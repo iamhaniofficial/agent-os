@@ -21,6 +21,8 @@ class SkillMeta:
     license: str = ""
     tags: list[str] = field(default_factory=list)
     platforms: list[str] = field(default_factory=list)
+    provider: str = ""  # publisher/brand (e.g. Bankr catalog "provider")
+    logo: str = ""  # raw URL to a logo asset, or "" for an initials fallback
 
 
 @dataclass

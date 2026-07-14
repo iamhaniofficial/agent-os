@@ -9,6 +9,7 @@ const SkillsView = (() => {
   let _filterText = '';
   let _statusFilter = 'all';
   let _activeTab = 'installed';
+  let _registryBrowsed = false;
 
   const _LAYER_ORDER = ['workspace', 'bundled', 'managed', 'personal', 'project', 'extra'];
   const _LAYER_LABEL = {
@@ -43,6 +44,7 @@ const SkillsView = (() => {
   function render(el) {
     _el = el;
     _rpc = App.getRpc();
+    _registryBrowsed = false;
     _ensureCss();
 
     _el.innerHTML = `
@@ -93,7 +95,7 @@ const SkillsView = (() => {
             <div id="skills-registry-results" class="sk-registry__results">
               <div class="sk-registry__hint">
                 <div class="sk-registry__hint-icon">${icons.skills()}</div>
-                <p>Search ClawHub skills to browse and install.</p>
+                <p>Browse community skills to install, or search by name.</p>
                 <p class="sk-dim">Paste a GitHub skill URL above for direct install.</p>
               </div>
             </div>
@@ -127,6 +129,11 @@ const SkillsView = (() => {
         const panel = _el.querySelector('#skills-tab-' + btn.dataset.tab);
         if (panel) panel.hidden = false;
         if (_searchWrap) _searchWrap.style.visibility = btn.dataset.tab === 'installed' ? '' : 'hidden';
+        // Browse the full community catalog on first open of the Community tab.
+        if (btn.dataset.tab === 'registry' && !_registryBrowsed) {
+          _registryBrowsed = true;
+          _searchRegistry('');
+        }
       });
     });
 
@@ -503,22 +510,38 @@ const SkillsView = (() => {
     }
   }
 
+  function _initials(text) {
+    const words = (text || '').trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return '?';
+    return (words[0][0] + (words[1] ? words[1][0] : '')).toUpperCase();
+  }
+
+  function _providerCell(r) {
+    const provider = r.provider || '';
+    const badge = r.logo
+      ? `<img class="sk-registry__logo" src="${_esc(r.logo)}" alt="" loading="lazy" onerror="this.remove()" />`
+      : `<span class="sk-registry__logo sk-registry__logo--initials">${_esc(_initials(provider || r.name))}</span>`;
+    return `<span class="sk-registry__provider">${badge}<span>${_esc(provider || '—')}</span></span>`;
+  }
+
   async function _searchRegistry(query) {
-    if (!_el || !_rpc || !query.trim()) return;
+    if (!_el || !_rpc) return;
+    const q = (query || '').trim();
+    const browsing = q === '';
     const wrap = _el.querySelector('#skills-registry-results');
     if (!wrap) return;
-    wrap.innerHTML = `<div class="sk-registry__loading"><span class="sk-spinner"></span> Searching ClawHub...</div>`;
+    wrap.innerHTML = `<div class="sk-registry__loading"><span class="sk-spinner"></span> ${browsing ? 'Loading community catalog…' : 'Searching community skills…'}</div>`;
 
     try {
-      const data = await _rpc.call('skills.search', { query: query.trim(), limit: 20 });
+      const data = await _rpc.call('skills.search', { query: q, limit: browsing ? 200 : 40 });
       const results = data.results || [];
       if (results.length === 0) {
-        wrap.innerHTML = `<div class="sk-registry__hint">
-          <p>No results for <strong>${_esc(query)}</strong>. Try a different query.</p>
-        </div>`;
+        wrap.innerHTML = browsing
+          ? `<div class="sk-registry__hint"><p>No community skills available right now. Try again shortly.</p></div>`
+          : `<div class="sk-registry__hint"><p>No results for <strong>${_esc(q)}</strong>. Try a different query.</p></div>`;
         return;
       }
-      let html = '<table class="sk-registry__table"><thead><tr><th>Name</th><th>Description</th><th>Source</th><th>Trust</th><th></th></tr></thead><tbody>';
+      let html = '<table class="sk-registry__table"><thead><tr><th>Name</th><th>Provider</th><th>Description</th><th>Source</th><th>Trust</th><th></th></tr></thead><tbody>';
       results.forEach(r => {
         const trustCls = r.trust_level === 'trusted' ? 'sk-chip--ok' : 'sk-chip--warn';
         const trustChip = `<span class="sk-chip ${trustCls}">${_esc(r.trust_level || 'community')}</span>`;
@@ -527,6 +550,7 @@ const SkillsView = (() => {
           : `<button class="btn btn--primary btn--sm" data-install="${_esc(r.identifier || r.name)}" data-source="${_esc(r.source || 'clawhub')}">Install</button>`;
         html += `<tr>
           <td class="sk-registry__name">${_esc(r.name)}</td>
+          <td>${_providerCell(r)}</td>
           <td class="sk-registry__desc">${_esc((r.description || '').slice(0, 80))}</td>
           <td class="sk-mono sk-dim">${_esc(r.source || '')}</td>
           <td>${trustChip}</td>

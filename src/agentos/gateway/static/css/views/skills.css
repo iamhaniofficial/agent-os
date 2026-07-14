@@ -406,6 +406,24 @@
 .sk-registry__table tbody tr:hover td { background: var(--bg-elevated); }
 .sk-registry__name { font-weight: 600; color: var(--text); }
 .sk-registry__desc { color: var(--text-muted); font-size: var(--fs-sm); }
+.sk-registry__provider { display: inline-flex; align-items: center; gap: 8px; }
+.sk-registry__logo {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  object-fit: contain;
+  flex: 0 0 auto;
+}
+.sk-registry__logo--initials {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+}
 
 /* ─── Chips ──────────────────────────────────────────────────────────── */
 

@@ -11,12 +11,28 @@ def test_skills_view_exposes_direct_github_install_control() -> None:
     assert "_installSkill(githubInput.value.trim(), 'github'," in view
 
 
-def test_skills_view_search_stays_clawhub_only() -> None:
+def test_skills_view_browses_community_catalog_without_source_picker() -> None:
     view = Path("src/agentos/gateway/static/js/views/skills.js").read_text(encoding="utf-8")
 
+    # No redundant source dropdown — sources are aggregated by the router.
     assert 'id="skills-registry-source"' not in view
-    assert "Searching ClawHub" in view
-    assert "skills.search', { query: query.trim(), limit: 20 }" in view
+    # Registry search aggregates across community sources (no ClawHub-only copy).
+    assert "Searching ClawHub" not in view
+    assert "community skills" in view
+    # Opening the Community tab browses the full catalog (empty-query search).
+    assert "_registryBrowsed" in view
+    assert "_searchRegistry('')" in view
+    # Browse requests a larger page than a targeted search.
+    assert "limit: browsing ? 200 : 40" in view
+
+
+def test_skills_view_renders_provider_and_logo() -> None:
+    view = Path("src/agentos/gateway/static/js/views/skills.js").read_text(encoding="utf-8")
+
+    assert "_providerCell" in view
+    assert "sk-registry__logo" in view
+    # Falls back to initials when a skill has no logo asset.
+    assert "sk-registry__logo--initials" in view
 
 
 def test_skills_view_distinguishes_bundled_from_local_layers() -> None:
