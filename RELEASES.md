@@ -2,6 +2,7 @@
 
 | Version | Tag | Date | Notes |
 |---|---|---|---|
+| 2026.7.14 | v2026.7.14 | 2026-07-14 | Release |
 | 2026.7.15 | v2026.7.15 | 2026-07-14 | CalVer release; version-independent install docs |
 | 0.0.1 | v0.0.1 | 2026-07-05 | AgentOS baseline release |
 

@@ -36,7 +36,7 @@ OpenAI, Anthropic, Ollama, DeepSeek, Gemini, Qwen/DashScope, and 20+
 other providers. You do not need to change your code or config to
 switch providers.
 
-AgentOS 2026.7.15 is the current release. The project website is
+AgentOS 2026.7.14 is the current release. The project website is
 [useagentos.dev](https://useagentos.dev). Follow
 [@useAgentOS](https://x.com/useAgentOS) on X for updates.
 
@@ -202,7 +202,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. Install AgentOS.** This command is the same on every system.
 
 ```sh
-uv tool install --python 3.12 "agentos[recommended] @ https://github.com/use-agent-os/agent-os/releases/download/v2026.7.15/agentos-2026.7.15-py3-none-any.whl"
+uv tool install --python 3.12 "agentos[recommended] @ https://github.com/use-agent-os/agent-os/releases/download/v2026.7.14/agentos-2026.7.14-py3-none-any.whl"
 ```
 
 This installs the AgentOS file from the link above. Then `uv`

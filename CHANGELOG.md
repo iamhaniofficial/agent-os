@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [2026.7.14] - 2026-07-14
+
+### Changed
+
+- Re-release aligning the current version tag to 2026.7.14.
+
 ## [2026.7.15] - 2026-07-14
 
 ### Changed
