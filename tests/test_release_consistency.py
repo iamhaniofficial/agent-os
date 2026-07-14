@@ -19,7 +19,7 @@ def test_pyproject_version_matches_current_release() -> None:
 
 def test_lockfile_version_matches_current_release() -> None:
     lock = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
-    package = next(item for item in lock["package"] if item["name"] == "agentos")
+    package = next(item for item in lock["package"] if item["name"] == "use-agent-os")
 
     assert package["version"] == CURRENT_VERSION
 
