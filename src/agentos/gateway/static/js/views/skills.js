@@ -121,16 +121,12 @@ const SkillsView = (() => {
             <div class="sk-partner__mark">${_robinhoodGlyph(48)}</div>
             <div class="sk-partner__text">
               <div class="sk-partner__name">Robinhood partner catalog</div>
-              <p class="sk-partner__desc">Trade stocks, ETFs, and crypto through Robinhood — tokenized equities, spot &amp; leverage, and Robinhood Chain skills. Coming soon.</p>
+              <p class="sk-partner__desc">Trade stocks, ETFs, and crypto through Robinhood — tokenized equities, spot &amp; leverage, and Robinhood Chain skills.</p>
             </div>
             <a class="sk-partner__link" href="https://robinhood.com" target="_blank" rel="noopener">robinhood.com ↗</a>
           </div>
           <div class="sk-browse" data-group="robinhood">
-            <div class="sk-empty">
-              <div class="sk-empty__mark">${_robinhoodGlyph(40)}</div>
-              <p class="sk-empty__title">Robinhood skills are on the way</p>
-              <p class="sk-empty__hint">This catalog is being prepared. Check back soon, or browse the Bankr &amp; Community catalogs in the meantime.</p>
-            </div>
+            <div class="sk-browse__results" id="skills-robinhood-wrap"></div>
           </div>
         </div>
 
@@ -285,6 +281,7 @@ const SkillsView = (() => {
       _allSkills = data.skills || [];
       _renderStats();
       _renderCards();
+      _renderRobinhood();
     } catch (err) {
       const wrap = _el && _el.querySelector('#skills-installed-wrap');
       if (wrap) {
@@ -416,6 +413,34 @@ const SkillsView = (() => {
       </div>
       <p class="sk-card__desc" title="${_esc(desc)}">${_esc(desc)}</p>
     </button>`;
+  }
+
+  // ── Robinhood tab (installed Robinhood-family skills) ──────────────────
+
+  function _isRobinhoodSkill(skill) {
+    const name = (skill.name || '').toLowerCase();
+    const home = (skill.homepage || '').toLowerCase();
+    return name.startsWith('robinhood') || home.includes('robinhood.com');
+  }
+
+  function _renderRobinhood() {
+    if (!_el) return;
+    const wrap = _el.querySelector('#skills-robinhood-wrap');
+    if (!wrap) return;
+
+    const skills = _allSkills
+      .filter(_isRobinhoodSkill)
+      .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+    if (skills.length === 0) {
+      wrap.innerHTML = `<div class="sk-empty">
+        <div class="sk-empty__mark">${_robinhoodGlyph(40)}</div>
+        <p class="sk-empty__title">Robinhood skills are on the way</p>
+        <p class="sk-empty__hint">No Robinhood skills installed yet. Check back soon, or browse the Bankr &amp; Community catalogs in the meantime.</p>
+      </div>`;
+      return;
+    }
+    wrap.innerHTML = `<div class="sk-grid">${skills.map(_renderCard).join('')}</div>`;
   }
 
   // ── Community / Bankr browse ───────────────────────────────────────────

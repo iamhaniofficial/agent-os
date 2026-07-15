@@ -35,15 +35,24 @@ def test_skills_view_has_dedicated_bankr_tab() -> None:
     assert "results.filter(r => r.source !== 'bankr')" in view
 
 
-def test_skills_view_has_dedicated_robinhood_tab_placeholder() -> None:
+def test_skills_view_has_dedicated_robinhood_tab() -> None:
     view = Path("src/agentos/gateway/static/js/views/skills.js").read_text(encoding="utf-8")
 
-    # A dedicated Robinhood partner tab with its brand logo and a coming-soon
-    # placeholder (no live source wired yet).
+    # A dedicated Robinhood partner tab with its brand logo.
     assert 'data-tab="robinhood"' in view
     assert 'id="skills-tab-robinhood"' in view
     assert "Robinhood partner catalog" in view
     assert "robinhood-symbol.png" in view
+
+
+def test_skills_view_robinhood_tab_lists_installed_robinhood_skills() -> None:
+    view = Path("src/agentos/gateway/static/js/views/skills.js").read_text(encoding="utf-8")
+
+    # The tab renders installed Robinhood-family skills (name prefix or homepage),
+    # falling back to a coming-soon empty state when none are installed.
+    assert "_renderRobinhood" in view
+    assert "_isRobinhoodSkill" in view
+    assert "robinhood.com" in view
     assert "Robinhood skills are on the way" in view
 
 
