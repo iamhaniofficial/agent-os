@@ -2,9 +2,9 @@
 
 | Version | Tag | Date | Notes |
 |---|---|---|---|
+| 2026.7.15 | v2026.7.15 | 2026-07-15 | Relicense to Apache-2.0 with `NOTICE` + OpenSquilla attribution; wheels ship license files |
 | 2026.7.14.post1 | v2026.7.14.post1 | 2026-07-14 | PyPI distribution rename to `use-agent-os`; first PyPI release |
 | 2026.7.14 | v2026.7.14 | 2026-07-14 | Release |
-| 2026.7.15 | v2026.7.15 | 2026-07-14 | CalVer release; version-independent install docs |
 | 0.0.1 | v0.0.1 | 2026-07-05 | AgentOS baseline release |
 
 Versions follow CalVer (`YYYY.M.D`). PEP 440 normalizes wheel filenames and drops

@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-default_version="v2026.7.14.post1"
+default_version="v2026.7.15"
 repo_slug="${AGENTOS_REPOSITORY:-use-agent-os/agent-os}"
 python_version="${AGENTOS_PYTHON_VERSION:-3.12}"
 original_path="${PATH:-}"

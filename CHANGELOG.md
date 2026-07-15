@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [2026.7.15] - 2026-07-15
+
 ### Changed
 
 - Relicensed the repository from MIT to **Apache-2.0** and added a root
@@ -35,11 +37,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - Re-release aligning the current version tag to 2026.7.14.
-
-## [2026.7.15] - 2026-07-14
-
-### Changed
-
 - Adopted CalVer versioning (`YYYY.M.D`). Because PEP 440 normalizes the version
   segment in wheel filenames (leading zeros dropped), tags use the same
   non-padded form, e.g. `v2026.7.15`.
