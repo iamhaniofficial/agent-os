@@ -193,7 +193,8 @@ const SkillsView = (() => {
       }
       const installBtn = e.target.closest('[data-install]');
       if (installBtn) {
-        _installSkill(installBtn.dataset.install, installBtn.dataset.source || 'clawhub', installBtn);
+        const force = installBtn.dataset.force === '1';
+        _installSkill(installBtn.dataset.install, installBtn.dataset.source || 'clawhub', installBtn, force);
         return;
       }
       const uninstallBtn = e.target.closest('[data-uninstall]');
@@ -750,25 +751,52 @@ const SkillsView = (() => {
     }
   }
 
-  async function _installSkill(identifier, source, btn) {
+  async function _installSkill(identifier, source, btn, force = false) {
     if (!_rpc) return;
+    const originalText = btn.textContent;
     btn.disabled = true;
-    btn.textContent = 'Installing…';
+    btn.textContent = force ? 'Force installing…' : 'Installing…';
     try {
-      const res = await _rpc.call('skills.install', { identifier, source });
+      const res = await _rpc.call('skills.install', { identifier, source, force });
       if (res.success) {
         btn.textContent = '✓ Installed';
         btn.classList.remove('btn--primary');
-        // Invalidate registry caches so the "installed" badge refreshes.
-        _registryCache = { bankr: null, community: null };
+        btn.classList.remove('btn--danger');
+        // Mark the item installed in-place across both cached lists so the
+        // badge flips without discarding the browsed catalog (a full refetch
+        // would blank the grid until it completes).
+        ['bankr', 'community'].forEach(g => {
+          const list = _registryCache[g];
+          if (Array.isArray(list)) {
+            list.forEach(r => {
+              if ((r.identifier || r.name) === identifier) r.installed = true;
+            });
+          }
+        });
         _loadData();
+        return;
+      }
+
+      // A "dangerous" security verdict is a deliberate block, not a crash.
+      // Explain it and offer an explicit override on the button.
+      const blocked = res.scan_verdict === 'dangerous';
+      const n = (res.scan_findings || []).length;
+      btn.disabled = false;
+      if (blocked && !force) {
+        btn.textContent = '⚠ Force install';
+        btn.classList.add('btn--danger');
+        btn.classList.remove('btn--primary');
+        btn.dataset.force = '1';
+        UI.toast(
+          `Security scan flagged ${res.name || 'this skill'}${n ? ' (' + n + ' finding' + (n === 1 ? '' : 's') + ')' : ''}. Click again to install anyway.`,
+          'err'
+        );
       } else {
         btn.textContent = 'Failed';
-        btn.disabled = false;
         UI.toast(res.message || 'Install failed', 'err');
       }
     } catch (err) {
-      btn.textContent = 'Error';
+      btn.textContent = originalText;
       btn.disabled = false;
       UI.toast(err.message, 'err');
     }

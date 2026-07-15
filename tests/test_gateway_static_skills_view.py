@@ -62,6 +62,18 @@ def test_skills_view_has_category_filter_chips() -> None:
     assert "_catFilter" in view
 
 
+def test_skills_view_offers_force_install_on_security_block() -> None:
+    view = Path("src/agentos/gateway/static/js/views/skills.js").read_text(encoding="utf-8")
+
+    # A dangerous security verdict is surfaced, not shown as a generic failure,
+    # and the button offers an explicit force-install override.
+    assert "scan_verdict === 'dangerous'" in view
+    assert "Force install" in view
+    assert "skills.install', { identifier, source, force }" in view
+    # The delegated click re-sends with force after the user confirms.
+    assert "installBtn.dataset.force === '1'" in view
+
+
 def test_skills_view_distinguishes_bundled_from_local_layers() -> None:
     view = Path("src/agentos/gateway/static/js/views/skills.js").read_text(encoding="utf-8")
 
