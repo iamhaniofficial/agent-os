@@ -160,6 +160,8 @@ def _memory_restart_required_for_paths(paths: set[str]) -> bool:
             return True
         if path.startswith("memory.embedding"):
             return True
+        if path.startswith("memory.provider"):
+            return True
     return False
 
 
@@ -173,6 +175,10 @@ def _memory_restart_fingerprint(config: Any) -> dict[str, Any]:
     return {
         "retrieval_mode": memory.get("retrieval_mode"),
         "embedding": memory.get("embedding"),
+        # The external memory-provider manager is built once at boot, so
+        # selecting a provider (or retuning its mem0 sub-settings) needs a
+        # gateway restart to take live effect.
+        "provider": memory.get("provider"),
     }
 
 

@@ -513,3 +513,146 @@ async def test_config_patch_disabling_channel_reports_restart_required(tmp_path)
 
     assert res.error is None, res.error
     assert res.payload["restartRequired"] is True
+
+
+@pytest.mark.asyncio
+async def test_config_patch_accepts_curated_memory_budget_fields(tmp_path):
+    """Setup UI's Memory card patches these three MemoryConfig fields directly.
+
+    They gate prompt assembly per-turn (read fresh via ``getattr`` in
+    ``engine/runtime.py`` and ``tools/builtin/memory_tools.py`` on the same
+    in-memory config object ``config.patch`` mutates in place), not anything
+    constructed once at boot -- so, unlike ``memory.embedding``/
+    ``memory.retrieval_mode``, they should NOT require a gateway restart.
+    """
+    cfg = GatewayConfig(config_path=str(tmp_path / "c.toml"))
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "config.patch",
+        {
+            "patches": {
+                "memory.curated_memory_char_limit": 5000,
+                "memory.curated_user_char_limit": 2500,
+                "memory.inject_limit": 7000,
+            }
+        },
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["restartRequired"] is False
+    assert cfg.memory.curated_memory_char_limit == 5000
+    assert cfg.memory.curated_user_char_limit == 2500
+    assert cfg.memory.inject_limit == 7000
+
+
+@pytest.mark.asyncio
+async def test_config_patch_selecting_memory_provider_reports_restart_required(tmp_path):
+    """The external memory-provider manager is built once at boot, so selecting a
+    provider (or retuning its mem0 sub-settings) requires a gateway restart.
+    """
+    cfg = GatewayConfig(config_path=str(tmp_path / "c.toml"))
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "config.patch",
+        {"patches": {"memory.provider.name": "mem0"}},
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["restartRequired"] is True
+    assert cfg.memory.provider.name == "mem0"
+
+
+@pytest.mark.asyncio
+async def test_config_patch_resetting_memory_provider_to_null_reports_restart_required(
+    tmp_path,
+):
+    """Round-trip: selecting a provider then patching name back to null (disabled)
+    must also succeed and require a restart, same as selecting one in the first place.
+    """
+    cfg = GatewayConfig(config_path=str(tmp_path / "c.toml"))
+    selected = await get_dispatcher().dispatch(
+        "r1",
+        "config.patch",
+        {"patches": {"memory.provider.name": "mem0"}},
+        _admin_ctx(cfg),
+    )
+    assert selected.error is None, selected.error
+    assert cfg.memory.provider.name == "mem0"
+
+    res = await get_dispatcher().dispatch(
+        "r2",
+        "config.patch",
+        {"patches": {"memory.provider.name": None}},
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["restartRequired"] is True
+    assert cfg.memory.provider.name is None
+
+
+@pytest.mark.asyncio
+async def test_config_patch_dotted_leaf_preserves_sibling_keys(tmp_path):
+    """The Form view flattens nested config into dotted leaves and saves each
+    touched leaf as one dot-path patch. Setting a single leaf must not wipe its
+    siblings under the same parent object.
+    """
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "c.toml"),
+        memory={"curated_memory_char_limit": 4000, "curated_user_char_limit": 1500},
+    )
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "config.patch",
+        {"patches": {"memory.provider.name": "mem0"}},
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is None, res.error
+    assert cfg.memory.provider.name == "mem0"
+    # Sibling scalars under memory survive the single-leaf patch.
+    assert cfg.memory.curated_memory_char_limit == 4000
+    assert cfg.memory.curated_user_char_limit == 1500
+
+
+@pytest.mark.asyncio
+async def test_config_patch_nested_dict_deep_merges_without_wiping_siblings(tmp_path):
+    """A nested single-leaf merge patch {"memory": {"provider": {"name": "mem0"}}}
+    must deep-merge, leaving unrelated memory/provider fields intact.
+    """
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "c.toml"),
+        memory={
+            "curated_memory_char_limit": 4000,
+            "provider": {"mem0": {"llm_model": "qwen3:8b"}},
+        },
+    )
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "config.patch",
+        {"patch": {"memory": {"provider": {"name": "mem0"}}}},
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is None, res.error
+    assert cfg.memory.provider.name == "mem0"
+    # Deep merge keeps the sibling scalar and the nested mem0 sub-object.
+    assert cfg.memory.curated_memory_char_limit == 4000
+    assert cfg.memory.provider.mem0.llm_model == "qwen3:8b"
+
+
+@pytest.mark.asyncio
+async def test_config_patch_retuning_mem0_settings_reports_restart_required(tmp_path):
+    cfg = GatewayConfig(config_path=str(tmp_path / "c.toml"))
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "config.patch",
+        {"patches": {"memory.provider.mem0.llm_model": "qwen3:8b"}},
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["restartRequired"] is True
+    assert cfg.memory.provider.mem0.llm_model == "qwen3:8b"

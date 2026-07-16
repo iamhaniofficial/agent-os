@@ -408,6 +408,7 @@ MemoryEmbeddingProvider = Literal[
 class MemoryEmbeddingLocalConfig(BaseModel):
     """Local memory embedding settings."""
 
+    model: str | None = None
     onnx_dir: str | None = None
 
 
@@ -463,6 +464,39 @@ class MemoryCostConfig(BaseModel):
     query_embedding_cache: Literal["off", "shadow", "on"] = "on"
 
 
+class Mem0ProviderSettings(BaseModel):
+    """Settings for the mem0 external memory provider (Plan B).
+
+    Defaults target a fully local stack (Ollama LLM + embedder) so the
+    provider works offline without API keys. ``vector_store_path`` defaults to
+    ``None`` — the provider resolves ``<agent state dir>/mem0`` at boot.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    llm_provider: str = "ollama"
+    llm_model: str = "qwen3:4b"
+    llm_base_url: str = "http://localhost:11434"
+    embedder_provider: str = "ollama"
+    embedder_model: str = "embeddinggemma"
+    embedder_base_url: str = "http://localhost:11434"
+    vector_store_path: str | None = None
+
+
+class MemoryProviderSettings(BaseModel):
+    """External memory-provider selection (Plan B).
+
+    ``name`` is ``None`` (disabled) by default — the provider layer adds zero
+    overhead unless a provider is explicitly selected. Set ``name="mem0"`` to
+    activate the mem0 provider (requires the ``mem0`` extra).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None  # None/"" = disabled (default)
+    mem0: Mem0ProviderSettings = Field(default_factory=Mem0ProviderSettings)
+
+
 class MemoryConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="AGENTOS_MEMORY_",
@@ -481,7 +515,13 @@ class MemoryConfig(BaseSettings):
     session_source_enabled: bool = False
 
     # Passive injection
-    inject_limit: int = 4000  # max chars for passive memory injection into system prompt
+    # 6400 gives headroom for the default curated budgets (4000 memory +
+    # 2000 user = 6000 chars of entry content) plus header/separator
+    # overhead (304 chars at full budgets), so a full memory block + full
+    # user block both fit at defaults and the block-boundary truncation
+    # (drop-whole-block) path is unreachable unless a store is configured
+    # with a larger limit.
+    inject_limit: int = 6400  # max chars for passive memory injection into system prompt
 
     # Size limits (0 = disabled)
     max_file_size_kb: int = 1024  # 1 MB per file
@@ -534,6 +574,16 @@ class MemoryConfig(BaseSettings):
 
     # Dream consolidation
     dream: DreamConfig = Field(default_factory=DreamConfig)
+
+    # Curated memory (hermes-style bounded entry stores). Char budgets for the
+    # always-injected MEMORY.md / USER.md files. Chars, not tokens — char
+    # counts are model-independent.
+    curated_memory_char_limit: int = 4000
+    curated_user_char_limit: int = 2000
+
+    # External memory provider (Plan B). Disabled by default (name=None) — the
+    # provider layer is never imported unless a provider is explicitly selected.
+    provider: MemoryProviderSettings = Field(default_factory=MemoryProviderSettings)
 
 
 def _default_tiers() -> dict:

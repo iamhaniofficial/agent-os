@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
@@ -22,6 +23,75 @@ BATCH_FAILURE_LIMIT = 2
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BASE_MS = 500
 DEFAULT_RETRY_MAX_MS = 8000
+
+
+@dataclass(frozen=True)
+class LocalModelSpec:
+    """Per-model metadata for local (ONNX) embedding models.
+
+    ``dims`` is ``None`` when the dimensionality should be discovered at
+    load time rather than asserted up front.
+    """
+
+    model_id: str
+    query_prefix: str
+    document_prefix: str
+    pooling: str  # "cls" | "mean"
+    max_tokens: int
+    dims: int | None
+
+
+LOCAL_MODEL_SPECS: dict[str, LocalModelSpec] = {
+    "BAAI/bge-small-zh-v1.5": LocalModelSpec(
+        model_id="BAAI/bge-small-zh-v1.5",
+        query_prefix="",
+        document_prefix="",
+        pooling="cls",
+        max_tokens=512,
+        dims=None,
+    ),
+    "google/embeddinggemma-300m": LocalModelSpec(
+        model_id="google/embeddinggemma-300m",
+        query_prefix="task: search result | query: ",
+        document_prefix="title: none | text: ",
+        pooling="mean",
+        max_tokens=1024,
+        dims=768,
+    ),
+}
+
+_DEFAULT_MODEL_SPEC = LocalModelSpec(
+    model_id="",
+    query_prefix="",
+    document_prefix="",
+    pooling="cls",
+    max_tokens=512,
+    dims=None,
+)
+
+# Ollama tags don't carry HF-style org/name ids, so map the ones we know
+# apply prompt prefixes to the canonical spec id. The lookup key is the
+# model name with any ":tag" suffix stripped first (see ``_spec_id``), so
+# "embeddinggemma:latest", "embeddinggemma:300m", and bare "embeddinggemma"
+# all resolve to the same alias. Any other Ollama model (e.g.
+# "nomic-embed-text" or "nomic-embed-text:latest") falls through to the
+# no-prefix default.
+_OLLAMA_SPEC_ALIASES: dict[str, str] = {
+    "embeddinggemma": "google/embeddinggemma-300m",
+}
+
+
+def model_spec(model_id: str) -> LocalModelSpec:
+    """Spec for model_id; unknown ids get a BGE-like default (cls/512/no prefixes)."""
+    return LOCAL_MODEL_SPECS.get(model_id, _DEFAULT_MODEL_SPEC)
+
+
+def format_query_text(model_id: str, text: str) -> str:
+    return model_spec(model_id).query_prefix + text
+
+
+def format_document_text(model_id: str, text: str) -> str:
+    return model_spec(model_id).document_prefix + text
 
 RETRYABLE_ERROR_PATTERNS = [
     "rate_limit",
@@ -172,7 +242,7 @@ class OpenAIEmbeddingProvider:
 class OllamaEmbeddingProvider:
     """Ollama local embedding provider."""
 
-    DEFAULT_MODEL = "nomic-embed-text"
+    DEFAULT_MODEL = "embeddinggemma"
 
     def __init__(
         self,
@@ -194,7 +264,20 @@ class OllamaEmbeddingProvider:
     def model(self) -> str:
         return self._model
 
-    async def embed_query(self, text: str) -> list[float]:
+    @property
+    def _spec_id(self) -> str:
+        """Canonical spec id for prompt-prefix lookups. Ollama tags don't
+        carry HF-style org/name ids, so known prefix-capable tags are
+        mapped via ``_OLLAMA_SPEC_ALIASES``; anything else (e.g.
+        ``nomic-embed-text``) gets the no-prefix default.
+
+        The ``:tag`` suffix (e.g. ``:latest``, ``:300m``) is stripped
+        before the alias lookup so any tag of a known model (not just the
+        untagged name) resolves to its prefix-capable spec."""
+        base = self._model.split(":", 1)[0]
+        return _OLLAMA_SPEC_ALIASES.get(base, self._model)
+
+    async def _embed_raw(self, text: str) -> list[float]:
         async def _call():
             async with httpx.AsyncClient(trust_env=_trust_env()) as client:
                 resp = await client.post(
@@ -207,10 +290,13 @@ class OllamaEmbeddingProvider:
 
         return await _retry_with_backoff(_call)  # type: ignore[no-any-return]
 
+    async def embed_query(self, text: str) -> list[float]:
+        return await self._embed_raw(format_query_text(self._spec_id, text))
+
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         results = []
         for text in texts:
-            vec = await self.embed_query(text)
+            vec = await self._embed_raw(format_document_text(self._spec_id, text))
             results.append(vec)
         return results
 
@@ -273,14 +359,36 @@ class LocalEmbeddingProvider:
     _BUNDLED_ONNX_DIR = Path(__file__).resolve().parent / "models" / "bge_onnx"
 
     @classmethod
-    def _bundled_onnx_dir(cls, model_name: str) -> Path | None:
-        """Resolve the bundled ONNX dir for the given model. Returns None
-        when no bundled export is available."""
+    def resolve_onnx_dir(cls, model_name: str) -> Path | None:
+        """Resolve the ONNX dir for the given model.
+
+        Resolution order:
+          1. The bundled-export convention (unchanged for BGE; also covers
+             any model shipped under ``models/embeddings/{short}-int8``).
+          2. A previously downloaded model dir under the user's AgentOS home
+             (``agentos.memory.model_download.downloaded_model_dir``).
+
+        Returns ``None`` when neither source has the model.
+        """
         if model_name == cls.DEFAULT_MODEL and cls._BUNDLED_ONNX_DIR.is_dir():
             return cls._BUNDLED_ONNX_DIR
         short = model_name.split("/")[-1]
         candidate = cls._BUNDLED_ONNX_DIR.parent / "embeddings" / f"{short}-int8"
-        return candidate if candidate.is_dir() else None
+        if candidate.is_dir():
+            return candidate
+        # Lazy import: model_download pulls in httpx-based download plumbing
+        # that has no business being an import-time dependency of the
+        # embedding module, and would risk a cycle if that ever changed.
+        from agentos.memory import model_download
+
+        return model_download.downloaded_model_dir(model_name)
+
+    @classmethod
+    def _bundled_onnx_dir(cls, model_name: str) -> Path | None:
+        """Deprecated alias for :meth:`resolve_onnx_dir`, kept for external
+        callers (``embedding_resolver.local_bge_available``,
+        ``gateway.boot``) and existing test monkeypatches."""
+        return cls.resolve_onnx_dir(model_name)
 
     def __init__(
         self,
@@ -296,8 +404,9 @@ class LocalEmbeddingProvider:
         #   <path>           → use exactly this dir
         # ``None`` is rejected explicitly: the previous semantics
         # (force sentence-transformers fallback) no longer exists.
+        self._onnx_dir_explicit = onnx_dir != "auto"
         if onnx_dir == "auto":
-            self._onnx_dir: Path | None = self._bundled_onnx_dir(self._model_name)
+            self._onnx_dir: Path | None = self.resolve_onnx_dir(self._model_name)
         elif onnx_dir is None:
             raise ValueError(
                 "onnx_dir=None is no longer supported; the sentence-transformers "
@@ -380,13 +489,23 @@ class LocalEmbeddingProvider:
                 f"LocalEmbeddingProvider found onnx_dir={self._onnx_dir} but "
                 "it contains no *.onnx files."
             )
+        spec = model_spec(self._model_name)
+        if self._onnx_dir_explicit and spec is _DEFAULT_MODEL_SPEC:
+            logger.warning(
+                "local_embedding.default_spec_for_custom_dir",
+                model_name=self._model_name,
+                onnx_dir=str(self._onnx_dir),
+                assumed_pooling=_DEFAULT_MODEL_SPEC.pooling,
+                assumed_max_tokens=_DEFAULT_MODEL_SPEC.max_tokens,
+                assumed_prefixes=False,
+            )
         try:
             session = ort.InferenceSession(str(onnx_files[0]), providers=["CPUExecutionProvider"])
             tokenizer_path = self._onnx_dir / "tokenizer.json"
             if not tokenizer_path.is_file():
                 raise RuntimeError(f"tokenizer.json not found in {self._onnx_dir}")
             tokenizer = Tokenizer.from_file(str(tokenizer_path))
-            tokenizer.enable_truncation(max_length=512)
+            tokenizer.enable_truncation(max_length=spec.max_tokens)
             tokenizer.enable_padding()
             input_names = [inp.name for inp in session.get_inputs()]
             # Warm-up + dim discovery via a dummy encode.
@@ -394,7 +513,7 @@ class LocalEmbeddingProvider:
             feed = self._tokenize_onnx(["warmup"], input_names)
             out = session.run(None, feed)[0]
             if out.ndim == 3:
-                out = out[:, 0, :]  # CLS pooling for BGE-style models
+                out = self._pool(out, feed, spec.pooling)
         except Exception as exc:
             logger.warning("local_embedding.onnx_load_failed", error=str(exc))
             raise RuntimeError(
@@ -421,13 +540,47 @@ class LocalEmbeddingProvider:
         }
         return {name: value for name, value in arrays.items() if name in input_names}
 
+    @staticmethod
+    def _pool(outputs: Any, feed: dict[str, Any], pooling: str) -> Any:
+        """Reduce an ndim==3 ``last_hidden_state``-shaped output to
+        ``(batch, dim)``.
+
+        ``"cls"`` takes the first-token vector (BGE-style models). ``"mean"``
+        computes an attention-mask-weighted mean over the sequence axis
+        (EmbeddingGemma and other mean-pooling models): positions where the
+        mask is 0 (padding) don't contribute to the sum, and the divisor is
+        clamped to at least 1 to avoid dividing by zero for an all-masked
+        (empty) sequence.
+        """
+        import numpy as np
+
+        if pooling == "mean":
+            mask = feed["attention_mask"].astype(np.float32)  # (batch, seq)
+            mask_expanded = mask[..., None]  # (batch, seq, 1)
+            summed = np.sum(outputs * mask_expanded, axis=1)  # (batch, dim)
+            counts = np.clip(np.sum(mask, axis=1, keepdims=True), a_min=1.0, a_max=None)
+            return (summed / counts).astype(np.float32)
+        return outputs[:, 0, :]  # CLS pooling
+
     def encode_sync(
         self,
         texts: list[str],
         *,
         batch_size: int = 32,
         show_progress_bar: bool = False,  # accepted for API compat; unused
+        role: str | None = None,
     ) -> np.ndarray:  # noqa: F821
+        """Encode ``texts`` to embedding vectors.
+
+        ``role`` is ``None`` by default, meaning texts are encoded as-is
+        (raw) — this is the path used by skills' ``SemanticIndex``, which
+        must not change behavior this task. ``embed_query``/``embed_batch``
+        pre-format their text with the model's prompt prefix (if any)
+        before calling this method, so ``role`` itself is currently
+        informational only; it exists for future callers that want the
+        provider to apply prefixes on their behalf.
+        """
+        del role  # reserved for future use; formatting happens in embed_*
         self._ensure_loaded()
         return self._encode_onnx(list(texts), batch_size=batch_size)
 
@@ -439,26 +592,29 @@ class LocalEmbeddingProvider:
         if not texts:
             dim = self._dim or 0
             return np.zeros((0, dim), dtype=np.float32)
+        pooling = model_spec(self._model_name).pooling
         chunks: list[np.ndarray] = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             feed = self._tokenize_onnx(batch, self._onnx_input_names)
             outputs = self._onnx_session.run(None, feed)[0]  # type: ignore[union-attr]
             if outputs.ndim == 3:
-                outputs = outputs[:, 0, :]  # CLS pooling
+                outputs = self._pool(outputs, feed, pooling)
             chunks.append(np.asarray(outputs, dtype=np.float32))
         return np.concatenate(chunks, axis=0)
 
     async def embed_query(self, text: str) -> list[float]:
         import asyncio
 
-        arr = await asyncio.to_thread(self.encode_sync, [text])
+        formatted = format_query_text(self._model_name, text)
+        arr = await asyncio.to_thread(self.encode_sync, [formatted])
         return cast(list[float], arr[0].tolist())
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         import asyncio
 
-        arr = await asyncio.to_thread(self.encode_sync, list(texts))
+        formatted = [format_document_text(self._model_name, text) for text in texts]
+        arr = await asyncio.to_thread(self.encode_sync, formatted)
         return [row.tolist() for row in arr]
 
     async def probe(self) -> tuple[bool, str | None]:

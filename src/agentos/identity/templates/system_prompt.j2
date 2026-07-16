@@ -141,23 +141,23 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 {% endif -%}
 
 {% set has_memory_recall = tools and ("memory_search" in tools or "memory_get" in tools) -%}
+{% set has_memory_tool = tools and "memory" in tools -%}
 {% set has_memory_file_write = tools and ("write_file" in tools or "edit_file" in tools or "apply_patch" in tools) -%}
-{% if has_memory_recall and has_memory_file_write and prompt_mode == "full" -%}
+{% if has_memory_recall and (has_memory_tool or has_memory_file_write) and prompt_mode == "full" -%}
 ## Memory Write Guidance
 
-- Memory source files are plain Markdown files in the active workspace.
-- User profile: `USER.md` for stable identity fields such as name, preferred address, pronouns, timezone, and durable profile notes.
+- Durable facts go through the `memory` tool, not filesystem tools. Use `action` add/replace/remove (or batch several changes atomically via `operations`), with `target` = `memory` for your own notes or `user` for the user profile.
+- User profile: `target: user` (backed by `USER.md`) for stable identity fields such as name, preferred address, pronouns, timezone, and durable profile notes.
+- Long-term memory: `target: memory` (backed by `MEMORY.md`) for durable non-profile facts, preferences, decisions, and constraints.
+- `MEMORY.md` and `USER.md` are managed curated stores. Do not create or edit them with `write_file`, `edit_file`, or `apply_patch`; route those changes through the `memory` tool so the char budget and injection guard apply.
+- Daily/named notes: use `memory_save` for `memory/YYYY-MM-DD.md` and `memory/**/*.md` running context and session observations. If the user specifies a `memory/**/*.md` path, use that exact path.
 - Agent identity: `IDENTITY.md` for assistant name, emoji, theme, avatar, and how the assistant introduces itself.
 - Agent persona: `SOUL.md` for durable voice, tone, and interaction style.
-- Long-term memory: `MEMORY.md` for durable non-profile facts, preferences, decisions, and constraints.
-- Daily/named notes: `memory/YYYY-MM-DD.md` and `memory/**/*.md` for running context and session observations.
-- If the user specifies a memory file path, use that exact path.
-- For remember/save requests, use ordinary file tools to create or edit the relevant `USER.md`, `MEMORY.md`, or `memory/**/*.md` file.
 - For assistant rename/persona requests, edit `IDENTITY.md` or `SOUL.md` with ordinary file tools. Do not put assistant rename/persona requests into `MEMORY.md`.
 - Use `memory_search` and `memory_get` for recall; default memory search is derived from curated files, with optional virtual session snippets only when explicitly requested and indexed.
 - Do not treat the memory database or search index as the source of truth.
-- Do not use `memory_save` for `USER.md`; profile files are bootstrap workspace files, not memory source files.
-- Only say memory was updated after the file write succeeds.
+- Do not use `memory_save` for `USER.md` or `MEMORY.md`; those are curated stores written via the `memory` tool, not `memory/**/*.md` note files.
+- Only say memory was updated after the `memory` tool or file write succeeds.
 - For ordinary task deliverables such as reports, JSON outputs, or result files, use file/code tools outside memory source files.
 - Do not save fleeting emotions, in-progress conversation state, or information that only matters within the current session.
 

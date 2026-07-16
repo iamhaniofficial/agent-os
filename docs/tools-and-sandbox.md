@@ -18,7 +18,7 @@ For a focused permissions guide, see
 | Shell and code | `exec_command`, `background_process`, `process`, `execute_code`. |
 | Git | `git_status`, `git_diff`, `git_log`, `git_commit`, `apply_patch`. |
 | Web | `web_search`, `web_fetch`, `http_request`. |
-| Memory | `memory_search`, `memory_save`, `memory_get`, `memory_delete`. |
+| Memory | `memory_search`, `memory_save`, `memory_get`, `memory_delete`, `memory`. |
 | Sessions | `sessions_send`, `sessions_spawn`, `sessions_list`, `sessions_history`, `session_status`. |
 | Artifacts | `publish_artifact`. |
 | Media | image generation, PDF, TTS, and media helpers. |

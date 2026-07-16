@@ -19,6 +19,9 @@ from .embedding import (
 
 ProviderName = Literal["none", "local", "openai", "ollama"]
 
+# Canonical id of the downloadable EmbeddingGemma export (see model_download).
+_GEMMA_MODEL = "google/embeddinggemma-300m"
+
 
 @dataclass(frozen=True)
 class MemoryEmbeddingDecision:
@@ -65,13 +68,36 @@ def _secret_fingerprint(value: str | None) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def preferred_local_model() -> str:
+    """Return the local embedding model auto/local mode should default to.
+
+    Prefers the downloaded EmbeddingGemma export when present (better retrieval
+    quality); otherwise falls back to the bundled BGE model so zero-config
+    installs keep working offline. Explicit user config overrides this — the
+    resolver only consults this helper when no model was pinned.
+    """
+    # Lazy import: model_download pulls in httpx-based download plumbing that
+    # has no business being an import-time dependency of the resolver.
+    from agentos.memory import model_download
+
+    if model_download.downloaded_model_dir(_GEMMA_MODEL) is not None:
+        return _GEMMA_MODEL
+    return LocalEmbeddingProvider.DEFAULT_MODEL
+
+
 def local_bge_available(model: str, onnx_dir: str | None = None) -> bool:
-    """Return whether auto mode may safely pick the local ONNX backend."""
+    """Return whether auto mode may safely pick the local ONNX backend.
+
+    Discovery routes through ``LocalEmbeddingProvider.resolve_onnx_dir`` so a
+    downloaded model (e.g. EmbeddingGemma) counts as available, not just the
+    bundled BGE export. Callers pass the *preferred* model so the probed dir
+    matches the model that would actually be selected.
+    """
     resolved: Path | None
     if onnx_dir:
         resolved = Path(onnx_dir).expanduser().resolve()
     else:
-        resolved = LocalEmbeddingProvider._bundled_onnx_dir(model)
+        resolved = LocalEmbeddingProvider.resolve_onnx_dir(model)
     return (
         resolved is not None
         and resolved.is_dir()
@@ -106,7 +132,11 @@ def resolve_memory_embedding(
     remote_cfg = getattr(embed_cfg, "remote", None)
     ollama_cfg = getattr(embed_cfg, "ollama", None)
 
-    local_model = LocalEmbeddingProvider.DEFAULT_MODEL
+    # Explicit local model: user pinned it via [embedding.local].model or the
+    # top-level [embedding].model. When unset, auto/local default to the
+    # preferred model (downloaded Gemma if present, else bundled BGE).
+    explicit_local_model = _clean_str(getattr(local_cfg, "model", None)) or top_model
+    local_model = explicit_local_model or preferred_local_model()
     local_onnx_dir = _resolve_user_path(getattr(local_cfg, "onnx_dir", None))
 
     remote_model = (
@@ -144,6 +174,17 @@ def resolve_memory_embedding(
         )
 
     if requested == "local":
+        # A user-supplied onnx_dir is trusted verbatim (the operator points us
+        # at their own export). Otherwise the model must resolve to a bundled
+        # or downloaded ONNX dir; if it does not, fail loudly with a fix.
+        if local_onnx_dir is None and LocalEmbeddingProvider.resolve_onnx_dir(local_model) is None:
+            raise ValueError(
+                f"memory.embedding.provider='local' selected model {local_model!r} "
+                "but no ONNX export was found (not bundled, not downloaded). "
+                f"Run `agentos memory embedding-download --model {local_model}` to fetch it, "
+                "set memory.embedding.local.onnx_dir to an existing export, or omit "
+                "the model to use the bundled BGE default."
+            )
         return _decision(
             requested,
             "local",

@@ -152,6 +152,23 @@ def memory_status_cmd(
     )
     console.print(table)
 
+    curated = payload.get("curated") or {}
+    if curated:
+        curated_table = Table(title="Curated memory (MEMORY.md / USER.md)", show_header=True)
+        curated_table.add_column("Store")
+        curated_table.add_column("Entries", justify="right")
+        curated_table.add_column("Usage")
+        for store_name in ("memory", "user"):
+            store_status = curated.get(store_name) or {}
+            if not store_status:
+                continue
+            curated_table.add_row(
+                "MEMORY.md" if store_name == "memory" else "USER.md",
+                str(store_status.get("entries", "")),
+                str(store_status.get("usage", "")),
+            )
+        console.print(curated_table)
+
 
 @memory_app.command("index")
 def memory_index_cmd(
@@ -291,6 +308,64 @@ def memory_show_cmd(
     console.print(str(payload.get("content") or ""))
     if payload.get("truncated"):
         console.print("[dim]... truncated[/dim]")
+
+
+@memory_app.command("embedding-download")
+def memory_embedding_download_cmd(
+    model: str = typer.Option(
+        "google/embeddinggemma-300m",
+        "--model",
+        help="Embedding model id to download",
+    ),
+) -> None:
+    """Download a local embedding model's ONNX export to the models dir.
+
+    This is a local filesystem operation (no running gateway required): it
+    fetches the model files directly from Hugging Face into
+    ``~/.agentos/models/embeddings/<target-dir>``.
+    """
+
+    import asyncio
+
+    from agentos.cli.ui import console
+    from agentos.memory.model_download import (
+        EMBEDDING_MODEL_MANIFESTS,
+        download_embedding_model,
+    )
+
+    if model not in EMBEDDING_MODEL_MANIFESTS:
+        console.print(f"[red]Unknown embedding model id: {model}[/red]")
+        raise typer.Exit(code=1)
+
+    manifest = EMBEDDING_MODEL_MANIFESTS[model]
+    target_dir = None
+
+    def _progress(name: str, done: int, total: int | None) -> None:
+        if total:
+            pct = 100 * done // total
+            console.print(f"  {name}: {done}/{total} bytes ({pct}%)")
+        else:
+            console.print(f"  {name}: {done} bytes")
+
+    console.print(
+        f"Downloading {model} (~{manifest.approx_total_mb} MB) to "
+        f"{manifest.target_dirname}/"
+    )
+
+    async def _run() -> Path:
+        return await download_embedding_model(model, progress=_progress)
+
+    try:
+        target_dir = asyncio.run(_run())
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]Downloaded to {target_dir}[/green]")
+    console.print(
+        "Restart the gateway (or stop/start it) to pick up the new model; "
+        "reindexing then happens automatically on the next sync."
+    )
 
 
 @raw_fallbacks_app.command("list")

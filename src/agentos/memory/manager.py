@@ -290,6 +290,9 @@ class MemoryManager:
     embedding_decision: Any | None = None
     vector_weight: float = 0.7
     text_weight: float = 0.3
+    # External memory provider (Plan B). ``None`` unless a provider is
+    # configured AND available at boot; see ``build_memory_managers``.
+    provider_manager: Any | None = None
     degraded: list[MemoryDegradation] = field(default_factory=list, init=False)
 
     def _record_degradation(
@@ -373,7 +376,45 @@ class MemoryManager:
         status.update(memory_config_diagnostics(self.memory_config))
         status.update(self.effective_retrieval_metadata())
         status["degraded"] = [d.as_dict() for d in self.degraded]
+        curated = await metric("curated", "status", self._curated_status, None)
+        if curated:
+            status["curated"] = curated
         return status
+
+    async def _curated_status(self) -> dict[str, Any] | None:
+        # The curated store's ``memory_dir`` is the *workspace root* -- the
+        # same directory the ``memory`` tool and runtime injection resolve
+        # MEMORY.md/USER.md against (see ``_curated_store_for`` in
+        # ``tools/builtin/memory_tools.py`` and ``_load_curated_memory_block``
+        # in ``engine/runtime.py``), NOT ``self.memory_dir`` -- which is the
+        # ``<workspace>/memory/`` subfolder used for daily notes and turn
+        # capture. Reading from ``self.memory_dir`` would always report 0
+        # curated entries in production.
+        curated_root = self.workspace_dir
+        if curated_root is None:
+            curated_root = getattr(self.turn_capture, "_workspace_dir", None)
+        if curated_root is None:
+            return None
+        from .curated import CuratedMemoryStore
+
+        memory_limit = getattr(self.memory_config, "curated_memory_char_limit", 4000)
+        user_limit = getattr(self.memory_config, "curated_user_char_limit", 2000)
+        store = CuratedMemoryStore(
+            memory_dir=Path(curated_root),
+            memory_char_limit=memory_limit,
+            user_char_limit=user_limit,
+        )
+        store.load_from_disk()
+        return {
+            "memory": {
+                "entries": len(store.entries_for("memory")),
+                "usage": store.usage_for("memory"),
+            },
+            "user": {
+                "entries": len(store.entries_for("user")),
+                "usage": store.usage_for("user"),
+            },
+        }
 
     def effective_retrieval_metadata(self) -> dict[str, str]:
         return effective_retrieval_metadata(
@@ -397,13 +438,76 @@ class MemoryManager:
             )
 
     async def close(self) -> None:
-        """Tear down in safe order: sync_manager first (background tasks),
-        then retriever, then store (aiosqlite main connection).
+        """Tear down in safe order: provider_manager first (external backend +
+        its background worker), then sync_manager (background tasks), then
+        retriever, then store (aiosqlite main connection).
         Idempotent — calling twice is safe.
         """
+        if self.provider_manager is not None:
+            await self._best_effort_call("provider_manager", "shutdown", self.provider_manager)
         await self._best_effort_call("sync_manager", "stop", self.sync_manager)
         await self._best_effort_call("retriever", "close", self.retriever)
         await self._best_effort_call("store", "close", self.store)
+
+
+async def _build_provider_manager(
+    provider_name: str,
+    *,
+    memory_config: Any,
+    agent_state_dir: Path,
+    agent_id: str,
+    reserved_tool_names: set[str] | None = None,
+) -> Any | None:
+    """Build + initialize a ``MemoryProviderManager`` for one agent, or ``None``.
+
+    Fully guarded: an unknown provider, an unavailable provider, a missing
+    optional dependency, or any initialization failure degrades to ``None`` so
+    the gateway boots regardless. The providers package is imported here
+    (function-local) so the disabled default path never touches it.
+
+    ``reserved_tool_names`` is the set of live runtime tool names (the gateway
+    passes ``ToolRegistry.list_names()`` from ``build_services``). Provider
+    tools whose names collide with a builtin are skipped so a provider can
+    never shadow a core tool.
+    """
+    try:
+        from agentos.memory.providers.manager import MemoryProviderManager
+        from agentos.memory.providers.registry import create_provider
+
+        provider = create_provider(
+            provider_name,
+            memory_config=memory_config,
+            agent_state_dir=agent_state_dir,
+        )
+        if provider is None or not provider.is_available():
+            return None
+
+        provider_manager = MemoryProviderManager(
+            reserved_tool_names=set(reserved_tool_names or set())
+        )
+        if not provider_manager.add_provider(provider):
+            return None
+
+        await provider_manager.initialize_all(
+            session_id="boot",
+            agent_state_dir=str(agent_state_dir),
+            platform="gateway",
+            agent_identity=agent_id,
+        )
+        log.info(
+            "build_services.memory_provider_ready",
+            agent_id=agent_id,
+            provider=provider_name,
+        )
+        return provider_manager
+    except Exception as exc:  # noqa: BLE001 — never let provider setup crash boot
+        log.warning(
+            "build_services.memory_provider_failed",
+            agent_id=agent_id,
+            provider=provider_name,
+            error=str(exc),
+        )
+        return None
 
 
 async def build_memory_managers(
@@ -411,6 +515,7 @@ async def build_memory_managers(
     agent_ids: list[str],
     *,
     session_storage: Any | None = None,
+    reserved_tool_names: set[str] | None = None,
 ) -> dict[str, MemoryManager]:
     """Construct per-agent ``MemoryManager`` instances from gateway config.
 
@@ -588,7 +693,7 @@ async def build_memory_managers(
                 memory_config=config.memory,
             )
 
-            managers[agent_id] = MemoryManager(
+            manager = MemoryManager(
                 agent_id=agent_id,
                 db_path=db_path,
                 store=in_flight_store,
@@ -602,6 +707,22 @@ async def build_memory_managers(
                 vector_weight=effective_vector_weight,
                 text_weight=effective_text_weight,
             )
+
+            # ── External memory provider (Plan B, disabled by default) ────
+            # Zero overhead when no provider is configured: the providers
+            # package is only imported inside this branch.
+            provider_name = getattr(getattr(cfg, "provider", None), "name", None)
+            if provider_name:
+                agent_data_dir = resolve_agent_data_dir(agent_id, config.state_dir)
+                manager.provider_manager = await _build_provider_manager(
+                    provider_name,
+                    memory_config=cfg,
+                    agent_state_dir=agent_data_dir,
+                    agent_id=agent_id,
+                    reserved_tool_names=reserved_tool_names,
+                )
+
+            managers[agent_id] = manager
             # Resources have been transferred to a MemoryManager that is now
             # tracked by `managers`; clear in-flight handles so a later
             # exception doesn't double-close them in the cleanup path.

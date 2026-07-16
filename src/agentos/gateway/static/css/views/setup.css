@@ -165,6 +165,10 @@
   box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 22%, transparent);
 }
 .setup__status.is-ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, var(--border)); }
+.setup__status.is-optional {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+}
 .setup__status.is-warn {
   color: var(--warn);
   border-color: color-mix(in srgb, var(--warn) 50%, var(--border));
@@ -181,7 +185,14 @@
   list-style: none;
 }
 
-.setup-reasons li {
+.setup-reasons__item {
+  display: flex;
+}
+
+.setup-reasons__action {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   min-height: 24px;
   padding: 5px 9px;
   border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
@@ -193,6 +204,50 @@
   font-weight: 700;
   letter-spacing: var(--track-wide);
   text-transform: uppercase;
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color var(--transition),
+    background var(--transition),
+    transform 160ms var(--ease-press);
+}
+
+.setup-reasons__fix {
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.setup-reasons__item.is-blocking .setup-reasons__action {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  background: color-mix(in srgb, var(--warn) 9%, var(--bg-surface));
+  color: var(--warn);
+}
+
+.setup-reasons__item.is-blocking .setup-reasons__fix {
+  color: var(--warn);
+}
+
+.setup-reasons__action:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-surface));
+}
+
+.setup-reasons__item.is-blocking .setup-reasons__action:hover {
+  border-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 16%, var(--bg-surface));
+}
+
+.setup-reasons__action:active {
+  transform: translateY(1px);
+}
+
+.setup-reasons__action:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.setup-reasons__item.is-blocking .setup-reasons__action:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent);
 }
 
 @keyframes setup-status-pulse {

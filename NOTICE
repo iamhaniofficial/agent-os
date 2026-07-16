@@ -10,3 +10,8 @@ affected modules.
 Additional third-party attributions (bundled skills, models, vendored
 web assets, and adapted tooling) are recorded in
 THIRD_PARTY_NOTICES.md.
+
+This product includes code adapted from hermes-agent
+(https://github.com/NousResearch/hermes-agent), Copyright (c) 2025
+Nous Research, licensed under the MIT License. Adapted components:
+curated memory store, memory tool schema, memory provider lifecycle.

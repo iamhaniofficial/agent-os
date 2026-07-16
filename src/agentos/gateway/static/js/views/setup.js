@@ -22,6 +22,18 @@ const SetupView = (() => {
     degraded: 'Needs action',
     unknown: 'Check',
   };
+  // Section id -> setup step id. Shared by initial-step selection and the
+  // clickable action-needed rows so both jump to the same fix surface.
+  const SECTION_STEPS = [
+    ['llm', 'provider'],
+    ['provider', 'provider'],
+    ['router', 'router'],
+    ['channels', 'channels'],
+    ['search', 'extras'],
+    ['image_generation', 'extras'],
+    ['audio', 'extras'],
+    ['memory_embedding', 'extras'],
+  ];
 
   let _el = null;
   let _rpc = null;
@@ -29,6 +41,7 @@ const SetupView = (() => {
   let _status = {};
   let _config = {};
   let _channelStatus = { channels: [] };
+  let _memoryDoctorStatus = null;
   let _step = 'provider';
   let _channelType = '';
   let _pollTimer = null;
@@ -48,16 +61,18 @@ const SetupView = (() => {
 
   async function _load() {
     try {
-      const [catalog, status, config, channelStatus] = await Promise.all([
+      const [catalog, status, config, channelStatus, memoryDoctorStatus] = await Promise.all([
         _rpc.call('onboarding.catalog'),
         _rpc.call('onboarding.status'),
         _rpc.call('config.get'),
         _rpc.call('channels.status').catch(() => ({ channels: [] })),
+        _rpc.call('doctor.memory.status').catch(() => null),
       ]);
       _catalog = catalog || {};
       _status = status || {};
       _config = config || {};
       _channelStatus = channelStatus || { channels: [] };
+      _memoryDoctorStatus = memoryDoctorStatus || null;
     } catch (err) {
       _el.innerHTML = `<div class="setup-error">Failed to load setup catalog: ${_esc(err.message)}</div>`;
     }
@@ -65,22 +80,23 @@ const SetupView = (() => {
 
   function _draw() {
     if (!_el) return;
-    const setupAction = _hasSetupAction();
+    const reasons = _onboardingReasons();
+    const headline = _setupHeadline(reasons);
     _el.innerHTML = `
       <section class="setup">
         <header class="setup__head">
           <div>
             <p class="setup__kicker">AgentOS setup</p>
-            <h2>${setupAction ? 'Action needed' : 'Ready to run'}</h2>
+            <h2>${_esc(headline.title)}</h2>
           </div>
           <div class="setup__head-aside">
             <button type="button" class="setup__exit" data-exit-setup aria-label="Exit setup and return to Overview">
               <span aria-hidden="true">←</span><span>Exit setup</span>
             </button>
-            <div class="setup__status ${setupAction ? 'is-warn' : 'is-ok'}">
-              ${setupAction ? 'Action needed' : 'Ready'}
+            <div class="setup__status ${headline.tone}">
+              ${_esc(headline.chip)}
             </div>
-            ${_renderOnboardingReasons()}
+            ${_renderOnboardingReasons(reasons)}
           </div>
         </header>
         <nav class="setup-stepper" aria-label="Setup steps">
@@ -156,35 +172,80 @@ const SetupView = (() => {
     );
   }
 
-  function _renderOnboardingReasons() {
-    const reasons = _onboardingReasons();
-    if (!reasons.length) return '';
-    return `<ul class="setup-reasons" aria-label="Setup actions needed">
-      ${reasons.map(reason => `<li>${_esc(reason)}</li>`).join('')}
+  // Header headline + status chip, tiered by the reasons list. Blocking wins;
+  // optional-only downgrades to "Optional improvements"; empty is "Ready".
+  function _setupHeadline(reasons) {
+    const list = reasons || _onboardingReasons();
+    const blocking = list.filter(reason => reason.tier === 'blocking').length;
+    const optional = list.length - blocking;
+    if (blocking) {
+      return { title: 'Action needed', chip: 'Action needed', tone: 'is-warn' };
+    }
+    if (optional) {
+      return {
+        title: 'Optional improvements',
+        chip: `Optional · ${optional} ${optional === 1 ? 'item' : 'items'}`,
+        tone: 'is-optional',
+      };
+    }
+    return { title: 'Ready to run', chip: 'Ready', tone: 'is-ok' };
+  }
+
+  function _renderOnboardingReasons(reasons) {
+    const list = reasons || _onboardingReasons();
+    if (!list.length) return '';
+    const blocking = list.filter(reason => reason.tier === 'blocking').length;
+    const label = blocking ? 'Setup actions needed' : 'Optional improvements';
+    return `<ul class="setup-reasons" aria-label="${_esc(label)}">
+      ${list.map(_renderReasonRow).join('')}
     </ul>`;
   }
 
+  function _renderReasonRow(reason) {
+    const isBlocking = reason.tier === 'blocking';
+    const toneClass = isBlocking ? 'is-blocking' : 'is-optional';
+    const affordance = isBlocking ? 'Fix →' : 'Review →';
+    const ariaLabel = `${affordance.replace(' →', '')} ${reason.text}`;
+    return `<li class="setup-reasons__item ${toneClass}">
+      <button type="button" class="setup-reasons__action" data-step="${_esc(reason.step)}" aria-label="${_esc(ariaLabel)}" title="${_esc(ariaLabel)}">
+        <span class="setup-reasons__text">${_esc(reason.text)}</span>
+        <span class="setup-reasons__fix" aria-hidden="true">${_esc(affordance)}</span>
+      </button>
+    </li>`;
+  }
+
+  // Reasons as tiered, clickable rows: { text, tier, step }.
+  // Blocking = detail.blocking || status === 'missing'; optional otherwise.
   function _onboardingReasons() {
     if (!_hasSetupAction()) return [];
     const reasons = [];
+    const seen = new Set();
+    const push = (text, tier, step) => {
+      if (seen.has(text)) return;
+      seen.add(text);
+      reasons.push({ text, tier, step });
+    };
     const llm = _config.llm || {};
     if (_providerEnvMissing()) {
-      reasons.push(`${_providerEnvKey()} is not visible`);
+      push(`${_providerEnvKey()} is not visible`, 'blocking', 'provider');
     } else if (!llm.provider || !llm.model) {
-      reasons.push('Connect a model provider');
+      push('Connect a model provider', 'blocking', 'provider');
     }
     const details = _status.sectionDetails || {};
     Object.entries(details).forEach(([name, detail]) => {
-      if (!detail.blocking && !detail.actionRequired) return;
+      if (!detail.blocking && !detail.actionRequired
+        && detail.status !== 'missing' && detail.status !== 'degraded') return;
+      const step = _stepForSection(name);
+      const tier = detail.blocking || detail.status === 'missing' ? 'blocking' : 'optional';
       if ((name === 'llm' || name === 'provider') && detail.status === 'missing') {
-        if (!reasons.includes('Connect a model provider')) reasons.push('Connect a model provider');
+        push('Connect a model provider', 'blocking', step);
         return;
       }
       if ((name === 'llm' || name === 'provider') && reasons.length) return;
-      const reason = _setupActionReason(name, detail);
-      if (!reasons.includes(reason)) reasons.push(reason);
+      push(_setupActionReason(name, detail), tier, step);
     });
-    return reasons.length ? reasons : ['Review setup sections for pending actions'];
+    if (!reasons.length) push('Review setup sections for pending actions', 'blocking', 'provider');
+    return reasons;
   }
 
   function _setupActionReason(name, detail) {
@@ -224,16 +285,7 @@ const SetupView = (() => {
 
   function _initialStepFromStatus() {
     const details = _status.sectionDetails || {};
-    const sectionSteps = [
-      ['llm', 'provider'],
-      ['router', 'router'],
-      ['channels', 'channels'],
-      ['search', 'extras'],
-      ['image_generation', 'extras'],
-      ['audio', 'extras'],
-      ['memory_embedding', 'extras'],
-    ];
-    const entry = sectionSteps.find(([section]) => {
+    const entry = SECTION_STEPS.find(([section]) => {
       const detail = details[section] || {};
       return (
         detail.blocking
@@ -247,6 +299,11 @@ const SetupView = (() => {
     return 'provider';
   }
 
+  function _stepForSection(name) {
+    const entry = SECTION_STEPS.find(([section]) => section === name);
+    return entry ? entry[1] : 'provider';
+  }
+
   function _renderNeedList(items, label, dataAttr = '') {
     const needs = (items || []).filter(Boolean);
     const attr = dataAttr ? ` ${dataAttr}` : '';
@@ -255,6 +312,22 @@ const SetupView = (() => {
       <span>${_esc(label)}</span>
       <ul>${needs.map(item => `<li>${_esc(item)}</li>`).join('')}</ul>
     </div>`;
+  }
+
+  function _renderMemorySettingsUsageRows(curated) {
+    if (!curated || typeof curated !== 'object') return '';
+    const rows = [
+      ['memory', 'MEMORY.md'],
+      ['user', 'USER.md'],
+    ].map(([key, label]) => {
+      const entry = curated[key];
+      if (!entry) return '';
+      const entries = Number(entry.entries || 0);
+      const usage = _esc(String(entry.usage || ''));
+      const noun = entries === 1 ? 'entry' : 'entries';
+      return `<p class="setup-muted" data-memory-settings-usage data-memory-settings-usage-${key}>${label}: ${entries} ${noun} — ${usage} chars</p>`;
+    }).join('');
+    return rows;
   }
 
   function _credentialNeedList(items, envKey) {
@@ -676,6 +749,19 @@ const SetupView = (() => {
     const memoryLocalHidden = memoryLocalControlEnabled ? '' : ' hidden';
     const memoryStatusText = _memoryEmbeddingStatusText(effectiveProvider);
     const memoryNeeds = _memoryNeedList(memorySpec, effectiveProvider, memoryEnv);
+    const memoryConfig = ((_config || {}).memory || {});
+    const memorySettingsMemoryLimit = memoryConfig.curated_memory_char_limit ?? 4000;
+    const memorySettingsUserLimit = memoryConfig.curated_user_char_limit ?? 2000;
+    const memorySettingsInjectLimit = memoryConfig.inject_limit ?? 6400;
+    const memoryProviderName = String(((memoryConfig.provider || {}).name) || '');
+    // ~310 chars of header/separator overhead per curated block (see
+    // MemoryConfig.inject_limit docstring in gateway/config.py) — a
+    // client-side heuristic only, not an authoritative budget check.
+    const memorySettingsOverheadChars = 310;
+    const memorySettingsOverBudget = (
+      memorySettingsMemoryLimit + memorySettingsUserLimit + memorySettingsOverheadChars
+    ) > memorySettingsInjectLimit;
+    const memorySettingsCurated = (_memoryDoctorStatus || {}).curated || null;
     const imageProviderSelected = _status.imageGenerationProvider || (_status.imageGenerationPrimary || '').split('/')[0] || imageProviders[0]?.providerId || 'openrouter';
     const imageSpec = imageProviders.find(p => p.providerId === imageProviderSelected) || imageProviders[0] || {};
     const imageConfig = ((_config || {}).image_generation || {});
@@ -772,6 +858,34 @@ const SetupView = (() => {
               </div>
             </details>
             <button class="${_capabilitySaveButtonClass('memory_embedding')}" data-save-memory>Save memory embedding</button>
+          </div>
+          <div class="setup-mini">
+            <div class="setup-mini__head">
+              <h4>Memory</h4>
+            </div>
+            <p class="setup-muted">Bounded long-term memory and profile notes carried into every conversation.</p>
+            <label><span>Memory provider</span>
+              <select id="setup-memory-provider-name" name="setup_memory_provider_name" data-memory-provider-name>
+                <option value=""${memoryProviderName === '' ? ' selected' : ''}>None — built-in memory only</option>
+                <option value="mem0"${memoryProviderName === 'mem0' ? ' selected' : ''}>mem0</option>
+              </select>
+            </label>
+            <p class="setup-muted">mem0 runs fully local (Ollama + on-disk vector store) and needs <code>pip install 'use-agent-os[mem0]'</code>. Switching provider requires a gateway restart.</p>
+            <label><span>Long-term memory budget (MEMORY.md)</span>
+              <input id="setup-memory-settings-memory-limit" name="setup_memory_settings_memory_limit" type="number" min="0" step="1" inputmode="numeric" data-memory-settings-memory-limit value="${_esc(String(memorySettingsMemoryLimit))}">
+            </label>
+            <p class="setup-muted">Max characters kept in MEMORY.md, the agent's shared long-term notes.</p>
+            <label><span>User profile budget (USER.md)</span>
+              <input id="setup-memory-settings-user-limit" name="setup_memory_settings_user_limit" type="number" min="0" step="1" inputmode="numeric" data-memory-settings-user-limit value="${_esc(String(memorySettingsUserLimit))}">
+            </label>
+            <p class="setup-muted">Max characters kept in USER.md, notes about you specifically.</p>
+            <label><span>Prompt injection limit</span>
+              <input id="setup-memory-settings-inject-limit" name="setup_memory_settings_inject_limit" type="number" min="0" step="1" inputmode="numeric" data-memory-settings-inject-limit value="${_esc(String(memorySettingsInjectLimit))}">
+            </label>
+            <p class="setup-muted">Max characters of memory injected into the system prompt each turn, chars not tokens.</p>
+            ${memorySettingsOverBudget ? '<div class="setup-warning" data-memory-settings-warning>Injection limit too small — the user profile block may be dropped.</div>' : ''}
+            ${_renderMemorySettingsUsageRows(memorySettingsCurated)}
+            <button class="setup-btn" data-save-memory-settings>Save memory settings</button>
           </div>
           <div class="setup-mini">
             <div class="setup-mini__head">
@@ -1202,6 +1316,7 @@ const SetupView = (() => {
     _el.querySelector('[data-save-channel]')?.addEventListener('click', _saveChannel);
     _el.querySelector('[data-save-search]')?.addEventListener('click', _saveSearch);
     _el.querySelector('[data-save-memory]')?.addEventListener('click', _saveMemory);
+    _el.querySelector('[data-save-memory-settings]')?.addEventListener('click', _saveMemorySettings);
     _el.querySelector('[data-save-image]')?.addEventListener('click', _saveImage);
     _el.querySelector('[data-save-audio]')?.addEventListener('click', _saveAudio);
   }
@@ -1713,6 +1828,32 @@ const SetupView = (() => {
       )) {
         UI.toast('Memory embedding saved. Restart required.', 'info');
       }
+      await _load();
+      _draw();
+    } catch (err) {
+      UI.toast('Save failed: ' + err.message, 'err');
+    }
+  }
+
+  async function _saveMemorySettings() {
+    const memoryLimitInput = _el.querySelector('[data-memory-settings-memory-limit]');
+    const userLimitInput = _el.querySelector('[data-memory-settings-user-limit]');
+    const injectLimitInput = _el.querySelector('[data-memory-settings-inject-limit]');
+    const providerNameInput = _el.querySelector('[data-memory-provider-name]');
+    const patches = {
+      'memory.provider.name': providerNameInput?.value || null,
+      'memory.curated_memory_char_limit': Number.parseInt(memoryLimitInput?.value || '0', 10),
+      'memory.curated_user_char_limit': Number.parseInt(userLimitInput?.value || '0', 10),
+      'memory.inject_limit': Number.parseInt(injectLimitInput?.value || '0', 10),
+    };
+    try {
+      const res = await _rpc.call('config.patch', { patches });
+      UI.toast(
+        (res || {}).restartRequired
+          ? 'Memory settings saved. Restart required.'
+          : 'Memory settings saved.',
+        'info',
+      );
       await _load();
       _draw();
     } catch (err) {

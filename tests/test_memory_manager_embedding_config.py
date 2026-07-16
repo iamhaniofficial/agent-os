@@ -12,11 +12,34 @@ from agentos.memory.embedding import (
     OllamaEmbeddingProvider,
     OpenAIEmbeddingProvider,
 )
-from agentos.memory.embedding_resolver import local_bge_available, resolve_memory_embedding
+from agentos.memory.embedding_resolver import (
+    local_bge_available,
+    preferred_local_model,
+    resolve_memory_embedding,
+)
 from agentos.memory.meta import MemoryIndexMeta
 from agentos.memory.store import LongTermMemoryStore
 
 _LOCAL_AVAILABLE_PATH = "agentos.memory.embedding_resolver.local_bge_available"
+_GEMMA_MODEL = "google/embeddinggemma-300m"
+_BGE_MODEL = "BAAI/bge-small-zh-v1.5"
+
+
+def _fake_gemma_download(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Make ``downloaded_model_dir(GEMMA)`` resolve to a real tmp dir with an
+    ONNX file, so preferred-model discovery treats Gemma as downloaded."""
+    gemma_dir = tmp_path / "embeddinggemma-300m-q8"
+    gemma_dir.mkdir()
+    (gemma_dir / "model_quantized.onnx").write_bytes(b"onnx")
+
+    def fake_downloaded_model_dir(model_id: str) -> Path | None:
+        return gemma_dir if model_id == _GEMMA_MODEL else None
+
+    monkeypatch.setattr(
+        "agentos.memory.model_download.downloaded_model_dir",
+        fake_downloaded_model_dir,
+    )
+    return gemma_dir
 
 
 class _FakeStore:
@@ -779,3 +802,122 @@ async def test_fts_only_reindex_after_provider_change_restores_lexical_search() 
         assert results[0].path == "MEMORY.md"
     finally:
         await store._db.close()  # type: ignore[union-attr]
+
+
+# --- C4: auto prefers downloaded EmbeddingGemma with BGE fallback ---------------
+
+
+def test_preferred_local_model_is_bge_when_gemma_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "agentos.memory.model_download.downloaded_model_dir",
+        lambda _model_id: None,
+    )
+    assert preferred_local_model() == _BGE_MODEL
+
+
+def test_preferred_local_model_is_gemma_when_downloaded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _fake_gemma_download(monkeypatch, tmp_path)
+    assert preferred_local_model() == _GEMMA_MODEL
+
+
+def test_auto_prefers_downloaded_gemma(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _fake_gemma_download(monkeypatch, tmp_path)
+    cfg = GatewayConfig()
+    decision = resolve_memory_embedding(cfg.memory, local_available=lambda *_: True)
+    assert decision.effective_provider == "local"
+    assert decision.model == _GEMMA_MODEL
+
+
+def test_auto_falls_back_to_bundled_bge_when_not_downloaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "agentos.memory.model_download.downloaded_model_dir",
+        lambda _model_id: None,
+    )
+    cfg = GatewayConfig()
+    decision = resolve_memory_embedding(cfg.memory, local_available=lambda *_: True)
+    assert decision.effective_provider == "local"
+    assert decision.model == _BGE_MODEL
+
+
+def test_explicit_local_model_wins_over_preferred(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Gemma is downloaded, but the user pinned BGE explicitly → verbatim.
+    _fake_gemma_download(monkeypatch, tmp_path)
+    cfg = GatewayConfig(
+        memory={"embedding": {"provider": "local", "local": {"model": _BGE_MODEL}}}
+    )
+    decision = resolve_memory_embedding(cfg.memory)
+    assert decision.effective_provider == "local"
+    assert decision.model == _BGE_MODEL
+
+
+def test_explicit_local_uses_preferred_gemma_when_downloaded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # provider=local with no pinned model, Gemma downloaded → prefer Gemma.
+    _fake_gemma_download(monkeypatch, tmp_path)
+    cfg = GatewayConfig(memory={"embedding": {"provider": "local"}})
+    decision = resolve_memory_embedding(cfg.memory)
+    assert decision.effective_provider == "local"
+    assert decision.model == _GEMMA_MODEL
+
+
+def test_explicit_local_bundled_bge_works_with_zero_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No Gemma, provider=local, no config → bundled BGE must keep working.
+    monkeypatch.setattr(
+        "agentos.memory.model_download.downloaded_model_dir",
+        lambda _model_id: None,
+    )
+    cfg = GatewayConfig(memory={"embedding": {"provider": "local"}})
+    decision = resolve_memory_embedding(cfg.memory)
+    assert decision.effective_provider == "local"
+    assert decision.model == _BGE_MODEL
+
+
+def test_explicit_local_missing_model_raises_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # User pins Gemma but it is not downloaded and not bundled → actionable error.
+    monkeypatch.setattr(
+        "agentos.memory.model_download.downloaded_model_dir",
+        lambda _model_id: None,
+    )
+    cfg = GatewayConfig(
+        memory={"embedding": {"provider": "local", "local": {"model": _GEMMA_MODEL}}}
+    )
+    with pytest.raises(ValueError, match="embedding-download"):
+        resolve_memory_embedding(cfg.memory)
+
+
+def test_fingerprint_differs_between_bge_and_gemma(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "agentos.memory.model_download.downloaded_model_dir",
+        lambda _model_id: None,
+    )
+    cfg = GatewayConfig()
+    decision_bge = resolve_memory_embedding(cfg.memory, local_available=lambda *_: True)
+
+    _fake_gemma_download(monkeypatch, tmp_path)
+    decision_gemma = resolve_memory_embedding(cfg.memory, local_available=lambda *_: True)
+
+    assert decision_bge.model == _BGE_MODEL
+    assert decision_gemma.model == _GEMMA_MODEL
+    assert decision_bge.fingerprint != decision_gemma.fingerprint

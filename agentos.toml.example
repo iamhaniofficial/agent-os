@@ -106,17 +106,26 @@ base_url = "https://openrouter.ai/api/v1"
 # "workspace" stores MEMORY.md and memory/*.md under workspace_dir.
 # SQLite indexes still live under state_dir.
 source = "workspace"
-# Long-term memory vector indexing defaults to provider="auto": it tries the
-# bundled local BGE-small ONNX model first, then a memory-specific remote key
-# if one is configured, then FTS-only. Chat LLM/OpenRouter credentials are not
+# Long-term memory vector indexing defaults to provider="auto". Auto order:
+# a downloaded EmbeddingGemma model first (higher quality), then the bundled
+# BGE-small ONNX model (offline fallback), then a memory-specific remote key if
+# one is configured, then FTS-only. Chat LLM/OpenRouter credentials are not
 # used for memory embeddings unless explicitly configured below.
+#
+# Upgrade the local model with:
+#   agentos memory embedding-download
+# Use --model <id> to select a different model (default: google/embeddinggemma-300m).
+# Auto mode then prefers it automatically. Switching the local model changes the
+# embedding fingerprint and triggers a full reindex on next start.
 # retrieval_mode = "hybrid"  # "hybrid" | "fts_only"
 #
 # [memory.embedding]
 # provider = "auto" # "auto" | "none" | "local" | "openai" | "openai-compatible" | "ollama"
 #
 # [memory.embedding.local]
-# onnx_dir = "" # optional; empty uses bundled BGE; supports absolute, ~, or process-relative paths
+# model = "" # optional; empty = auto (downloaded EmbeddingGemma else bundled BGE);
+#            # pin to "google/embeddinggemma-300m" or "BAAI/bge-small-zh-v1.5"
+# onnx_dir = "" # optional; empty uses the resolved model's export; supports absolute, ~, or process-relative paths
 #
 # [memory.embedding.remote]
 # api_key = ""
@@ -126,13 +135,49 @@ source = "workspace"
 #
 # [memory.embedding.ollama]
 # base_url = "http://localhost:11434"
-# model = "nomic-embed-text"
+# model = "embeddinggemma"
+# Older setups may still have "nomic-embed-text" configured here; that
+# continues to work, but changing the model (in either direction) triggers
+# a full reindex since it changes the embedding fingerprint.
 # Turn capture writes memory/archive/** audit transcripts by default.
 # These archives are not searchable memory unless explicitly opted in.
 # capture_user = true
 # capture_assistant = false
 # capture_excluded_run_kinds = ["recall", "session_recall"]
 # capture_excluded_provenance_kinds = ["recall", "tool_result", "memory_injected"]
+#
+# Curated memory: MEMORY.md (agent notes) and USER.md (user profile) are
+# bounded entry stores injected into every system prompt. When full, the
+# agent consolidates via the `memory` tool instead of growing unbounded.
+# curated_memory_char_limit = 4000
+# curated_user_char_limit = 2000
+#
+# inject_limit bounds total passive memory injection into the system prompt
+# (curated blocks plus any legacy free-form fallback). Keep it comfortably
+# above curated_memory_char_limit + curated_user_char_limit + header
+# overhead so a full MEMORY.md and a full USER.md both fit without either
+# block being dropped whole at the injection boundary.
+# inject_limit = 6400
+
+# [memory.provider]
+# Optional external memory provider layered on top of built-in memory. When a
+# provider is selected it adds a prompt recall block, fenced recall, per-turn
+# sync, and a write mirror. name is empty by default (built-in memory only).
+# The provider is built once at boot, so changing name requires a gateway
+# restart. mem0 needs the extra: pip install "use-agent-os[mem0]".
+# name = "mem0"  # "" (disabled) | "mem0"
+#
+# [memory.provider.mem0]
+# mem0 defaults target a fully local stack (Ollama LLM + embedder, on-disk
+# vector store) so it works offline with no API keys. vector_store_path is
+# empty by default and resolves to <agent state dir>/mem0 at boot.
+# llm_provider = "ollama"
+# llm_model = "qwen3:4b"
+# llm_base_url = "http://localhost:11434"
+# embedder_provider = "ollama"
+# embedder_model = "embeddinggemma"
+# embedder_base_url = "http://localhost:11434"
+# vector_store_path = ""  # empty -> <agent state dir>/mem0
 
 [memory.dream]
 # Dream consolidation is safety-first by default. Background scheduling and
@@ -160,7 +205,8 @@ max_skills_prompt_chars = 8000
 # filter_lexical_top_n = 20
 # filter_semantic_top_n = 20
 # filter_rrf_k = 60
-# filter_embedding_model = "BAAI/bge-small-zh-v1.5"
+# filter_embedding_model = "BAAI/bge-small-zh-v1.5"  # bundled BGE default;
+#   set "google/embeddinggemma-300m" to reuse a downloaded EmbeddingGemma export
 
 [task_runtime]
 # Server-side agent turn queue. Same-session tasks are serialized;

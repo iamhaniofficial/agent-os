@@ -1370,6 +1370,7 @@ class TurnRunner:
         model_catalog: Any | None = None,
         memory_retrievers: dict[str, Any] | None = None,
         turn_capture_services: dict[str, Any] | None = None,
+        memory_provider_managers: dict[str, Any] | None = None,
         session_flush_service: SessionFlushService | None = None,
         session_lock_provider: Callable[[str], asyncio.Lock] | None = None,
         diagnostics_state: Any | None = None,
@@ -1387,6 +1388,11 @@ class TurnRunner:
         self._model_catalog = model_catalog
         self._memory_retrievers = memory_retrievers
         self._turn_capture_services = turn_capture_services
+        # External memory provider managers (Plan B), keyed by agent_id. Empty /
+        # None unless a provider is configured AND available at boot. Every
+        # provider wiring site is a single ``None``/empty-dict check so the
+        # disabled default path adds zero awaits/imports to the hot path.
+        self._memory_provider_managers = memory_provider_managers
         self._session_flush_service = session_flush_service
         self._diagnostics_state = diagnostics_state
         self._router_control_hold_store = RouterControlHoldStore()
@@ -1634,6 +1640,75 @@ class TurnRunner:
             ),
         )
 
+    def _provider_manager_for(self, agent_id: str) -> Any | None:
+        """Resolve the external memory provider manager for an agent, or None.
+
+        Zero-cost when no provider is configured: the dict is None/empty on the
+        disabled default path, so this returns ``None`` after a single lookup.
+        Falls back to the ``main`` agent's manager, mirroring how the other
+        per-agent memory tiers resolve.
+        """
+        managers = self._memory_provider_managers
+        if not managers:
+            return None
+        return managers.get(agent_id) or managers.get("main")
+
+    async def _resolve_session_id_for_prefetch(self, session_key: str) -> str:
+        """Best-effort provider recall scoping key. Empty string on any miss."""
+        if self._session_manager is None:
+            return ""
+        try:
+            session = await self._session_manager.get_session(session_key)
+        except Exception:  # noqa: BLE001 — recall scoping is best-effort
+            return ""
+        return str(getattr(session, "session_id", "") or "")
+
+    async def _augment_extra_context_with_prefetch(
+        self,
+        *,
+        agent_id: str,
+        session_id: str,
+        message: str,
+        extra_context: dict[str, str] | None,
+        timeout: float = 3.0,
+    ) -> dict[str, str] | None:
+        """Return ``extra_context`` with the provider's fenced recall injected.
+
+        The prefetched block is per-turn volatile content, so it rides in
+        ``extra_context`` (rendered as a ``## <key>`` block in the dynamic
+        suffix) rather than the cacheable base prompt. Best-effort and bounded:
+        a slow provider cannot stall the turn — on timeout or error we log and
+        inject nothing, returning the context unchanged. No-op (returns the
+        input object) when no provider is configured.
+        """
+        manager = self._provider_manager_for(agent_id)
+        if manager is None or not message:
+            return extra_context
+        try:
+            block = await asyncio.wait_for(
+                manager.prefetch_all(message, session_id=session_id),
+                timeout=timeout,
+            )
+        except TimeoutError:
+            log.warning(
+                "turn_runner.memory_prefetch_timeout",
+                agent_id=agent_id,
+                timeout_seconds=timeout,
+            )
+            return extra_context
+        except Exception as exc:  # noqa: BLE001 — recall is best-effort
+            log.warning(
+                "turn_runner.memory_prefetch_failed",
+                agent_id=agent_id,
+                error=str(exc),
+            )
+            return extra_context
+        if not block:
+            return extra_context
+        merged = dict(extra_context) if extra_context else {}
+        merged["Memory Context"] = block
+        return merged
+
     async def _capture_turn_memory(
         self,
         *,
@@ -1679,6 +1754,23 @@ class TurnRunner:
             captured_at=datetime.now(tz=UTC),
             no_memory_capture=no_memory_capture,
         )
+
+        # Mirror the completed turn to the external provider (Plan B). Both
+        # calls are non-blocking background enqueues that no-op when no
+        # provider is configured — the turn path never awaits provider I/O.
+        provider_manager = self._provider_manager_for(agent_id)
+        if provider_manager is not None:
+            session_id = getattr(session, "session_id", "")
+            provider_manager.sync_all(
+                runtime_message,
+                final_text,
+                session_id=session_id,
+                messages=[
+                    {"role": "user", "content": runtime_message},
+                    {"role": "assistant", "content": final_text},
+                ],
+            )
+            provider_manager.queue_prefetch_all(runtime_message, session_id=session_id)
 
     @staticmethod
     def _capture_filter_matches(value: str | None, excluded_values: Any) -> bool:
@@ -2002,6 +2094,18 @@ class TurnRunner:
             semantic_input = input_out.semantic_input
             extra_prompt_context = input_out.extra_prompt_context
             normalization_metadata = input_out.normalization_metadata
+
+            # External memory provider PREFETCH (Plan B): inject this turn's
+            # recalled context as a per-turn volatile block. Gated on provider
+            # presence first so the disabled default adds only a dict lookup;
+            # bounded by a modest timeout so a slow provider cannot stall turns.
+            if self._provider_manager_for(agent_id) is not None:
+                extra_prompt_context = await self._augment_extra_context_with_prefetch(
+                    agent_id=agent_id,
+                    session_id=await self._resolve_session_id_for_prefetch(session_key),
+                    message=runtime_message,
+                    extra_context=extra_prompt_context,
+                )
 
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
@@ -3465,6 +3569,39 @@ class TurnRunner:
         else:
             daily = self._load_daily_notes(memory_source_dir)
             memory_text = self._load_memory_md(memory_source_dir)
+        # The curated store now owns MEMORY.md / USER.md injection via the
+        # ``## Memory`` block (usage header + sanitization). Drop the raw
+        # copies from the volatile "Workspace Files" block so they are not
+        # injected twice.
+        #
+        # IMPORTANT: this pop must NOT be gated on the rendered header being
+        # present in ``memory_text``. When the curated user block gets
+        # dropped whole by the inject_limit budget (see
+        # ``_load_curated_memory_block``), ``memory_text`` no longer
+        # contains "USER PROFILE (who the user is)" even though the curated
+        # store still manages USER.md -- gating on that string would let the
+        # RAW, UNSANITIZED USER.md re-enter the prompt via the
+        # workspace-files block. Sanitization must not depend on injection
+        # success, so pop unconditionally whenever the curated path was used
+        # at all (i.e. private memory injection is allowed for this
+        # session), independent of which blocks survived the budget.
+        if memory_text and "MEMORY (your personal notes)" in memory_text:
+            workspace_files.pop("MEMORY.md", None)
+        if private_memory_allowed:
+            workspace_files.pop("USER.md", None)
+        # External memory provider STATIC block (Plan B). Joins the curated
+        # memory blocks in the cacheable base prompt (provider identity /
+        # capability text is stable across turns). No-op when no provider is
+        # configured or the provider yields no block. Gated by private-memory
+        # policy alongside the curated blocks so stateless prompts stay clean.
+        if private_memory_allowed:
+            provider_manager = self._provider_manager_for(agent_id)
+            if provider_manager is not None:
+                static_block = provider_manager.build_system_prompt()
+                if static_block:
+                    memory_text = (
+                        f"{memory_text}\n\n{static_block}" if memory_text else static_block
+                    )
         daily_notes_count_before_omit = len(daily)
         daily_notes_omitted = daily_notes_count_before_omit > 0
         if daily_notes_omitted:
@@ -3628,12 +3765,26 @@ class TurnRunner:
         return 50_000
 
     def _load_memory_md(self, workspace_dir: Any, max_chars: int | None = None) -> str | None:
-        """Load MEMORY.md from agent workspace for system prompt injection."""
+        """Build the curated MEMORY.md + USER.md block for system-prompt injection.
+
+        Runs the one-time free-form → §-entry migration, then loads a
+        ``CuratedMemoryStore`` and returns its frozen snapshot blocks (usage
+        header + per-entry threat sanitization) joined memory-then-user. Falls
+        back to the legacy raw-file read only when the curated store yields no
+        block (e.g. a ``memory.md`` lowercase file the store does not manage).
+        """
         from pathlib import Path
 
         if max_chars is None:
-            max_chars = getattr(getattr(self._config, "memory", None), "inject_limit", 4000)
+            max_chars = getattr(getattr(self._config, "memory", None), "inject_limit", 6400)
         root = Path(workspace_dir)
+
+        curated = self._load_curated_memory_block(root, max_chars=max_chars)
+        if curated is not None:
+            return curated
+
+        # Legacy fallback: lowercase memory.md, or any file the curated store
+        # does not treat as MEMORY.md.
         memory_file = root / "MEMORY.md"
         if not memory_file.is_file():
             memory_file = root / "memory.md"
@@ -3648,6 +3799,85 @@ class TurnRunner:
         if len(content) > max_chars:
             return content[:max_chars] + "\n..."
         return content
+
+    def _load_curated_memory_block(
+        self, memory_dir: Any, *, max_chars: int | None = None
+    ) -> str | None:
+        """Return the joined curated MEMORY.md + USER.md snapshot block, or None.
+
+        Migrates a pre-curated free-form MEMORY.md before the first load, then
+        renders the store's frozen snapshot blocks. Returns None when neither
+        store has any entries so the caller can apply its legacy fallback.
+
+        Blocks are included whole, in priority order (memory block first, then
+        user block): a block that would push the joined result past
+        ``max_chars`` is dropped entirely rather than sliced mid-block, so the
+        usage header inside a kept block always matches what was injected. The
+        one exception is a pathological memory block that alone exceeds
+        ``max_chars`` — that block is still sliced (legacy behavior) so a
+        broken store still injects something, with a warning logged.
+        """
+        from pathlib import Path
+
+        from agentos.memory.curated import CuratedMemoryStore
+        from agentos.memory.curated_migration import migrate_freeform_memory_md
+
+        memory_cfg = getattr(self._config, "memory", None)
+        memory_limit = getattr(memory_cfg, "curated_memory_char_limit", 4000)
+        user_limit = getattr(memory_cfg, "curated_user_char_limit", 2000)
+
+        root = Path(memory_dir)
+        try:
+            migrate_freeform_memory_md(root, memory_limit)
+        except OSError:
+            pass
+
+        store = CuratedMemoryStore(
+            memory_dir=root,
+            memory_char_limit=memory_limit,
+            user_char_limit=user_limit,
+        )
+        store.load_from_disk()
+        named_blocks = [
+            (name, block)
+            for name, block in (
+                ("memory", store.snapshot_block("memory")),
+                ("user", store.snapshot_block("user")),
+            )
+            if block
+        ]
+        if not named_blocks:
+            return None
+
+        if max_chars is None:
+            return "\n\n".join(block for _, block in named_blocks)
+
+        first_name, first_block = named_blocks[0]
+        if len(first_block) > max_chars:
+            # Pathological case: even the highest-priority block alone
+            # overflows the limit. Fall back to a raw slice of that block
+            # only, so the caller still gets something injected, rather than
+            # dropping memory injection entirely.
+            log.warning(
+                "curated_memory.inject_truncated",
+                block=first_name,
+                block_chars=len(first_block),
+                max_chars=max_chars,
+            )
+            return first_block[:max_chars] + "\n..."
+
+        included: list[str] = [first_block]
+        joined_len = len(first_block)
+        for name, block in named_blocks[1:]:
+            candidate_len = joined_len + len("\n\n") + len(block)
+            if candidate_len > max_chars:
+                # Drop this (and, implicitly, any lower-priority) block whole
+                # rather than slicing mid-block.
+                continue
+            included.append(block)
+            joined_len = candidate_len
+
+        return "\n\n".join(included)
 
     def _load_daily_notes(self, workspace_dir: Any) -> dict[str, str]:
         from agentos.identity.workspace import load_daily_notes

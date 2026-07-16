@@ -45,15 +45,18 @@ def test_default_bootstrap_templates_define_distinct_file_roles() -> None:
 def test_system_prompt_routes_profile_to_user_md() -> None:
     prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="full"),
-        tools=["memory_search", "memory_get", "write_file", "edit_file", "apply_patch"],
+        tools=["memory_search", "memory_get", "memory", "write_file", "edit_file", "apply_patch"],
     )
 
     assert "USER.md" in prompt
     assert "name, preferred address, pronouns, timezone" in prompt
-    assert "Do not use `memory_save` for `USER.md`" in prompt
-    assert "MEMORY.md` for durable non-profile facts" in prompt
-    assert "`MEMORY.md` + `memory/**/*.md`" in prompt
-    assert "relevant `USER.md`, `MEMORY.md`, or `memory/**/*.md` file" in prompt
+    # Durable facts route through the `memory` tool, not memory_save / filesystem tools.
+    assert "Durable facts go through the `memory` tool" in prompt
+    assert "target` = `memory`" in prompt or "`target` = `memory`" in prompt
+    assert "`target: user`" in prompt
+    assert "Do not use `memory_save` for `USER.md` or `MEMORY.md`" in prompt
+    assert "are managed curated stores" in prompt
+    assert "Do not create or edit them with `write_file`" in prompt
     assert "decisions, dates, people, preferences, or todos" not in prompt
     assert "prior work, decisions, dated history, todos" in prompt
 

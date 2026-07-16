@@ -81,6 +81,7 @@ const App = (() => {
         <a class="nav-item" href="#" data-path="/usage">${icons.usage()} Usage</a>
         <a class="nav-item" href="#" data-path="/cron">${icons.cron()} Cron</a>
         <div class="nav-group-label">Settings</div>
+        <a class="nav-item" href="#" data-path="/setup">${icons.sliders()} Setup</a>
         <a class="nav-item" href="#" data-path="/config">${icons.config()} Config</a>
         <a class="nav-item" href="#" data-path="/logs">${icons.logs()} Logs</a>
         <a class="nav-item" href="#" data-path="/approvals">${icons.approvals()} Approvals <span class="nav-badge hidden" id="approval-count">0</span></a>

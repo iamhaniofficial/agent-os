@@ -26,7 +26,15 @@ def get_embedder(model_name: str | None = None) -> LocalEmbeddingProvider:
     RuntimeError is surfaced when the caller invokes encode_sync /
     embed_query / embed_batch.
     """
-    name = model_name or LocalEmbeddingProvider.DEFAULT_MODEL
+    if model_name is None:
+        # Lazy import to avoid a cycle: embedding_resolver imports from the
+        # memory embedding module, and this module is imported during skill
+        # retrieval setup. Prefer downloaded EmbeddingGemma over bundled BGE.
+        from agentos.memory.embedding_resolver import preferred_local_model
+
+        name = preferred_local_model()
+    else:
+        name = model_name
     with _lock:
         inst = _instances.get(name)
         if inst is None:

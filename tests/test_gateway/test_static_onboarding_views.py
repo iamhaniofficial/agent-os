@@ -73,6 +73,23 @@ def test_setup_view_loads_catalog_and_status():
     assert "current.mode" in txt
 
 
+def test_setup_memory_card_offers_external_provider_selector():
+    txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+
+    # A select bound to memory.provider.name with none (default) + mem0 options.
+    assert "data-memory-provider-name" in txt
+    assert "memory.provider.name" in txt
+    assert "None — built-in memory only" in txt
+    assert ">mem0<" in txt
+    # Hint spells out the extra + the fully-local stack requirement.
+    assert "use-agent-os[mem0]" in txt
+    assert "Ollama" in txt
+    # Saved via config.patch and surfaces the restart hint from the response.
+    save_start = txt.index("async function _saveMemorySettings()")
+    save_body = txt[save_start : txt.index("\n  }", save_start)]
+    assert "memory.provider.name" in save_body
+
+
 def test_setup_view_is_available_and_uses_canonical_cli_fallbacks():
     txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
     assert "SETUP_UI_AVAILABLE" not in txt
@@ -230,11 +247,13 @@ def test_setup_view_starts_on_most_relevant_step():
     assert "function _initialStepFromStatus()" in txt
     assert "await _load();\n    _selectInitialStep();" in render_body
     assert render_body.index("await _load();") < render_body.index("_selectInitialStep();")
-    assert txt.index("const entry = sectionSteps.find") < txt.index(
+    # Initial-step selection reuses the shared SECTION_STEPS map.
+    assert txt.index("const entry = SECTION_STEPS.find(([section]) =>") < txt.index(
         "if (_status.needsOnboarding === false) return 'finish';"
     )
     assert "if (_status.needsOnboarding === false) return 'finish';" in txt
     assert "detail.actionRequired" in txt
+    assert "const SECTION_STEPS = [" in txt
     assert "['llm', 'provider']" in txt
     assert "['router', 'router']" in txt
     assert "['search', 'extras']" in txt
@@ -248,19 +267,39 @@ def test_setup_view_starts_on_most_relevant_step():
 def test_setup_header_tracks_optional_action_required_sections():
     txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
     draw_start = txt.index("function _draw()")
-    draw_end = txt.index("  function _renderOnboardingReasons()", draw_start)
+    draw_end = txt.index("  function _renderStepButton", draw_start)
     draw_body = txt[draw_start:draw_end]
+    headline_start = txt.index("function _setupHeadline(reasons)")
+    headline_end = txt.index("  function _renderOnboardingReasons", headline_start)
+    headline_body = txt[headline_start:headline_end]
     reasons_start = txt.index("function _onboardingReasons()")
-    reasons_end = txt.index("  function _renderCurrentStep()", reasons_start)
+    reasons_end = txt.index("  function _setupActionReason", reasons_start)
     reasons_body = txt[reasons_start:reasons_end]
 
     assert "function _hasSetupAction()" in txt
-    assert "const setupAction = _hasSetupAction();" in draw_body
-    assert "${setupAction ? 'Action needed' : 'Ready to run'}" in draw_body
-    assert "setup__status ${setupAction ? 'is-warn' : 'is-ok'}" in draw_body
-    assert "${setupAction ? 'Action needed' : 'Ready'}" in draw_body
+    # The header derives its headline/chip from the tiered reasons list, not a
+    # binary _hasSetupAction() flag.
+    assert "const reasons = _onboardingReasons();" in draw_body
+    assert "const headline = _setupHeadline(reasons);" in draw_body
+    assert "<h2>${_esc(headline.title)}</h2>" in draw_body
+    assert 'class="setup__status ${headline.tone}"' in draw_body
+    assert "${_esc(headline.chip)}" in draw_body
+    assert "${_renderOnboardingReasons(reasons)}" in draw_body
+    # Three tiers: blocking -> Action needed, optional-only -> Optional
+    # improvements, clean -> Ready to run.
+    assert "reason.tier === 'blocking'" in headline_body
+    assert "title: 'Action needed'" in headline_body
+    assert "title: 'Optional improvements'" in headline_body
+    assert "title: 'Ready to run'" in headline_body
+    assert "tone: 'is-optional'" in headline_body
+    assert "'item' : 'items'" in headline_body
+    # Reasons are tiered {text, tier, step} objects.
     assert "if (!_hasSetupAction()) return [];" in reasons_body
-    assert "if (!detail.blocking && !detail.actionRequired)" in reasons_body
+    assert "reasons.push({ text, tier, step });" in reasons_body
+    assert (
+        "detail.blocking || detail.status === 'missing' ? 'blocking' : 'optional'"
+        in reasons_body
+    )
 
 
 def test_setup_finish_summarizes_provider_proxy_only_when_present():
@@ -568,13 +607,21 @@ def test_setup_view_rebinds_conditional_fields_after_dynamic_redraw():
     assert "_bindConditionalSelects(box || _el)" in txt
 
 
-def test_setup_view_is_loaded_and_registered_but_not_sidebar_primary():
+def test_setup_view_is_loaded_and_registered_in_sidebar_settings():
     template = TEMPLATE.read_text(encoding="utf-8")
     app = APP.read_text(encoding="utf-8")
     assert "static/js/views/setup.js" in template
     assert "_renderStandardView(SetupView, el)" in app
     assert "Router.register('/setup'" in app
-    assert 'data-path="/setup"' not in app
+    assert 'data-path="/setup"' in app
+
+
+def test_sidebar_settings_group_links_setup_view():
+    app_js = APP.read_text(encoding="utf-8")
+    settings_idx = app_js.index('nav-group-label">Settings')
+    setup_idx = app_js.index('data-path="/setup"')
+    config_idx = app_js.index('data-path="/config"')
+    assert settings_idx < setup_idx < config_idx  # Setup listed first in Settings group
 
 
 def test_setup_view_marks_unsupported_providers_disabled():
@@ -768,6 +815,7 @@ def test_setup_view_does_not_redraw_dirty_channel_form_during_status_poll():
 
 def test_setup_view_surfaces_action_needed_reasons():
     txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+    css = (ROOT / "static/css/views/setup.css").read_text(encoding="utf-8")
     assert "function _onboardingReasons" in txt
     assert "setup-reasons" in txt
     assert "Connect a model provider" in txt
@@ -777,12 +825,34 @@ def test_setup_view_surfaces_action_needed_reasons():
     assert "detail.blocking" in txt
     assert "(_status.channelCount || 0) === 0" not in txt
 
+    # Reasons render as clickable rows that jump to the section's setup step
+    # via the shared SECTION_STEPS map (reused by initial-step selection too).
+    assert "const SECTION_STEPS = [" in txt
+    assert "function _stepForSection(name)" in txt
+    assert "const entry = SECTION_STEPS.find(([section]) => section === name);" in txt
+    assert "function _renderReasonRow(reason)" in txt
+    assert 'data-step="${_esc(reason.step)}"' in txt
+    assert "'Fix →'" in txt
+    assert "'Review →'" in txt
+    assert "setup-reasons__action" in txt
+    assert "setup-reasons__fix" in txt
+    # Blocking rows are visually distinct from optional rows.
+    assert "is-blocking" in txt
+    assert ".setup-reasons__item.is-blocking .setup-reasons__action" in css
+    assert ".setup__status.is-optional" in css
+    # _initialStepFromStatus reuses the shared map rather than a local copy.
+    init_start = txt.index("function _initialStepFromStatus()")
+    init_end = txt.index("  function _stepForSection", init_start)
+    init_body = txt[init_start:init_end]
+    assert "SECTION_STEPS.find(([section]) =>" in init_body
+    assert "const sectionSteps = [" not in init_body
+
 
 def test_setup_stepper_surfaces_readiness_for_each_setup_area():
     txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
     css = (ROOT / "static/css/views/setup.css").read_text(encoding="utf-8")
     draw_start = txt.index("function _draw()")
-    draw_end = txt.index("  function _renderOnboardingReasons()", draw_start)
+    draw_end = txt.index("  function _renderStepButton", draw_start)
     draw_body = txt[draw_start:draw_end]
 
     assert "STEPS.map(_renderStepButton).join('')" in draw_body
@@ -1290,11 +1360,57 @@ def test_channels_view_remains_status_only_but_links_guided_setup():
     assert "channels.restart" not in txt
 
 
-def test_example_config_does_not_advertise_local_embedding_model_override():
+def test_example_config_documents_local_embedding_model_override():
     txt = (ROOT.parents[2] / "agentos.toml.example").read_text(encoding="utf-8")
     local_section = txt.split("# [memory.embedding.local]", 1)[1].split(
         "# [memory.embedding.remote]",
         1,
     )[0]
-    assert "model =" not in local_section
+    # C5: the local block now advertises the commented model override (empty =
+    # auto) alongside onnx_dir, and names both documented model ids.
+    assert "model =" in local_section
     assert "onnx_dir" in local_section
+    assert "google/embeddinggemma-300m" in local_section
+    assert "BAAI/bge-small-zh-v1.5" in local_section
+
+
+def test_setup_view_has_memory_settings_card_with_user_facing_labels():
+    txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+    assert "Long-term memory budget (MEMORY.md)" in txt
+    assert "User profile budget (USER.md)" in txt
+    assert "Prompt injection limit" in txt
+    assert "data-memory-settings-memory-limit" in txt
+    assert "data-memory-settings-user-limit" in txt
+    assert "data-memory-settings-inject-limit" in txt
+
+
+def test_setup_view_memory_settings_card_reads_curated_config_fields():
+    txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+    assert "curated_memory_char_limit" in txt
+    assert "curated_user_char_limit" in txt
+    assert "memory.inject_limit" in txt
+
+
+def test_setup_view_memory_settings_card_warns_when_inject_limit_too_small():
+    txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+    assert "Injection limit too small" in txt
+    assert "the user profile block may be dropped" in txt
+
+
+def test_setup_view_memory_settings_card_renders_curated_usage_rows():
+    txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+    assert "data-memory-settings-usage" in txt
+    assert "entries" in txt
+    assert "doctor.memory.status" in txt
+
+
+def test_setup_view_memory_settings_card_saves_via_config_patch():
+    txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+    start = txt.index("async function _saveMemorySettings()")
+    end = txt.index("\n  }", start)
+    body = txt[start:end]
+    assert "'config.patch'" in body
+    assert "memory.curated_memory_char_limit" in body
+    assert "memory.curated_user_char_limit" in body
+    assert "memory.inject_limit" in body
+    assert "data-save-memory-settings" in txt

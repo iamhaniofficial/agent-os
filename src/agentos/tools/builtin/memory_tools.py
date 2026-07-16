@@ -20,6 +20,8 @@ Usage (multi-agent routing):
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 import structlog
 
+from agentos.memory.curated import CuratedMemoryStore
 from agentos.memory.redaction import redact_memory_text
 from agentos.memory.source_paths import is_memory_source_path, is_searchable_source_path
 from agentos.memory.types import (
@@ -63,6 +66,72 @@ _MEMORY_THREAT_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _INVISIBLE_CHARS = re.compile(r"[\u200b\u200c\u200d\ufeff\u202a-\u202e]")
+
+# Actions that mirror to an external memory provider. Read-only or unknown
+# actions never reach a provider \u2014 ported from hermes-agent's
+# ``notify_memory_tool_write`` gating (MIT).
+_MIRRORED_MEMORY_ACTIONS: Final[frozenset[str]] = frozenset({"add", "replace", "remove"})
+
+
+def _memory_write_committed(result: Any) -> bool:
+    """True only when the curated ``memory`` tool actually committed a write.
+
+    Fails closed: a non-JSON string, a non-dict payload, a missing ``success``,
+    or a write staged for approval (``staged is True``) all return False so an
+    external provider is never told about a write that did not land.
+    """
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:  # noqa: BLE001
+            return False
+    if not isinstance(result, dict):
+        return False
+    return result.get("success") is True and result.get("staged") is not True
+
+
+def _mirror_memory_write(
+    provider_manager: Any | None,
+    *,
+    tool_result: Any,
+    target: str,
+    action: str | None,
+    content: str | None,
+    old_text: str | None,
+    operations: list[dict[str, Any]] | None,
+) -> None:
+    """Mirror a successful curated ``memory`` write to the external provider.
+
+    Ports the hermes ``notify_memory_tool_write`` semantics: gate on a
+    committed (non-staged, successful) write, expand the single-op and batched
+    ``operations`` shapes, keep only add/replace/remove, and forward
+    ``old_text`` as provenance metadata. No-op when no provider is configured.
+    """
+    if provider_manager is None:
+        return
+    if not _memory_write_committed(tool_result):
+        return
+    if operations:
+        raw_ops: list[dict[str, Any]] = [op for op in operations if isinstance(op, dict)]
+    else:
+        raw_ops = [{"action": action, "content": content, "old_text": old_text}]
+    for op in raw_ops:
+        op_action = str(op.get("action") or "")
+        if op_action not in _MIRRORED_MEMORY_ACTIONS:
+            continue
+        metadata: dict[str, Any] = {}
+        op_old_text = op.get("old_text")
+        if op_old_text:
+            metadata["old_text"] = str(op_old_text)
+        try:
+            provider_manager.notify_memory_write(
+                op_action,
+                target,
+                str(op.get("content") or ""),
+                metadata,
+            )
+        except Exception as exc:  # noqa: BLE001 \u2014 mirror must never break the tool
+            logger.debug("memory_tool.provider_mirror_failed", action=op_action, error=str(exc))
 
 
 def _scan_memory_content(content: str) -> str | None:
@@ -329,18 +398,49 @@ def create_memory_tools(
     on_memory_write: Any | None = None,
     memory_source: str = "state",
     workspace_base: str | None = None,
+    config_root: Any | None = None,
+    provider_managers: dict[str, Any] | None = None,
 ) -> None:
     """Register memory tools. Accepts either a single store or a dict keyed by agent_id.
 
     Backward-compatible: a single store/retriever is auto-wrapped into ``{"main": ...}``.
     When dicts are provided, the active agent_id (from ToolContext via contextvar) selects
     the correct store, retriever, and memory directory at call time.
+
+    ``config_root`` (optional): the ROOT ``GatewayConfig`` object (or a
+    zero-arg getter returning it), used to resolve curated memory budgets
+    live on every call -- see ``_curated_store_for`` for why this must be
+    the root, not ``memory_config`` alone. Falls back to the (possibly
+    stale-after-patch) ``memory_config`` sub-object when omitted, so
+    existing callers/tests that only pass ``memory_config`` keep working.
+
+    ``provider_managers`` (optional): per-agent ``MemoryProviderManager``
+    instances (Plan B). When present, a SUCCESSFUL curated ``memory`` write is
+    mirrored to the active agent's provider via ``notify_memory_write`` (see
+    ``_mirror_memory_write`` for the success-only, add/replace/remove gating).
+    None/empty means no mirroring — zero cost on the disabled default path.
     """
     # Normalize to dict form
     if not isinstance(stores, dict):
         stores = {"main": stores}
     if not isinstance(retrievers, dict):
         retrievers = {"main": retrievers}
+
+    def _provider_manager_for_current_agent() -> Any | None:
+        """Resolve the external memory provider manager for the active agent.
+
+        Zero-cost when no provider is configured (``provider_managers`` is
+        None/empty). Mirrors ``_resolve``'s agent_id resolution + ``main``
+        fallback so the write mirror targets the same per-agent provider the
+        boot wiring attached.
+        """
+        if not provider_managers:
+            return None
+        from agentos.session.keys import normalize_agent_id
+
+        ctx = current_tool_context.get()
+        agent_id = normalize_agent_id((ctx.agent_id if ctx else None) or "main")
+        return provider_managers.get(agent_id) or provider_managers.get("main")
 
     class ResolvedAgent(NamedTuple):
         store: LongTermMemoryStore
@@ -388,6 +488,68 @@ def create_memory_tools(
             wd = memory_dir  # fallback: use memory_dir as workspace in test/legacy mode
         return ResolvedAgent(store=s, retriever=r, memory_dir=md, workspace_dir=wd)
 
+    _curated_stores: dict[str, CuratedMemoryStore] = {}
+
+    def _live_memory_config() -> Any | None:
+        """Resolve the current ``MemoryConfig`` sub-object from the ROOT config.
+
+        REAL contract (round 1 got this wrong): ``config.patch`` ->
+        ``_update_config_in_place`` (rpc_config.py) does a top-level,
+        attribute-by-attribute ``setattr`` loop on ``GatewayConfig``, e.g.
+        ``setattr(old, "memory", getattr(new, "memory"))``. That REPLACES
+        ``config.memory`` with a brand-new ``MemoryConfig`` instance -- it
+        does not mutate the old sub-object's fields in place. So a closure
+        that captured ``memory_config`` (the sub-object) directly is looking
+        at an orphaned instance forever after the first patch; only the ROOT
+        config object survives a patch and stays the same instance.
+
+        Mirrors runtime.py's proven-live pattern: hold the root and
+        traverse ``getattr(root, "memory", None)`` fresh on every call, so
+        each call sees whatever sub-object is currently attached.
+        """
+        root = config_root() if callable(config_root) else config_root
+        if root is not None:
+            return getattr(root, "memory", None)
+        return memory_config
+
+    def _curated_store_for(r: ResolvedAgent) -> CuratedMemoryStore:
+        """Return the curated store for r's workspace root, building it once.
+
+        The curated store's ``memory_dir`` is the workspace root -- the same
+        directory ``memory_save`` resolves MEMORY.md/USER.md against (see
+        ``_resolve_memory_path`` / ``_is_memory_source_path``), not the
+        ``memory/`` subfolder used for daily notes.
+
+        Live-refresh contract: the char-limit budgets are read from the
+        ROOT config (via ``_live_memory_config``) on EVERY call rather than
+        captured once at boot or from a sub-object closure. See
+        ``_live_memory_config`` for why the root -- not ``memory_config`` --
+        is the only thing guaranteed to survive ``config.patch``. If a
+        cached store's limits no longer match the live config, we rebuild it
+        from disk (files are the source of truth, guarded by file-lock +
+        atomic replace, so rebuilding mid-session is safe) and swap it into
+        the cache.
+        """
+        if not r.workspace_dir:
+            raise ToolError("workspace directory not configured.")
+        live_memory_config = _live_memory_config()
+        memory_char_limit = getattr(live_memory_config, "curated_memory_char_limit", 4000)
+        user_char_limit = getattr(live_memory_config, "curated_user_char_limit", 2000)
+        key = str(Path(r.workspace_dir))
+        curated = _curated_stores.get(key)
+        if curated is None or (
+            curated.memory_char_limit != memory_char_limit
+            or curated.user_char_limit != user_char_limit
+        ):
+            curated = CuratedMemoryStore(
+                memory_dir=Path(r.workspace_dir),
+                memory_char_limit=memory_char_limit,
+                user_char_limit=user_char_limit,
+            )
+            curated.load_from_disk()
+            _curated_stores[key] = curated
+        return curated
+
     @dataclass(frozen=True)
     class PlannedWrite:
         path: str
@@ -417,10 +579,11 @@ def create_memory_tools(
     def _validate_memory_save_target(path: str, mode: str) -> None:
         if not _is_memory_save_path(path):
             raise ToolError(f"invalid memory path. {_MEMORY_SOURCE_PATH_HINT}")
-        if path == "MEMORY.md" and mode != "replace":
+        if Path(path).parts == ("MEMORY.md",):
             raise ToolError(
-                "MEMORY.md must use mode='replace'. "
-                "Read it first, then write the full updated content."
+                "MEMORY.md is managed by the `memory` tool now. Use "
+                "memory(action=add, ...) for durable facts; memory_save is for "
+                "memory/**/*.md notes."
             )
 
     def _ensure_clean_memory_content(content: str, path: str) -> None:
@@ -674,21 +837,22 @@ def create_memory_tools(
     @tool(
         name="memory_save",
         description=(
-            "Save content to memory source files for future recall. This is not "
-            "for ordinary task deliverables such as reports, JSON outputs, or "
-            "result files. Use MEMORY.md for long-term facts (mode=replace) and "
-            "memory/YYYY-MM-DD.md for daily notes (mode=append). Profile/bootstrap "
-            "files such as USER.md are edited with filesystem tools, not memory_save."
+            "Save content to memory/**/*.md source files for future recall. This is "
+            "not for ordinary task deliverables such as reports, JSON outputs, or "
+            "result files. Use memory/YYYY-MM-DD.md for daily notes (mode=append). "
+            "For durable long-term facts, use the `memory` tool instead -- MEMORY.md "
+            "is managed there, not with memory_save. Profile/bootstrap files such as "
+            "USER.md are edited with filesystem tools, not memory_save."
         ),
         params={
             "content": {"type": "string", "description": "Content to save"},
             "path": {
                 "type": "string",
                 "description": (
-                    "MEMORY.md (long-term, mode=replace) or "
                     "memory/YYYY-MM-DD.md / memory/<name>.md "
                     "(daily or named memory source, mode=append). "
-                    "Defaults to today's daily note."
+                    "Defaults to today's daily note. MEMORY.md is not accepted here "
+                    "-- use the `memory` tool for long-term facts."
                 ),
             },
             "mode": {
@@ -720,6 +884,199 @@ def create_memory_tools(
             on_memory_write(_aid)
         integrity = "ok" if chunks[path] > 0 else "missing_chunks"
         return f"Saved to {path} ({chunks[path]} chunks indexed; integrity={integrity})."
+
+    def _missing_old_text_error(store: CuratedMemoryStore, target: str, action: str) -> str:
+        """Build a recoverable error for a replace/remove call missing old_text.
+
+        ``replace``/``remove`` are inherently targeted -- without ``old_text``
+        there is no entry to act on. Rather than a dead-end "old_text is
+        required" error, return the current entry inventory plus an explicit
+        retry instruction so the model can reissue the call with ``old_text``
+        set to a unique substring of the entry it means. Ported from hermes
+        ``memory_tool.py::_missing_old_text_error`` (see NOTICE).
+        """
+        entries = store.entries_for(target)
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"'{action}' needs old_text -- a short unique substring of the "
+                    f"entry to {action}. None was provided. Reissue the {action} "
+                    f"with old_text set to part of one of the current_entries below."
+                ),
+                "current_entries": entries,
+                "usage": store.usage_for(target),
+            },
+            ensure_ascii=False,
+        )
+
+    @tool(
+        name="memory",
+        description=(
+            "Save durable facts to persistent memory that survive across sessions. Memory is "
+            "injected into every future turn, so keep entries compact and high-signal.\n\n"
+            "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
+            "{action, content?, old_text?}). The batch applies atomically and the char limit is "
+            "checked only on the FINAL result — so a single call can remove/replace stale entries "
+            "to free room AND add new ones, even when an add alone would overflow. The response "
+            "reports current/limit chars and confirms completion; one batch call finishes the "
+            "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
+            "single lone change.\n\n"
+            "WHEN: save proactively when the user states a preference, correction, or personal "
+            "detail, or you learn a stable fact about their environment, conventions, or workflow. "
+            "Priority: user preferences & corrections > environment facts > procedures. The best "
+            "memory stops the user repeating themselves.\n\n"
+            "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
+            "removes or shortens enough stale entries and adds the new one together.\n\n"
+            "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
+            "notes (environment, conventions, tool quirks, lessons).\n\n"
+            "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task "
+            "progress, completed-work logs, temporary TODO state (use session_search for "
+            "those). Reusable procedures belong in a skill, not memory."
+        ),
+        params={
+            "action": {
+                "type": "string",
+                "enum": ["add", "replace", "remove"],
+                "description": (
+                    "The action to perform (single-op shape). Omit when using 'operations'."
+                ),
+            },
+            "target": {
+                "type": "string",
+                "enum": ["memory", "user"],
+                "description": (
+                    "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                ),
+            },
+            "content": {
+                "type": "string",
+                "description": (
+                    "The entry content. Required for 'add' and 'replace' (single-op shape)."
+                ),
+            },
+            "old_text": {
+                "type": "string",
+                "description": (
+                    "REQUIRED for 'replace' and 'remove' (single-op shape): a short unique "
+                    "substring identifying the existing entry to modify. Omit only for 'add'."
+                ),
+            },
+            "operations": {
+                "type": "array",
+                "description": (
+                    "Batch shape: a list of operations applied atomically in one call "
+                    "against the final char budget. Preferred when making multiple changes "
+                    "or consolidating to make room. Each item is {action, content?, old_text?}."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["add", "replace", "remove"]},
+                        "content": {
+                            "type": "string",
+                            "description": "Entry content for add/replace.",
+                        },
+                        "old_text": {
+                            "type": "string",
+                            "description": "Substring identifying the entry for replace/remove.",
+                        },
+                    },
+                    "required": ["action"],
+                },
+            },
+        },
+        required=[],
+        registry=registry,
+    )
+    async def memory(
+        action: str | None = None,
+        target: str | None = "memory",
+        content: str | None = None,
+        old_text: str | None = None,
+        operations: list[dict[str, Any]] | None = None,
+    ) -> str:
+        r = _resolve()
+        store = _curated_store_for(r)
+
+        # Some strict providers fill optional schema fields with JSON null
+        # rather than omitting them. Treat target: null as omitted so writes
+        # still use the documented default store instead of failing.
+        if target is None:
+            target = "memory"
+
+        if target not in {"memory", "user"}:
+            return json.dumps(
+                {"success": False, "error": f"Invalid target '{target}'. Use 'memory' or 'user'."},
+                ensure_ascii=False,
+            )
+
+        # --- Batch path ----------------------------------------------------
+        if operations:
+            if not isinstance(operations, list):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            "operations must be a list of "
+                            "{action, content?, old_text?} objects."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            result = await asyncio.to_thread(store.apply_batch, target, operations)
+            _mirror_memory_write(
+                _provider_manager_for_current_agent(),
+                tool_result=result,
+                target=target,
+                action=None,
+                content=None,
+                old_text=None,
+                operations=operations,
+            )
+            return json.dumps(result, ensure_ascii=False)
+
+        # --- Single-op path --------------------------------------------------
+        if action == "add" and not content:
+            return json.dumps(
+                {"success": False, "error": "Content is required for 'add' action."},
+                ensure_ascii=False,
+            )
+        if action == "replace" and (not old_text or not content):
+            if not old_text:
+                return _missing_old_text_error(store, target, "replace")
+            return json.dumps(
+                {"success": False, "error": "content is required for 'replace' action."},
+                ensure_ascii=False,
+            )
+        if action == "remove" and not old_text:
+            return _missing_old_text_error(store, target, "remove")
+
+        if action == "add":
+            result = await asyncio.to_thread(store.add, target, content or "")
+        elif action == "replace":
+            result = await asyncio.to_thread(store.replace, target, old_text or "", content or "")
+        elif action == "remove":
+            result = await asyncio.to_thread(store.remove, target, old_text or "")
+        else:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Unknown action '{action}'. Use: add, replace, remove",
+                },
+                ensure_ascii=False,
+            )
+
+        _mirror_memory_write(
+            _provider_manager_for_current_agent(),
+            tool_result=result,
+            target=target,
+            action=action,
+            content=content,
+            old_text=old_text,
+            operations=None,
+        )
+        return json.dumps(result, ensure_ascii=False)
 
     @tool(
         name="memory_get",
@@ -835,6 +1192,7 @@ def create_memory_tools(
         tools=[
             "memory_search",
             "memory_save",
+            "memory",
             "memory_get",
             "memory_delete",
         ],

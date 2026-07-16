@@ -69,17 +69,41 @@ const ConfigView = (() => {
     'agentos_router.judge_short_circuit_allowlist':
       'Extra exact greeting/ack phrases (case-insensitive) that skip the judge. These are ADDED to the built-in default allowlist (en/vi/zh), not a replacement — leave empty to use just the defaults.',
     'memory.embedding':
-      'Long-term memory embedding provider. Defaults to local bundled BGE in auto mode when available; remote embeddings require explicit memory embedding configuration.',
+      'Long-term memory embedding provider. Auto mode prefers a downloaded EmbeddingGemma model, then the bundled BGE ONNX, then a configured remote key, then FTS-only. Run `agentos memory embedding-download` to fetch the EmbeddingGemma upgrade; switching the local model triggers a full reindex. Remote embeddings require explicit memory embedding configuration.',
     'memory.embedding.provider':
       'Canonical memory embedding provider: auto, none, local, openai/openai-compatible, or ollama. This is independent from the chat LLM provider.',
     'memory.embedding.remote.api_key':
       'API key for the memory embedding endpoint. This does not inherit the chat/OpenRouter key in auto mode.',
     'memory.embedding.remote.base_url':
       'OpenAI-compatible API root for memory indexing, for example https://api.openai.com/v1. The provider appends /embeddings.',
+    'memory.embedding.local.model':
+      'Optional local embedding model id to pin. Leave empty for auto (a downloaded EmbeddingGemma export when present, otherwise the bundled BGE-small). Set "google/embeddinggemma-300m" or "BAAI/bge-small-zh-v1.5" to force one. Changing this triggers a full reindex.',
     'memory.embedding.local.onnx_dir':
-      'Optional ONNX directory for a custom local embedding model. Leave empty to use the bundled BGE-small model.',
+      'Optional ONNX directory for a custom local embedding model. Leave empty to use the resolved model’s export (downloaded EmbeddingGemma or bundled BGE-small).',
     'memory.retrieval_mode':
       'Memory retrieval mode. "hybrid" uses vectors when an embedding provider is available; "fts_only" disables vectors.',
+    'memory.curated_memory_char_limit':
+      'Character budget for MEMORY.md, the agent’s curated notes file. When full, the agent consolidates existing entries via the memory tool instead of growing the file further.',
+    'memory.curated_user_char_limit':
+      'Character budget for USER.md, the curated user profile file.',
+    'memory.inject_limit':
+      'Cap on the combined curated MEMORY.md + USER.md blocks injected into every system prompt. Keep it above the sum of the two char-limit budgets plus roughly 310 chars of header/separator overhead, or the user-profile block is dropped whole to stay under budget.',
+    'memory.provider.name':
+      'Optional external memory provider layered on top of built-in memory. Empty (the default) keeps built-in memory only; "mem0" enables the mem0 provider (prompt recall block, fenced recall, per-turn sync, write mirror). The provider is built once at boot, so changing this requires a gateway restart. mem0 needs the extra: pip install "use-agent-os[mem0]".',
+    'memory.provider.mem0.llm_provider':
+      'Backend the mem0 provider uses for its extraction/summarization LLM. Defaults to "ollama" for a fully local stack. Requires a gateway restart.',
+    'memory.provider.mem0.llm_model':
+      'mem0 extraction/summarization model. Default "qwen3:4b" (a small local Ollama model). Requires a gateway restart.',
+    'memory.provider.mem0.llm_base_url':
+      'Base URL for the mem0 LLM backend. Defaults to the local Ollama endpoint http://localhost:11434. Requires a gateway restart.',
+    'memory.provider.mem0.embedder_provider':
+      'Backend for mem0 embeddings. Defaults to "ollama" so embeddings stay local. Requires a gateway restart.',
+    'memory.provider.mem0.embedder_model':
+      'mem0 embedding model. Default "embeddinggemma" (local via Ollama). Requires a gateway restart.',
+    'memory.provider.mem0.embedder_base_url':
+      'Base URL for the mem0 embedder backend. Defaults to the local Ollama endpoint http://localhost:11434. Requires a gateway restart.',
+    'memory.provider.mem0.vector_store_path':
+      'On-disk directory for the mem0 vector store. Empty resolves to <agent state dir>/mem0 at boot, keeping all data local. Requires a gateway restart.',
     'sandbox.sandbox':
       'Runtime sandbox switch. The out-of-box posture keeps this false; use agentos sandbox on|bypass|full to change sandbox and permission defaults together.',
     'sandbox.security_grading':
@@ -388,12 +412,47 @@ const ConfigView = (() => {
     _renderStickybar();
   }
 
+  // Max object levels to descend before falling back to a JSON-blob field.
+  // Top-level entries are depth 0, so three descents expose the depth-3 leaf
+  // memory.embedding.local.model as a field; a 4th object level blobs out.
+  const _FLATTEN_MAX_DEPTH = 3;
+
+  /**
+   * Flatten object-valued entries into dotted-key leaf fields. Recurse while the
+   * value is a plain object (not array, not null) AND depth < _FLATTEN_MAX_DEPTH.
+   * Arrays, null, and scalars are leaves; an object still nested at the depth
+   * limit is emitted whole (the JSON-blob field renders it with Edit).
+   */
+  function _flattenEntries(entries) {
+    const out = [];
+    const walk = (key, value, depth) => {
+      const isPlainObject =
+        value !== null && typeof value === 'object' && !Array.isArray(value);
+      if (isPlainObject && depth < _FLATTEN_MAX_DEPTH) {
+        const keys = Object.keys(value);
+        if (keys.length === 0) {
+          out.push([key, value]);  // empty object: keep as a JSON-blob leaf
+          return;
+        }
+        keys.forEach(childKey => walk(`${key}.${childKey}`, value[childKey], depth + 1));
+        return;
+      }
+      out.push([key, value]);
+    };
+    // depth counts object levels descended: a top-level entry is depth 0, so
+    // three descents reach memory.embedding.local.model before the limit trips.
+    entries.forEach(([k, v]) => walk(k, v, 0));
+    return out;
+  }
+
   function _entriesForTab(tab) {
-    return Object.entries(_configData).filter(([k, v]) => {
+    const topLevel = Object.entries(_configData).filter(([k]) => {
       const lk = k.toLowerCase();
-      const matchesTab = tab.prefixes.some(p => lk.startsWith(p + '.') || lk === p || lk.startsWith(p + '_'));
-      const matchesSearch = !_searchText || lk.includes(_searchText) || _searchBlob(v).includes(_searchText);
-      return matchesTab && matchesSearch;
+      return tab.prefixes.some(p => lk.startsWith(p + '.') || lk === p || lk.startsWith(p + '_'));
+    });
+    return _flattenEntries(topLevel).filter(([k, v]) => {
+      if (!_searchText) return true;
+      return k.toLowerCase().includes(_searchText) || _searchBlob(v).includes(_searchText);
     });
   }
 
@@ -409,7 +468,7 @@ const ConfigView = (() => {
             </div>
           </header>
           <div class="cfg-settings-fields">
-            ${group.entries.map(([k, v]) => _fieldHtml(k, v)).join('')}
+            ${group.entries.map(([k, v]) => _fieldHtml(k, v, group.id)).join('')}
           </div>
         </section>`;
     }).join('');
@@ -436,13 +495,27 @@ const ConfigView = (() => {
     return id.replace(/[_-]/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase());
   }
 
-  function _fieldHtml(k, v) {
+  // Label shown to the user: the dotted key with its group prefix stripped, so a
+  // flattened leaf reads `provider.name` under the Memory group rather than
+  // `memory.provider.name`. The full key stays in data-cfg-key for save + masking.
+  function _fieldLabel(k, groupId) {
+    if (groupId && groupId !== 'general' && k.startsWith(groupId + '.')) {
+      return k.slice(groupId.length + 1);
+    }
+    return k;
+  }
+
+  function _fieldHtml(k, v, groupId) {
+    // Sensitive-key masking tests the FULL dotted key, so a nested leaf like
+    // memory.embedding.remote.api_key is still masked after flattening.
     const isSensitive = /key|token|secret|password|api_key/i.test(k);
     const isDirty = k in _dirty;
     const isInvalid = k in _invalidJson;
     const isObject = typeof v === 'object' && v !== null;
-    const isLongKey = k.length > 24;
+    const label = _fieldLabel(k, groupId);
+    const isLongKey = label.length > 24;
     const ek = _esc(k);
+    const elabel = _esc(label);
     const curVal = isDirty ? _dirty[k].new : v;
     const inputId = `cfg-input-${_safeId(k)}`;
 
@@ -489,7 +562,7 @@ const ConfigView = (() => {
     return `
       <div class="${fieldClasses}">
         <div class="config-field__label-row">
-          <label class="form-label" for="${inputId}">${ek}</label>
+          <label class="form-label" for="${inputId}" title="${ek}">${elabel}</label>
           ${helpBtn}
         </div>
         ${inputHtml}
@@ -517,7 +590,7 @@ const ConfigView = (() => {
     } else {
       newVal = target.value;
     }
-    const oldVal = _configData[key];
+    const oldVal = _configValueAt(key);
     if (newVal === oldVal || JSON.stringify(newVal) === JSON.stringify(oldVal)) {
       delete _dirty[key];
       if (type === 'json') delete _jsonDrafts[key];
@@ -535,8 +608,19 @@ const ConfigView = (() => {
     if (!det) return;
     const summary = det.closest('details')?.querySelector('.cfg-object-summary');
     if (!summary) return;
-    const cur = key in _dirty ? _dirty[key].new : _configData[key];
+    const cur = key in _dirty ? _dirty[key].new : _configValueAt(key);
     summary.textContent = _objectSummary(cur);
+  }
+
+  /** Read the loaded config value at a (possibly dotted) leaf key. */
+  function _configValueAt(key) {
+    if (key in _configData) return _configData[key];
+    let cur = _configData;
+    for (const part of key.split('.')) {
+      if (cur !== null && typeof cur === 'object' && part in cur) cur = cur[part];
+      else return undefined;
+    }
+    return cur;
   }
 
   function _setJsonInvalid(target, invalid) {
