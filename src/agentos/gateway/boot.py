@@ -1356,6 +1356,52 @@ def _should_build_provider_selector(*, provider: str, api_key: str) -> bool:
     return not spec.requires_api_key()
 
 
+def _router_tier_provider_mismatches(
+    *, config: GatewayConfig, llm_provider: str
+) -> dict[str, str]:
+    """Router tiers whose declared provider differs from the runtime provider.
+
+    Routing is single-provider: boot builds ONE client from ``llm.provider``;
+    ``agentos_router.tiers[*].provider`` is metadata and never builds a client.
+    A tier pointing elsewhere silently misroutes (local providers 404 and the
+    engine degrades such routes to ``llm.model``), so boot surfaces the
+    mismatch. Returns ``{tier_name: tier_provider}`` for the offending tiers;
+    tiers without a non-empty ``provider`` value do not participate.
+    """
+    router_cfg = getattr(config, "agentos_router", None)
+    if router_cfg is None or not getattr(router_cfg, "enabled", False):
+        return {}
+    tiers = getattr(router_cfg, "tiers", None)
+    if not isinstance(tiers, dict):
+        return {}
+    runtime_provider = str(llm_provider).strip().lower()
+    mismatched: dict[str, str] = {}
+    for tier_name, tier in tiers.items():
+        if not isinstance(tier, dict):
+            continue
+        tier_provider = str(tier.get("provider") or "").strip()
+        if tier_provider and tier_provider.lower() != runtime_provider:
+            mismatched[str(tier_name)] = tier_provider
+    return mismatched
+
+
+def _warn_on_tier_provider_mismatch(config: GatewayConfig, llm_provider: str) -> None:
+    """One-time boot warning for router tiers that point at a foreign provider."""
+    mismatched = _router_tier_provider_mismatches(config=config, llm_provider=llm_provider)
+    if not mismatched:
+        return
+    log.warning(
+        "agentos_router.tier_provider_mismatch",
+        llm_provider=llm_provider,
+        mismatched_tiers=mismatched,
+        note=(
+            "tiers only select the MODEL; requests always go through "
+            "llm.provider — mismatched tiers are degraded to llm.model "
+            "on local providers"
+        ),
+    )
+
+
 def _agentos_router_bundle_dir(router_cfg: Any) -> Path:
     """Resolve the v4_phase3 bundle root, honoring the v4_bundle_dir override."""
     configured = getattr(router_cfg, "v4_bundle_dir", None)
@@ -1587,6 +1633,10 @@ async def build_services(
                 provider=llm_runtime.provider,
                 model=llm_runtime.model,
             )
+
+    # Routing is single-provider: warn once when enabled router tiers declare a
+    # provider that differs from the one client boot just selected.
+    _warn_on_tier_provider_mismatch(config, llm_runtime.provider)
 
     # ── Model catalog (boot order: after provider selector) ──────────
     # Keep a catalog for every provider so direct-provider runtime paths still
