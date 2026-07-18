@@ -179,6 +179,74 @@ def test_gateway_run_warns_lan_open_when_opt_in_set(tmp_path, monkeypatch) -> No
     assert "LAN-open" in output
 
 
+def test_gateway_run_records_raw_toml_bind_originals_not_env_merged(
+    tmp_path, monkeypatch
+) -> None:
+    """[FIX 3] The runtime-override map must record the RAW on-disk host/port/
+    debug, never the env-merged effective values. With AGENTOS_GATEWAY_HOST set,
+    GatewayConfig.load reports host=0.0.0.0; recording THAT as the on-disk
+    original would let a later config.patch freeze 0.0.0.0. The TOML here has an
+    explicit host=127.0.0.1, so the recorded original must be 127.0.0.1."""
+    target = tmp_path / "agentos.toml"
+    target.write_text("host = \"127.0.0.1\"\n", encoding="utf-8")
+    monkeypatch.setenv("AGENTOS_STATE_DIR", str(tmp_path / "home"))
+    monkeypatch.setenv("AGENTOS_GATEWAY_HOST", "0.0.0.0")
+    monkeypatch.setenv("AGENTOS_AUTH_ALLOW_UNAUTHENTICATED_PUBLIC", "true")
+    monkeypatch.delenv("AGENTOS_AUTH_MODE", raising=False)
+
+    captured: dict = {}
+
+    def capturing_set_overrides(mapping):
+        captured["overrides"] = dict(mapping) if mapping else {}
+        return gateway_cmd.set_runtime_overrides(mapping)
+
+    monkeypatch.setattr(gateway_cmd, "set_runtime_overrides", capturing_set_overrides)
+
+    async def fake_start_gateway_server(**_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gateway_cmd, "start_gateway_server", fake_start_gateway_server)
+
+    runner.invoke(app, ["gateway", "run", "--config", str(target), "--listen", "0.0.0.0"])
+
+    overrides = captured["overrides"]
+    assert overrides["host"] == "127.0.0.1"  # raw TOML value, NOT env 0.0.0.0
+    assert overrides["port"] is None  # absent in TOML -> None (drop on persist)
+    assert overrides["debug"] is None  # absent in TOML -> None
+
+
+def test_gateway_run_records_none_when_host_absent_and_env_public(
+    tmp_path, monkeypatch
+) -> None:
+    """[FIX 3] host absent from TOML + AGENTOS_GATEWAY_HOST=0.0.0.0: the recorded
+    original is None (drop on persist so the env/default re-applies at next
+    boot), never the env-supplied 0.0.0.0."""
+    target = tmp_path / "agentos.toml"
+    target.write_text("debug = false\n", encoding="utf-8")  # NO host
+    monkeypatch.setenv("AGENTOS_STATE_DIR", str(tmp_path / "home"))
+    monkeypatch.setenv("AGENTOS_GATEWAY_HOST", "0.0.0.0")
+    monkeypatch.setenv("AGENTOS_AUTH_ALLOW_UNAUTHENTICATED_PUBLIC", "true")
+    monkeypatch.delenv("AGENTOS_AUTH_MODE", raising=False)
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        gateway_cmd,
+        "set_runtime_overrides",
+        lambda m: captured.setdefault("overrides", dict(m) if m else {}),
+    )
+
+    async def fake_start_gateway_server(**_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(gateway_cmd, "start_gateway_server", fake_start_gateway_server)
+
+    runner.invoke(app, ["gateway", "run", "--config", str(target)])
+
+    overrides = captured["overrides"]
+    assert overrides["host"] is None  # NOT the env-supplied 0.0.0.0
+    assert overrides["debug"] is False  # raw literal
+
+
 def test_gateway_lifecycle_paths_use_state_root(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("AGENTOS_STATE_DIR", str(tmp_path / "home"))
 

@@ -16,6 +16,28 @@ from agentos.identity.bootstrap import (
 )
 from agentos.session.keys import normalize_agent_id
 
+
+def _dotted_paths(payload: Any, prefix: str) -> set[str]:
+    """Recursively collect dotted paths under ``prefix`` for dict/list payloads.
+
+    List indices become numeric path segments (``agents.0.name``) so every
+    concrete leaf the config carries is named. Scalars contribute nothing beyond
+    the ``prefix`` the caller already added.
+    """
+    paths: set[str] = set()
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            current = f"{prefix}.{key}"
+            paths.add(current)
+            paths.update(_dotted_paths(value, current))
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            current = f"{prefix}.{index}"
+            paths.add(current)
+            paths.update(_dotted_paths(value, current))
+    return paths
+
+
 _WORKSPACE_AGENT_FILE_NAMES = (
     *CORE_BOOTSTRAP_TEMPLATE_FILENAMES,
     ONE_SHOT_BOOTSTRAP_FILENAME,
@@ -177,13 +199,33 @@ class AgentRegistry:
     async def _persist(self) -> None:
         if not self.persist_changes:
             return
-        from agentos.onboarding.config_store import persist_config
+        # Route through the override-aware gateway writer (NOT the onboarding
+        # writer directly) so a one-off CLI --listen/--port/--debug that
+        # run_gateway injected into this in-memory config is never frozen into
+        # config.toml by an agents.* mutation. The registry only ever mutates
+        # ``agents``, so ``agents`` (and its dotted descendants) are the sole
+        # explicit paths — the runtime-override map restores everything else to
+        # its on-disk original. Imported lazily to avoid an import cycle.
+        from agentos.gateway.config_persist import persist_config
 
-        persist_config(
-            self.config,
-            path=self.config_path or self.config.config_path,
-            restart_required=True,
-        )
+        target = self.config_path or self.config.config_path
+        if target is not None and not getattr(self.config, "config_path", None):
+            self.config.config_path = str(target)
+        persist_config(self.config, explicit_paths=self._agents_explicit_paths())
+
+    def _agents_explicit_paths(self) -> set[str]:
+        """Every dotted path under ``agents`` this registry may have changed.
+
+        The registry mutates only ``agents``, so persisting exactly those paths
+        (top-level ``agents`` plus each nested entry path) marks the agent edit
+        as an explicit change that must survive, while leaving bind/auth fields
+        to the runtime-override restore.
+        """
+        toml = self.config.to_toml_dict() if hasattr(self.config, "to_toml_dict") else {}
+        agents = toml.get("agents")
+        paths: set[str] = {"agents"}
+        paths.update(_dotted_paths(agents, "agents"))
+        return paths
 
     def _main_agent_summary(self) -> dict[str, Any]:
         return {

@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import copy
-from pathlib import Path
 from typing import Any, cast
 
+from agentos.gateway.config_persist import persist_config as _persist_config
 from agentos.gateway.rpc import RpcContext, get_dispatcher
-from agentos.paths import default_agentos_home
 
 _d = get_dispatcher()
 
@@ -18,22 +17,6 @@ def _update_config_in_place(old: Any, new: Any) -> None:
         setattr(old, field_name, getattr(new, field_name))
     if hasattr(old, "inherit_runtime_secrets"):
         old.inherit_runtime_secrets(new)
-
-
-def _persist_config(config: Any) -> None:
-    """Write config to TOML, defaulting to the user config path when unset."""
-    if not getattr(config, "config_path", None) and hasattr(config, "config_path"):
-        config.config_path = str(default_agentos_home() / "config.toml")
-
-    if not getattr(config, "config_path", None):
-        return
-
-    import tomli_w  # TOML writer (tomllib is read-only)
-
-    path = Path(config.config_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        tomli_w.dump(config.to_toml_dict(), f)
 
 
 def _inherit_runtime_secrets(source: Any, target: Any) -> None:
@@ -56,6 +39,35 @@ def _collect_paths(payload: Any, prefix: str = "") -> set[str]:
             paths.add(current)
             paths.update(_collect_paths(value, current))
     return paths
+
+
+def diff_paths(old: Any, new: Any, prefix: str = "") -> set[str]:
+    """Dotted paths that DIFFER between two nested dicts (added/removed/changed).
+
+    Recurses through matching dict subtrees; a key present in exactly one side,
+    or whose leaf value differs, yields its dotted path. Non-dict values (lists,
+    scalars) are compared by equality — a changed list yields the list's own
+    path, not per-index paths. Used by ``config.apply`` to treat a YAML-mode
+    Save as an edit of only the fields the operator actually changed versus the
+    baseline they were shown (``config.get``), so a field left at its runtime
+    echo is restored while a deliberately edited overridden field persists.
+    """
+    if isinstance(old, dict) and isinstance(new, dict):
+        changed: set[str] = set()
+        for key in old.keys() | new.keys():
+            current = f"{prefix}.{key}" if prefix else key
+            if key not in old or key not in new:
+                changed.add(current)
+                # A whole added/removed subtree: name every leaf inside it too so
+                # nested edits under a newly added section are all explicit.
+                changed.update(_collect_paths(new.get(key), current))
+                changed.update(_collect_paths(old.get(key), current))
+            else:
+                changed.update(diff_paths(old[key], new[key], current))
+        return changed
+    if old != new and prefix:
+        return {prefix}
+    return set()
 
 
 def _align_auto_router_profile_for_provider_patch(
@@ -302,8 +314,10 @@ def _sync_image_generation(config: Any) -> None:
     configure_audio(getattr(config, "audio", None))
 
 
-# Read-only paths that cannot be modified via config.set/patch/apply
-_READONLY_PATHS = frozenset({"auth.token", "auth.password"})
+# Read-only paths that cannot be modified via config.set/patch/apply.
+# host/port: bind posture is CLI-only (agentos gateway run --bind / --port),
+# so the config UI/RPC can never persist an unsafe public-bind config.
+_READONLY_PATHS = frozenset({"auth.token", "auth.password", "host", "port"})
 _SAFE_WRITE_PATCH_PATHS = frozenset(
     {
         "skills.filter_enabled",
@@ -318,6 +332,20 @@ _SAFE_WRITE_PATCH_PATHS = frozenset(
         "agentos_router.confidence_threshold",
     }
 )
+
+
+def _preserve_readonly_bind(payload: dict, config: Any) -> dict:
+    """Copy the RUNNING host/port into *payload* — bind posture is CLI-only.
+
+    Preserve, do not reject: a UI full-config round-trip that echoes the
+    current host must not fail, and a submitted host/port must never replace
+    the running one.
+    """
+    payload = dict(payload)
+    if config is not None:
+        payload["host"] = config.host
+        payload["port"] = config.port
+    return payload
 
 
 def _resolve_path(obj: dict, path: str) -> Any:
@@ -393,12 +421,16 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     if _memory_restart_required_for_paths({path}):
         _validate_memory_embedding_semantics(new_config)
     _inherit_runtime_secrets(ctx.config, new_config)
-    explicit_paths = {path} | _collect_paths(value, path)
+    # host/port are never persistable via RPC (bind posture is CLI-only), so a
+    # readonly path echoed inside a nested value must never enter explicit_paths
+    # — otherwise it short-circuits the runtime-override restore in persist_config
+    # and freezes a transient CLI bind. Subtract them unconditionally.
+    explicit_paths = ({path} | _collect_paths(value, path)) - _READONLY_PATHS
     _clear_runtime_secret_paths(new_config, explicit_paths - redacted_paths)
     _sync_provider_selector(ctx, new_config)
     _update_config_in_place(ctx.config, new_config)
     _sync_image_generation(new_config)
-    _persist_config(ctx.config)
+    _persist_config(ctx.config, explicit_paths=explicit_paths)
     return {
         "restartRequired": _restart_required(
             old_memory_fingerprint=old_memory_fingerprint,
@@ -455,10 +487,18 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
         patch_data, merge_restored_paths = _restore_redacted_values(patch_data, source_cfg_dict)
         redacted_paths.update(merge_restored_paths)
         cfg_dict = _deep_merge(cfg_dict, patch_data)
+        # The merge path bypasses the per-path _READONLY_PATHS skip above, so
+        # re-assert the running bind posture (host/port are CLI-only).
+        cfg_dict = _preserve_readonly_bind(cfg_dict, ctx.config)
 
     explicit_paths = set(dot_patches.keys()) | _collect_paths(patch_data)
     for path, value in dot_patches.items():
         explicit_paths.update(_collect_paths(value, path))
+    # A UI form can echo the display-only host/port alongside a genuine edit;
+    # they are read-only paths (skipped when applied), so they must not enter
+    # explicit_paths and short-circuit the runtime-override restore. host/port
+    # are never persistable via RPC regardless.
+    explicit_paths -= _READONLY_PATHS
     _align_auto_router_profile_for_provider_patch(ctx.config, cfg_dict, explicit_paths)
 
     from agentos.gateway.config import GatewayConfig
@@ -474,7 +514,7 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
     _update_config_in_place(ctx.config, new_config)
     _sync_image_generation(new_config)
 
-    _persist_config(ctx.config)
+    _persist_config(ctx.config, explicit_paths=explicit_paths)
     return {
         "patched": list(dot_patches.keys()) + (["(merge)"] if patch_data else []),
         "restartRequired": _restart_required(
@@ -513,18 +553,43 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
 
     from agentos.gateway.config import GatewayConfig
 
+    baseline_payload: Any = None
     config_payload = params.get("config")
     if config_payload is None and "config_yaml" in params:
         import yaml  # type: ignore[import-untyped]
 
         config_payload = yaml.safe_load(params["config_yaml"]) or {}
+        if "baseline_yaml" in params:
+            baseline_payload = yaml.safe_load(params["baseline_yaml"]) or {}
 
     if not isinstance(config_payload, dict):
         raise ValueError("params.config is required")
 
     config_payload = dict(config_payload)
+    # YAML-mode Save seeds the payload from the RUNNING config (config.get), so
+    # every CLI/break-glass override it carries (host/port/debug/auth.mode/
+    # opt-in) is echoed back verbatim.
+    from agentos.gateway.config_persist import get_runtime_overrides
+
+    if isinstance(baseline_payload, dict):
+        # The client sent the baseline it showed the operator (the config.get
+        # snapshot). A field that DIFFERS from that baseline is a real edit and
+        # must persist even while it carries a runtime override; a field left at
+        # its echo is not an edit and is restored to its on-disk original by
+        # persist_config. Subtract _READONLY_PATHS: host/port are never
+        # persistable via RPC regardless of a diff.
+        explicit_paths = diff_paths(baseline_payload, config_payload) - _READONLY_PATHS
+    else:
+        # Older client (or config= dict payload): no baseline to diff against.
+        # Fall back to the round-2 safe behavior — subtract the full runtime-
+        # override key set (mirroring rpc_onboarding._onboarding_explicit_paths)
+        # so an echoed transient posture never freezes. (A form-mode config.patch
+        # sends only the dirty keys, which are not in the override map.)
+        explicit_paths = _collect_paths(config_payload) - set(get_runtime_overrides())
     if ctx.config is not None and not config_payload.get("config_path"):
         config_payload["config_path"] = getattr(ctx.config, "config_path", None)
+    # Full replace preserves the RUNNING bind posture (host/port are CLI-only).
+    config_payload = _preserve_readonly_bind(config_payload, ctx.config)
 
     old_memory_fingerprint = _memory_restart_fingerprint(ctx.config)
     old_channels_fingerprint = _channels_restart_fingerprint(ctx.config)
@@ -546,7 +611,10 @@ async def _handle_config_apply(params: dict | None, ctx: RpcContext) -> dict[str
     if ctx.config is not None:
         _update_config_in_place(ctx.config, new_config)
     _sync_image_generation(new_config)
-    _persist_config(ctx.config if ctx.config is not None else new_config)
+    _persist_config(
+        ctx.config if ctx.config is not None else new_config,
+        explicit_paths=explicit_paths,
+    )
     return {
         "restartRequired": _restart_required(
             old_memory_fingerprint=old_memory_fingerprint,

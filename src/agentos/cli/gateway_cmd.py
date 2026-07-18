@@ -5,9 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 
 import typer
 
+from agentos.cli.gateway_auth_prompt import (
+    AuthProvisionOutcome,
+    provision_public_bind_auth,
+)
 from agentos.cli.gateway_lifecycle import (
     GatewayLifecycleManager,
     GatewayLifecycleResult,
@@ -16,7 +21,13 @@ from agentos.cli.gateway_lifecycle import (
 from agentos.cli.ui import ACCENT_MARKUP, console
 from agentos.gateway.boot import start_gateway_server
 from agentos.gateway.config import GatewayConfig, is_public_bind, resolve_listen_address
+from agentos.gateway.config_persist import read_raw_bind_overrides, set_runtime_overrides
 from agentos.paths import default_agentos_home
+
+
+def _stdin_isatty() -> bool:
+    """Seam for tests — CliRunner replaces sys.stdin, so patch this instead."""
+    return sys.stdin.isatty()
 
 
 def gateway_startup_guidance(host: str, port: int, scheme: str = "http") -> tuple[str, ...]:
@@ -60,7 +71,35 @@ def run_gateway(
     explicit_flag: str | None = listen or (bind if bind and bind != "127.0.0.1" else None)
     host = resolve_listen_address(explicit_flag, default=config.host or "127.0.0.1")
     resolved_port = port if port is not None else config.port
+    # Record the RAW on-disk values BEFORE overriding them in memory, in the
+    # process-global runtime-override map that every config writer consults. A
+    # one-off --listen/--port/--debug (or a later break-glass mode=none) must
+    # never be frozen into config.toml by ANY config write; each key maps to its
+    # pre-override on-disk value so persist restores it unless a writer marks
+    # that exact field explicitly changed.
+    #
+    # Read the literal TOML — NOT config.host/port/debug, which GatewayConfig.load
+    # has already env-merged (AGENTOS_GATEWAY_HOST etc.). An env-supplied posture
+    # is itself transient (env vars are per-invocation), so recording the effective
+    # value as the "on-disk original" would let a later config.patch freeze it. A
+    # key absent from the TOML records as None -> persist drops it, so the
+    # load-time default/env re-applies at the next boot.
+    set_runtime_overrides(read_raw_bind_overrides(config.config_path))
     config = config.model_copy(update={"host": host, "port": resolved_port, "debug": debug})
+
+    # Public-bind auth provisioning: the helper owns all public-bind warning
+    # messaging and, on an interactive TTY, prompts to secure an unprotected
+    # public bind (generate+persist a token / break-glass / cancel). Non-TTY
+    # runs never prompt — enforce_public_bind_auth_guard still refuses the
+    # unsafe combination downstream, exactly as before.
+    outcome, config = provision_public_bind_auth(
+        config,
+        interactive=_stdin_isatty(),
+        emit=console.print,
+    )
+    if outcome is AuthProvisionOutcome.CANCEL:
+        console.print("[yellow]Gateway start cancelled.[/yellow]")
+        raise typer.Exit(0)
 
     banner_host = f"[red]{host}[/red]" if is_public_bind(host) else f"[{ACCENT_MARKUP}]{host}[/]"
     console.print(
@@ -69,29 +108,6 @@ def run_gateway(
     scheme = "https" if (config.tls.keyfile and config.tls.certfile) else "http"
     for line in gateway_startup_guidance(host, resolved_port, scheme=scheme):
         console.print(line)
-    if is_public_bind(host):
-        # Use ASCII-only glyphs here so the warning still prints on Windows
-        # consoles configured for legacy GBK code pages (where U+26A0 / em-dash
-        # crash Rich's legacy renderer with UnicodeEncodeError).
-        console.print(
-            "[yellow]WARNING: gateway is bound to a wildcard address - "
-            "reachable from every interface.[/yellow]"
-        )
-        if config.auth.mode == "none" and config.auth.allow_unauthenticated_public:
-            # Without the opt-in, start_gateway_server refuses this combination
-            # outright (enforce_public_bind_auth_guard) — no point warning that
-            # the network is open right before the refusal explains itself.
-            console.print(
-                "[yellow]  auth.mode=none + wildcard bind + "
-                "allow_unauthenticated_public = LAN-open. "
-                "Anyone reachable on this network can use the chat, sessions, "
-                "and config surfaces with your provider credentials.[/yellow]"
-            )
-        console.print(
-            "[yellow]  Bypass / elevated mode remains owner-only and "
-            "is unreachable from non-loopback peers; the chat UI will "
-            "self-disable that pill.[/yellow]"
-        )
 
     async def _run() -> None:
         # Subscription manager is gateway-specific (WS event routing)
