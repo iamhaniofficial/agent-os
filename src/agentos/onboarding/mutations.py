@@ -621,11 +621,8 @@ def upsert_router(
         )
         public_payload.update({"enabled": True, "tier_profile": None})
     else:
-        if provider not in ROUTER_TIER_PROFILE_IDS:
-            router_payload["enabled"] = False
-            router_payload["tier_profile"] = None
-            public_payload.update({"enabled": False, "tier_profile": None})
-        else:
+        llm_model = str(config.llm.model or "").strip()
+        if provider in ROUTER_TIER_PROFILE_IDS:
             router_payload["enabled"] = True
             router_payload["tier_profile"] = provider
             router_payload["tiers"] = _merge_router_tiers(
@@ -633,6 +630,35 @@ def upsert_router(
                 tiers,
             )
             public_payload.update({"enabled": True, "tier_profile": provider})
+        elif is_local_provider(provider) and llm_model:
+            # Local providers have no tier profile, but "recommended" must not
+            # disable the router and resurrect the openrouter default tiers
+            # (clobbering the local pin the provider step just wrote). Keep an
+            # operator-customised table verbatim; otherwise pin every tier to
+            # the configured local model.
+            router_payload["enabled"] = True
+            router_payload["tier_profile"] = None
+            current_tiers = {
+                name: dict(tier)
+                for name, tier in (config.agentos_router.tiers or {}).items()
+                if isinstance(tier, dict)
+            }
+            if current_tiers and not _tiers_are_machine_written_defaults(
+                current_tiers, provider, llm_model
+            ):
+                router_payload["tiers"] = _merge_router_tiers(current_tiers, tiers)
+            else:
+                router_payload["tiers"] = _merge_router_tiers(
+                    _local_provider_tiers(
+                        _router_tier_profile_defaults("openrouter"), provider, llm_model
+                    ),
+                    tiers,
+                )
+            public_payload.update({"enabled": True, "tier_profile": None})
+        else:
+            router_payload["enabled"] = False
+            router_payload["tier_profile"] = None
+            public_payload.update({"enabled": False, "tier_profile": None})
     warnings: list[str] = []
     if router_payload.get("enabled"):
         warnings.extend(

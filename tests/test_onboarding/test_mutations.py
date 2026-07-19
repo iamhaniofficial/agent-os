@@ -558,6 +558,62 @@ def test_upsert_router_can_disable():
     assert res.public_payload["mode"] == "disabled"
 
 
+def test_upsert_router_recommended_keeps_local_provider_enabled_with_pinned_tiers():
+    """First-run wizard order: provider step then router step.
+
+    The router step must not clobber the local pin the provider step wrote —
+    previously it disabled the router and resurrected the openrouter default
+    tiers via the config default factory.
+    """
+    cfg = GatewayConfig()
+    provider_res = upsert_llm_provider(
+        cfg, provider_id="ollama", model="qwen3.5:2b", base_url="http://localhost:11434"
+    )
+
+    res = upsert_router(provider_res.config, mode="recommended", strategy="v4_phase3")
+    router = res.config.agentos_router
+
+    assert router.enabled is True
+    assert router.tier_profile is None
+    for name in ("c0", "c1", "c2", "c3", "image_model"):
+        assert router.tiers[name]["provider"] == "ollama", name
+        assert router.tiers[name]["model"] == "qwen3.5:2b", name
+    assert router.tiers["image_model"]["supports_image"] is True
+    assert router.tiers["image_model"]["image_only"] is True
+    assert res.public_payload["enabled"] is True
+
+
+def test_upsert_router_recommended_respects_custom_local_tiers():
+    # An operator-customised local multi-model table must survive the router step.
+    custom = {
+        "c0": {"provider": "ollama", "model": "qwen3.5:2b"},
+        "c1": {"provider": "ollama", "model": "qwen3.5:9b"},
+        "c2": {"provider": "ollama", "model": "qwen3.5:9b"},
+        "c3": {"provider": "ollama", "model": "qwen3.5:latest"},
+    }
+    cfg = GatewayConfig(
+        llm={"provider": "ollama", "model": "qwen3.5:2b", "api_key": ""},
+        agentos_router={"enabled": True, "tiers": custom},
+    )
+
+    res = upsert_router(cfg, mode="recommended", strategy="v4_phase3")
+    router = res.config.agentos_router
+
+    assert router.enabled is True
+    assert router.tiers["c1"]["model"] == "qwen3.5:9b"
+    assert router.tiers["c3"]["model"] == "qwen3.5:latest"
+
+
+def test_upsert_router_recommended_still_disables_unknown_nonlocal_provider():
+    # Non-local providers without a tier profile keep today's disable behavior.
+    cfg = GatewayConfig(llm={"provider": "anthropic", "model": "claude-sonnet-4-6"})
+
+    res = upsert_router(cfg, mode="recommended")
+
+    assert res.config.agentos_router.enabled is False
+    assert res.config.agentos_router.tier_profile is None
+
+
 def test_upsert_router_rejects_openrouter_mix_for_direct_provider():
     cfg = GatewayConfig(llm={"provider": "deepseek", "model": "deepseek-chat"})
 
