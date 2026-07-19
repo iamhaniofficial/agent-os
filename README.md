@@ -236,6 +236,34 @@ or use the GitHub release wheel link directly:
 > wheel alias. Only the Windows portable zip has a version-independent
 > `releases/latest/download/` alias.
 
+### Upgrade
+
+Upgrade a `uv tool` install to the latest release:
+
+```sh
+uv tool upgrade use-agent-os
+```
+
+This keeps the extras from the original install (for example
+`[recommended]`). A version-pinned install (`==<version>`) stays on
+its pin — to move it, re-run the install command with the new
+version. For a `pip` fallback install, use
+`python -m pip install --user --upgrade "use-agent-os[recommended]"`.
+
+For an [install from source](#install-from-source), pull and re-run
+the installer:
+
+```sh
+cd agent-os
+git pull
+git lfs pull --include="src/agentos/memory/models/**"
+bash scripts/install_source.sh        # Windows: scripts/install_source.ps1
+```
+
+After any upgrade, restart the gateway so it runs the new code. Your
+configuration and data in `~/.agentos/` are not touched by upgrades.
+To check the installed version, run `uv tool list`.
+
 ### Install from source
 
 Use this path to run AgentOS from a Git checkout, without changing
