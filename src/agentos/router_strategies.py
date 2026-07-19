@@ -32,12 +32,14 @@ __all__ = [
     "is_known_strategy",
     "known_strategy_ids",
     "pilot_asset_probe",
-    "v4_asset_probe",
     "PILOT_STRATEGY_ID",
     "V4_STRATEGY_ID",
     "LLM_JUDGE_STRATEGY_ID",
 ]
 
+#: Legacy strategy id. The v4_phase3 engine and its model bundle were removed
+#: (Phase C); the id survives only so config migration can rewrite persisted
+#: ``strategy = "v4_phase3"`` selections to ``pilot-v1`` on load.
 V4_STRATEGY_ID = "v4_phase3"
 LLM_JUDGE_STRATEGY_ID = "llm_judge"
 PILOT_STRATEGY_ID = "pilot-v1"
@@ -57,17 +59,13 @@ _PILOT_REQUIRED_FILES = ("model.onnx", "manifest.json")
 #: or boot/doctor report ready while every turn degrades.
 _MINILM_REQUIRED_FILES = ("model.onnx", "tokenizer.json")
 
-#: Files the v4 bundle must carry.
-_V4_REQUIRED_FILES = ("runtime_src", "router.runtime.yaml")
-
 
 @dataclass(frozen=True)
 class RouterStrategyInfo:
     """Immutable descriptor for one router strategy.
 
     Attributes:
-        strategy_id: canonical id (``"v4_phase3"`` | ``"pilot-v1"`` |
-            ``"llm_judge"``).
+        strategy_id: canonical id (``"pilot-v1"`` | ``"llm_judge"``).
         source: healthy telemetry ``routing_source`` tag.
         degraded_source: telemetry tag emitted when the strategy degrades.
         requires_local_assets: whether boot preflight must probe on-disk assets.
@@ -147,37 +145,7 @@ def _resolve_pilot_artifact_dir(config: object | None) -> Path:
     return _pilot_default_artifact_dir()
 
 
-def _v4_bundle_dir(config: object | None) -> Path:
-    configured = getattr(config, "v4_bundle_dir", None) if config is not None else None
-    if configured:
-        return Path(configured).expanduser()
-    return (
-        Path(__file__).resolve().parent
-        / "agentos_router"
-        / "models"
-        / "v4.2_phase3_inference"
-    )
-
-
-def v4_asset_probe(config: object | None = None) -> list[str]:
-    """Return the v4 bundle files that are missing (empty when present)."""
-    bundle_dir = _v4_bundle_dir(config)
-    return [
-        str(bundle_dir / name)
-        for name in _V4_REQUIRED_FILES
-        if not (bundle_dir / name).exists()
-    ]
-
-
 _REGISTRY: dict[str, RouterStrategyInfo] = {
-    V4_STRATEGY_ID: RouterStrategyInfo(
-        strategy_id=V4_STRATEGY_ID,
-        source="v4_phase3",
-        degraded_source="v4_unavailable",
-        requires_local_assets=True,
-        uses_judge=False,
-        asset_probe=v4_asset_probe,
-    ),
     LLM_JUDGE_STRATEGY_ID: RouterStrategyInfo(
         strategy_id=LLM_JUDGE_STRATEGY_ID,
         source="llm_judge",

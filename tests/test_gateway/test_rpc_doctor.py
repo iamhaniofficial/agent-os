@@ -819,13 +819,11 @@ def test_router_payload_marks_runtime_invalid_when_judge_unresolvable() -> None:
     assert payload["error"]
 
 
-def test_router_payload_v4_phase3_skips_judge_resolution() -> None:
-    """v4_phase3 (the reintegrated default local ML router) needs no judge and no
-    cloud credentials: its doctor health is purely bundle presence. The payload
-    must early-return before any judge resolution, so all judge fields are None
-    and the strategy is reported verbatim as "v4_phase3". Bundle presence is
-    env-dependent (git-ignored), so this asserts only the shape that holds
-    regardless of whether the local bundle is present.
+def test_router_payload_normalizes_legacy_v4_strategy() -> None:
+    """A legacy "v4_phase3" selection that reaches config construction (e.g.
+    an env override that bypasses the config-file migration) normalizes to
+    pilot-v1, so the doctor payload reports the live strategy — never the
+    removed engine — and still skips judge resolution for it.
     """
     import agentos.gateway.rpc_doctor as rpc_doctor
 
@@ -833,19 +831,19 @@ def test_router_payload_v4_phase3_skips_judge_resolution() -> None:
         llm={"provider": "deepseek", "model": "deepseek-chat"},
         agentos_router={"strategy": "v4_phase3"},
     )
-    assert config.agentos_router.strategy == "v4_phase3"
+    assert config.agentos_router.strategy == "pilot-v1"
     ctx = RpcContext(conn_id="test", config=config)
 
     payload = rpc_doctor._router_payload(ctx)
 
-    assert payload["strategy"] == "v4_phase3"
+    assert payload["strategy"] == "pilot-v1"
     assert payload["judgeProvider"] is None
     assert payload["judgeModel"] is None
     assert payload["judgeSource"] is None
     assert payload["judgeBaseUrl"] is None
 
 
-def test_router_payload_reports_tier_providers_for_v4_phase3() -> None:
+def test_router_payload_reports_tier_providers_for_pilot() -> None:
     """The payload carries llm.provider plus each tier's declared provider so
     evaluate_router can flag tiers pointing at a provider the runtime never
     builds a client for (routing is single-provider; tiers only pick the model).
@@ -854,7 +852,7 @@ def test_router_payload_reports_tier_providers_for_v4_phase3() -> None:
 
     config = GatewayConfig(
         llm={"provider": "ollama", "model": "llama3"},
-        agentos_router={"strategy": "v4_phase3"},
+        agentos_router={"strategy": "pilot-v1"},
     )
     ctx = RpcContext(conn_id="test", config=config)
 

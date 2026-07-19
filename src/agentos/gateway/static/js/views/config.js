@@ -53,7 +53,7 @@ const ConfigView = (() => {
     'agentos_router.rollout_phase':
       'Rollout stage for new router model versions. Higher phases enable more aggressive routing decisions.',
     'agentos_router.strategy':
-      '"v4_phase3" (default) classifies each turn with the local ML router (BGE+LightGBM bundle, no LLM call); "llm_judge" classifies via a small LLM call instead. The v4 bundle ships out-of-git and degrades to the default tier if absent.',
+      '"pilot-v1" (default) classifies each turn with the local Pilot ML router (MiniLM+ONNX bundle, no LLM call); "llm_judge" classifies via a small LLM call instead. The pilot bundle ships in the wheel and degrades to the default tier if absent.',
     'agentos_router.judge_model':
       'Explicit LLM-judge model. Leave unset for Auto: the judge follows the tier profile’s cheapest text tier (c0 first), so profile switches auto-update it.',
     'agentos_router.judge_provider':

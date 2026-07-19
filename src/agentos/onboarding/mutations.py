@@ -561,10 +561,9 @@ def upsert_router(
 ) -> MutationResult:
     """Upsert router config.
 
-    ``strategy`` selects the routing engine: ``"v4_phase3"`` (the local ML
-    router, the default), ``"llm_judge"`` (classify each turn via a small LLM
-    call), or ``"pilot-v1"`` (local ONNX+MiniLM router, English-optimized).
-    Valid ids come from the router strategy registry
+    ``strategy`` selects the routing engine: ``"pilot-v1"`` (local ONNX+MiniLM
+    router, English-optimized, the default) or ``"llm_judge"`` (classify each
+    turn via a small LLM call). Valid ids come from the router strategy registry
     (``agentos.router_strategies``). ``None`` preserves the persisted strategy;
     any unknown value raises.
     The strategy is recorded whenever it is provided — even when ``mode`` is
@@ -574,8 +573,7 @@ def upsert_router(
     when the router ends up enabled: ``judge_model=None`` preserves the persisted
     value; ``""`` or ``"auto"`` clears to AUTO (persists nothing, so later profile
     switches auto-update the judge); anything else pins an explicit judge model.
-    They are harmless (ignored at routing time) when the strategy is
-    ``v4_phase3``.
+    They are harmless (ignored at routing time) under ``pilot-v1``.
 
     ``safety_net_threshold`` sets ``[agentos_router.pilot].safety_net_threshold``
     (only meaningful under ``strategy="pilot-v1"``): ``None`` preserves the

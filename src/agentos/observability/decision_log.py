@@ -38,8 +38,6 @@ _ABS_PATH_RE = re.compile(r"(?<!\w)(?:/home/[^/\s]+|/Users/[^/\s]+|/root)(?:/[^\
 RoutingSource = Literal[
     "llm_judge",
     "judge_unavailable",
-    "v4_phase3",
-    "v4_unavailable",
     "pilot_v1",
     "pilot_unavailable",
     "cache",

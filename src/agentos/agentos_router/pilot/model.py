@@ -4,7 +4,7 @@ Loads and validates the fixture/production artifact pair (``model.onnx`` +
 ``manifest.json``) from an artifact directory, then exposes calibrated
 per-class probabilities.
 
-The design mirrors ``V4Phase3Strategy``'s **fail-soft** contract: a missing
+The design follows the router's **fail-soft** contract: a missing
 directory, a missing/corrupt file, a sha256 or IO-contract mismatch, or a
 class-order mismatch all leave the model in an **unavailable** state (a
 queryable ``available`` flag + ``unavailable_reason``) rather than raising.

@@ -169,10 +169,10 @@ def test_release_wheel_allows_tokenjuice_provenance_markdown() -> None:
 def test_release_wheel_allows_router_bundle_provenance_markdown() -> None:
     module = load_script()
     bundle_provenance = (
-        "agentos/agentos_router/models/v4.2_phase3_inference/PROVENANCE.md"
+        "agentos/agentos_router/models/pilot_v1/PROVENANCE.md"
     )
     other_bundle_doc = (
-        "agentos/agentos_router/models/v4.2_phase3_inference/NOTES.md"
+        "agentos/agentos_router/models/pilot_v1/NOTES.md"
     )
 
     violations = module.forbidden_release_wheel_entries(

@@ -1402,28 +1402,15 @@ def _warn_on_tier_provider_mismatch(config: GatewayConfig, llm_provider: str) ->
     )
 
 
-def _agentos_router_bundle_dir(router_cfg: Any) -> Path:
-    """Resolve the v4_phase3 bundle root, honoring the v4_bundle_dir override."""
-    configured = getattr(router_cfg, "v4_bundle_dir", None)
-    if configured:
-        return Path(configured).expanduser()
-    return (
-        Path(__file__).resolve().parents[1]
-        / "agentos_router"
-        / "models"
-        / "v4.2_phase3_inference"
-    )
-
-
 def validate_agentos_router_runtime(config: GatewayConfig) -> None:
     """Validate router runtime prerequisites for the configured strategy.
 
     Registry-driven (``agentos.router_strategies``): a strategy whose
     ``requires_local_assets`` is set runs its ``asset_probe`` and reports any
     missing files. A missing asset only warns (routing degrades to the default
-    tier) unless ``require_router_runtime`` is set, in which case it raises —
-    identical semantics across ``v4_phase3`` and ``pilot-v1``. A ``uses_judge``
-    strategy needs no local assets: resolve and log the judge target instead.
+    tier) unless ``require_router_runtime`` is set, in which case it raises. A
+    ``uses_judge`` strategy needs no local assets: resolve and log the judge
+    target instead.
     """
     from agentos.router_strategies import get_strategy_info, resolve_strategy_id
 
@@ -1436,10 +1423,7 @@ def validate_agentos_router_runtime(config: GatewayConfig) -> None:
     if info is not None and info.requires_local_assets and info.asset_probe is not None:
         missing = info.asset_probe(router_cfg)
         if missing:
-            # Keep the v4 phrasing ("V4 bundle files") stable for operators and
-            # existing runtime-check assertions; Pilot gets its own noun.
-            label = "V4 bundle files" if strategy == "v4_phase3" else f"{strategy} router assets"
-            message = f"missing {label}: {missing}"
+            message = f"missing {strategy} router assets: {missing}"
             if getattr(router_cfg, "require_router_runtime", False):
                 raise RuntimeError(message)
             log.warning(

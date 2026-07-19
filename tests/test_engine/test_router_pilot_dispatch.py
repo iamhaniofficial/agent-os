@@ -55,11 +55,12 @@ def test_dispatch_builds_pilot_strategy_for_pilot_v1() -> None:
     assert strategy.artifact_dir == FIXTURE_DIR
 
 
-def test_dispatch_still_builds_v4_and_judge() -> None:
-    from agentos.agentos_router.v4_phase3 import V4Phase3Strategy
-
-    v4 = step._get_strategy(AgentOSRouterConfig(strategy="v4_phase3"))
-    assert isinstance(v4, V4Phase3Strategy)
+def test_dispatch_builds_pilot_for_legacy_v4_and_judge_for_judge() -> None:
+    # The v4_phase3 engine was removed (Phase C): a legacy strategy value that
+    # reaches config construction normalizes to pilot-v1, so dispatch builds
+    # PilotStrategy — never a removed engine.
+    legacy = step._get_strategy(AgentOSRouterConfig(strategy="v4_phase3"))
+    assert isinstance(legacy, PilotStrategy)
 
     # A fresh cache key is required for the judge to build a distinct instance.
     step._strategy = None
@@ -68,8 +69,8 @@ def test_dispatch_still_builds_v4_and_judge() -> None:
         AgentOSRouterConfig(strategy="llm_judge"), llm_cfg=None
     )
     # The judge builder may return an unavailable stand-in without credentials,
-    # but it must NOT be a Pilot/V4 strategy.
-    assert not isinstance(judge, PilotStrategy | V4Phase3Strategy)
+    # but it must NOT be a Pilot strategy.
+    assert not isinstance(judge, PilotStrategy)
 
 
 def test_cache_key_includes_pilot_thresholds() -> None:

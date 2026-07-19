@@ -3,9 +3,9 @@
 ``_find_valid_tier`` walks ``TIER_ORDER`` upward to honour a ``valid_tiers``
 allowlist: given a desired starting tier, it returns the nearest configured
 tier at or above it, falling back to any configured tier (in canonical order)
-when the desired tier sits above every valid one. Extracted here so
-``V4Phase3Strategy`` and ``PilotStrategy`` share one implementation rather than
-each carrying a private copy.
+when the desired tier sits above every valid one. Extracted here so the
+router strategies (``PilotStrategy``, ``LLMJudgeStrategy``) share one
+implementation rather than each carrying a private copy.
 """
 
 from __future__ import annotations

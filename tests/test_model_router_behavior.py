@@ -858,29 +858,6 @@ async def test_judge_strategy_build_failure_falls_back_to_default_tier(
     assert routed.metadata["routing_confidence"] == 0.0
 
 
-@pytest.mark.asyncio
-async def test_v4_phase3_without_bundle_degrades_to_default_tier() -> None:
-    """v4_phase3 is the reintegrated default strategy, but its ML bundle is
-    git-ignored and absent in CI/public checkouts. When the bundle is missing,
-    V4Phase3Strategy stays unavailable and classify degrades to the default tier
-    (c1) with routing_source="v4_unavailable" and confidence 0.0 — it does NOT
-    raise (require_router_runtime defaults False). Tested directly against a
-    nonexistent bundle path for determinism regardless of the local machine."""
-    from agentos.agentos_router.v4_phase3 import V4Phase3Strategy
-
-    strategy = V4Phase3Strategy(bundle_dir="/nonexistent/path")
-
-    assert strategy._available is False
-
-    tier, confidence, source, _extra = await strategy.classify(
-        "Explain the setup steps.", ["c0", "c1", "c2", "c3"]
-    )
-
-    assert tier == "c1"
-    assert confidence == 0.0
-    assert source == "v4_unavailable"
-
-
 def _real_judge_strategy(monkeypatch: pytest.MonkeyPatch, route_class: str) -> None:
     """Install the REAL LLMJudgeStrategy with only _judge mocked, so route-class
     -> thinking_mode/prompt_policy derivation runs end-to-end via _build_extra

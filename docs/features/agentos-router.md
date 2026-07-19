@@ -27,13 +27,12 @@ It is not required. AgentOS can also run in direct single-model mode.
 
 ## Strategies
 
-Pilot Router has three selectable strategies, set via
+Pilot Router has two selectable strategies, set via
 `agentos_router.strategy` in `agentos.toml` (or the onboarding wizard):
 
 | Strategy | Mode label | How it decides |
 | --- | --- | --- |
 | `pilot-v1` (default) | Local ML — English-optimized (Pilot) | An AgentOS-native, English-optimized local router (MiniLM embeddings + a self-trained AgentOS model, ONNX). Decides on-device with no LLM call, nothing leaving your machine. The bundle ships in the wheel under `src/agentos/agentos_router/models/pilot_v1/`; a missing bundle degrades to the default tier (c1). See [The Pilot strategy](#the-pilot-strategy) below for status, config, and upgrade-from-v4 behavior. |
-| `v4_phase3` (legacy) | Smart routing (on-device) | The previous default: an on-device ML ensemble (BGE embeddings + LightGBM) scoring each turn locally — no LLM call. Retained in-tree only as an evaluation baseline (removed in Phase C); a config that still pins it is **auto-migrated to `pilot-v1`** on the next load — see [Upgrading from v4_phase3](#the-pilot-strategy). Not a supported persisted strategy. |
 | `llm_judge` | Smart routing (LLM-based) | A small "judge" model classifies each turn (R0–R3) via a forced tool call. The judge can be a cloud model (default: the cheapest tier of your active provider) or a local OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp, vLLM) configured with `judge_model` / `judge_base_url`. |
 
 Both the Web UI setup wizard and the CLI (`agentos onboard`,
@@ -56,9 +55,10 @@ nothing leaves your machine.
 fresh install routes through it with no config change. It was promoted from
 opt-in after passing the owner's relative-to-incumbent ship gate (it beats the
 `v4_phase3` incumbent on 11/12 evaluation axes; see `DATA.md` /
-`eval_report.md`). The legacy `v4_phase3` engine remains in-tree only as an
-evaluation baseline (removed in Phase C); a config that still pins it is
-auto-migrated to `pilot-v1` on the next load (see **Upgrading from v4_phase3**).
+`eval_report.md`). The legacy `v4_phase3` engine and its ~52MB model bundle
+have been removed from the tree entirely (Phase C); a config that still pins it
+is auto-migrated to `pilot-v1` on the next load (see **Upgrading from
+v4_phase3**).
 
 The default needs no config, but the Pilot safety-net floor is tunable:
 
@@ -80,7 +80,7 @@ The Web UI setup wizard / CLI preselect the
 artifacts are missing. When the Pilot model bundle is not present (e.g. a source
 checkout without `git lfs pull`), the strategy tags the decision
 `pilot_unavailable` and routes the turn to the default tier (the same graceful
-degrade `v4_phase3` uses when its bundle is missing).
+degrade `v4_phase3` used when its bundle was missing).
 
 **Upgrading from v4_phase3.** Historical installs persisted
 `strategy = "v4_phase3"` explicitly in `~/.agentos/config.toml`. On the next
@@ -88,8 +88,9 @@ config load AgentOS **automatically migrates** any such config to `pilot-v1`:
 the old file is backed up verbatim next to it (`config.toml.backup.<timestamp>`)
 and rewritten with `strategy = "pilot-v1"`, and the flip is logged. The
 migration is idempotent — once rewritten there is nothing left to migrate. There
-is no supported way to keep `v4_phase3` in config; the legacy engine stays
-in-tree only as an evaluation baseline until its scheduled removal (Phase C).
+is no way to keep `v4_phase3` in config: the legacy engine and its model bundle
+were removed from the tree (Phase C), and a value that bypasses the file
+migration (e.g. an env override) normalizes to `pilot-v1` at config load.
 
 ## One Router, One Provider
 

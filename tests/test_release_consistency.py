@@ -51,18 +51,16 @@ def test_default_recommended_install_contract_covers_embedding_and_channels() ->
     extras = project["optional-dependencies"]
     recommended = _dep_names(extras["recommended"])
 
-    # Local memory embedding (BGE ONNX) needs onnxruntime + tokenizers. The
-    # default v4_phase3 local ML router additionally needs lightgbm + joblib +
-    # scikit-learn to run its inference core (the ~75MB model bundle ships
-    # out-of-git); recommended bundles them so the default router works.
+    # Local memory embedding (BGE ONNX) and the default pilot-v1 router both
+    # run on numpy + onnxruntime + tokenizers; recommended bundles them so the
+    # default router works. The v4-era lightgbm/joblib/scikit-learn deps left
+    # with the removed v4_phase3 engine and must NOT creep back in.
     assert {
         "numpy",
         "onnxruntime",
         "tokenizers",
-        "lightgbm",
-        "scikit-learn",
-        "joblib",
     } <= recommended
+    assert not {"lightgbm", "scikit-learn", "joblib"} & recommended
     assert {
         "cryptography",  # WeCom callback crypto
         "dingtalk-stream",

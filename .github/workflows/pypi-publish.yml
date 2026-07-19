@@ -50,20 +50,6 @@ jobs:
                       f"LFS pointer not hydrated: {path}"
                   )
 
-          # The v4_phase3 router bundle is the wheel's routing brain; a missing
-          # weight silently degrades every turn to the default tier.
-          bundle = Path("src/agentos/agentos_router/models/v4.2_phase3_inference")
-          for name in (
-              "lgbm_main.bin",
-              "lgbm_aux.bin",
-              "mlp/model.onnx",
-              "features/tfidf.pkl",
-              "features/svd.pkl",
-              "router.runtime.yaml",
-              "runtime_src/src/router/inference/core.py",
-          ):
-              assert (bundle / name).is_file(), f"missing router asset: {name}"
-
           # Pilot router MiniLM INT8 export (T1). Lives under the
           # memory/models LFS root checked above; listed explicitly so a
           # non-hydrated LFS checkout can't silently ship a pointer file.

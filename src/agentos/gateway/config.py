@@ -1063,12 +1063,11 @@ class AgentOSRouterConfig(BaseSettings):
     auto_thinking: bool = True
     rollout_phase: str = "full"  # "observe" | "prompt_only" | "full"
     # "pilot-v1" (default: local ONNX+MiniLM router, English-optimized, no LLM
-    # call) | "v4_phase3" (legacy local ML router — BGE+LightGBM bundle; the
-    # one-line rollback strategy) | "llm_judge" (routes via a small LLM judge
-    # call). Both local bundles ship in the wheel under agentos_router/models/;
-    # a missing bundle degrades to the default tier unless require_router_runtime
-    # is set. Valid ids come from the router strategy registry
-    # (agentos.router_strategies).
+    # call) | "llm_judge" (routes via a small LLM judge call). The pilot bundle
+    # ships in the wheel under agentos_router/models/; a missing bundle degrades
+    # to the default tier unless require_router_runtime is set. Valid ids come
+    # from the router strategy registry (agentos.router_strategies); a persisted
+    # legacy "v4_phase3" is force-migrated to "pilot-v1" on config load.
     strategy: str = DEFAULT_ROUTER_STRATEGY
     tier_profile: str | None = None
     tiers: dict = Field(default_factory=_default_tiers)
@@ -1098,16 +1097,11 @@ class AgentOSRouterConfig(BaseSettings):
     # Judge-internal timeout (seconds). None derives it from
     # routing_timeout_seconds, staying strictly below the outer router budget.
     judge_timeout_seconds: float | None = Field(default=None, gt=0.0)
-    # Legacy local ML router (strategy="v4_phase3", eval baseline only; the
-    # default is "pilot-v1"). v4_bundle_dir overrides the bundled
-    # asset root (agentos_router/models/v4.2_phase3_inference); v4_use_aux_head
-    # overrides the bundle's router.runtime.yaml aux-head flag when set.
-    v4_bundle_dir: str | None = None  # V4 Phase 3 bundle root; defaults to bundled assets
-    v4_use_aux_head: bool | None = True  # override router.runtime.yaml aux head when set
-    # When True, a missing/broken v4 bundle raises at boot instead of degrading
-    # to the default tier. Defaults False: the bundle ships in the wheel, but a
-    # source checkout without `git lfs pull` still has only pointer stubs, and a
-    # strict default would turn that into a hard boot failure.
+    # When True, a missing/broken router bundle raises at boot instead of
+    # degrading to the default tier. Defaults False: the bundle ships in the
+    # wheel, but a source checkout without `git lfs pull` still has only pointer
+    # stubs, and a strict default would turn that into a hard boot failure.
+    # (Removed legacy v4_* fields are tolerated by extra="ignore" above.)
     require_router_runtime: bool = False
     # Pilot router strategy (strategy="pilot-v1"). Local ONNX+MiniLM router
     # (English-optimized). Settings live in the [agentos_router.pilot] sub-table.
@@ -1124,9 +1118,21 @@ class AgentOSRouterConfig(BaseSettings):
     @field_validator("strategy")
     @classmethod
     def _validate_strategy(cls, value: str) -> str:
-        from agentos.router_strategies import is_known_strategy, known_strategy_ids
+        from agentos.router_strategies import (
+            PILOT_STRATEGY_ID,
+            V4_STRATEGY_ID,
+            is_known_strategy,
+            known_strategy_ids,
+        )
 
         normalized = str(value or "").strip()
+        if normalized == V4_STRATEGY_ID:
+            # The v4_phase3 engine was removed (Phase C). Config files are
+            # rewritten by the load-time migration before validation; this
+            # alias covers values that bypass it (env override, direct
+            # construction) so an old selection degrades to the default
+            # strategy instead of hard-failing boot.
+            return PILOT_STRATEGY_ID
         if not is_known_strategy(normalized):
             allowed = ", ".join(repr(s) for s in sorted(known_strategy_ids()))
             raise ValueError(
