@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [2026.7.19.post1] - 2026-07-19
+
+### Changed
+
+- Renamed the router display name from "AgentOS Router" to "Pilot Router"
+  across the CLI, gateway, and onboarding surfaces.
+- Synced the router docs with the `pilot-v1` default and the 3-option
+  strategy selector.
+
 ### Removed
 
 - The legacy `v4_phase3` router engine and its ~52MB model bundle no longer
