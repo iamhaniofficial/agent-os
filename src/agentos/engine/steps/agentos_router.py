@@ -502,16 +502,6 @@ def _strategy_cache_key(config: object, llm_cfg: object | None = None) -> tuple:
             getattr(config, "default_tier", None),
             _tiers_fingerprint(config),
         )
-    if strategy_name == "v4_phase3":
-        # A bundle-path / aux-head / runtime-flag change must rebuild the cached
-        # V4Phase3Strategy (it snapshots these in __init__ and loads the bundle
-        # eagerly), otherwise the edit silently no-ops until process restart.
-        key = (
-            *key,
-            getattr(config, "v4_bundle_dir", None),
-            getattr(config, "v4_use_aux_head", None),
-            getattr(config, "require_router_runtime", False),
-        )
     if strategy_name == "pilot-v1":
         # PilotStrategy snapshots safety_net_threshold, confidence_threshold
         # (already keyed above via `confidence`), the artifact dir, and the
@@ -603,32 +593,6 @@ def _build_pilot_strategy(config: object) -> RouterStrategy:
         return _UnavailableJudgeStrategy(exc, source=degraded_source)
 
 
-def _build_v4_phase3_strategy(config: object) -> RouterStrategy:
-    """Build the local ML router strategy from the on-disk v4 bundle.
-
-    The heavy inference core (onnxruntime + lightgbm) is imported lazily inside
-    ``V4Phase3Strategy._init_runtime`` from the bundle's ``runtime_src``. A
-    missing/broken bundle degrades to ``_unavailable_classify`` (default tier)
-    unless ``require_router_runtime`` is set, so a machine without the
-    git-ignored bundle still boots instead of crashing.
-    """
-    from agentos.agentos_router.v4_phase3 import V4Phase3Strategy
-
-    try:
-        return cast(
-            RouterStrategy,
-            V4Phase3Strategy(
-                bundle_dir=getattr(config, "v4_bundle_dir", None),
-                confidence_threshold=getattr(config, "confidence_threshold", 0.5),
-                require_router_runtime=getattr(config, "require_router_runtime", False),
-                use_aux_head=getattr(config, "v4_use_aux_head", None),
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("agentos_router.strategy_unavailable", error=str(exc))
-        return _UnavailableJudgeStrategy(exc)
-
-
 def _get_strategy(config: object, llm_cfg: object | None = None) -> RouterStrategy:
     global _strategy, _strategy_key  # noqa: PLW0603
     with _strategy_lock:
@@ -638,9 +602,7 @@ def _get_strategy(config: object, llm_cfg: object | None = None) -> RouterStrate
         if _strategy_key is not None and _strategy_key != key:
             _history_store.clear()
         strategy_name = _strategy_name(config)
-        if strategy_name == "v4_phase3":
-            strategy = _build_v4_phase3_strategy(config)
-        elif strategy_name == "pilot-v1":
+        if strategy_name == "pilot-v1":
             strategy = _build_pilot_strategy(config)
         else:
             strategy = _build_llm_judge_strategy(config, llm_cfg)

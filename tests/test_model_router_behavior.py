@@ -847,7 +847,7 @@ async def test_judge_strategy_build_failure_falls_back_to_default_tier(
 
     monkeypatch.setattr(llm_judge, "LLMJudgeStrategy", ExplodingJudgeStrategy)
     ctx = make_context("Explain the setup steps.")
-    # The default strategy is now v4_phase3; select llm_judge explicitly so the
+    # The default strategy is pilot-v1; select llm_judge explicitly so the
     # judge build-failure path (ExplodingJudgeStrategy) is the one exercised.
     ctx.config.agentos_router.strategy = "llm_judge"
 
@@ -856,29 +856,6 @@ async def test_judge_strategy_build_failure_falls_back_to_default_tier(
     assert routed.metadata["routing_source"] == "judge_unavailable"
     assert routed.metadata["routed_tier"] == "c1"
     assert routed.metadata["routing_confidence"] == 0.0
-
-
-@pytest.mark.asyncio
-async def test_v4_phase3_without_bundle_degrades_to_default_tier() -> None:
-    """v4_phase3 is the reintegrated default strategy, but its ML bundle is
-    git-ignored and absent in CI/public checkouts. When the bundle is missing,
-    V4Phase3Strategy stays unavailable and classify degrades to the default tier
-    (c1) with routing_source="v4_unavailable" and confidence 0.0 — it does NOT
-    raise (require_router_runtime defaults False). Tested directly against a
-    nonexistent bundle path for determinism regardless of the local machine."""
-    from agentos.agentos_router.v4_phase3 import V4Phase3Strategy
-
-    strategy = V4Phase3Strategy(bundle_dir="/nonexistent/path")
-
-    assert strategy._available is False
-
-    tier, confidence, source, _extra = await strategy.classify(
-        "Explain the setup steps.", ["c0", "c1", "c2", "c3"]
-    )
-
-    assert tier == "c1"
-    assert confidence == 0.0
-    assert source == "v4_unavailable"
 
 
 def _real_judge_strategy(monkeypatch: pytest.MonkeyPatch, route_class: str) -> None:
@@ -912,7 +889,7 @@ async def test_trivial_route_class_derives_p0_and_injects_hint_end_to_end(
     router injects the localized P0 hint into the display message."""
     _real_judge_strategy(monkeypatch, "R0")
     ctx = make_context("thanks, that works")
-    # Default strategy is now v4_phase3; select the judge explicitly so the real
+    # Default strategy is pilot-v1; select the judge explicitly so the real
     # LLMJudgeStrategy derivation (mocked _judge) is the path under test.
     ctx.config.agentos_router.strategy = "llm_judge"
 
@@ -934,7 +911,7 @@ async def test_trivial_chinese_route_class_injects_localized_p0_hint_end_to_end(
     Chinese (restores the deleted localized-P0 coverage)."""
     _real_judge_strategy(monkeypatch, "R0")
     ctx = make_context("谢谢，这个可以了")
-    # Default strategy is now v4_phase3; select the judge explicitly so the real
+    # Default strategy is pilot-v1; select the judge explicitly so the real
     # LLMJudgeStrategy localized-hint derivation is the path under test.
     ctx.config.agentos_router.strategy = "llm_judge"
 
@@ -955,7 +932,7 @@ async def test_complex_route_class_derives_t3_p2_without_p0_injection_end_to_end
         "Diagnose this intermittent production data-corruption bug across "
         "services and plan a safe rollback."
     )
-    # Default strategy is now v4_phase3; select the judge explicitly so the real
+    # Default strategy is pilot-v1; select the judge explicitly so the real
     # LLMJudgeStrategy derivation (mocked _judge) is the path under test.
     ctx.config.agentos_router.strategy = "llm_judge"
 

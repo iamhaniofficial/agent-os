@@ -786,7 +786,7 @@ def _router_runtime_invalid_finding(
     """Pick an accurate finding for an invalid router runtime.
 
     ``runtimeInvalidReason`` (set by ``rpc_doctor``) distinguishes a genuinely
-    missing local runtime asset (the v4_phase3 ML bundle) from purely judge-side
+    missing local runtime asset (the pilot-v1 ML bundle) from purely judge-side
     failures (an unresolvable judge, or a judge whose provider has no
     credentials). Those judge conditions have nothing to do with local files, so
     they get their own id/title/fix_steps instead of misdirecting the operator

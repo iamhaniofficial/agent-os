@@ -103,9 +103,18 @@ Read: [`features/skills.md`](features/skills.md)
 ## Pilot Router
 
 AgentOS's local routing layer for choosing an appropriate model tier per
-turn.
+turn. Every routing strategy — the default `pilot-v1` local ML model and the
+LLM judge — runs inside it.
 
 Read: [`features/agentos-router.md`](features/agentos-router.md)
+
+## pilot-v1
+
+The default Pilot Router strategy: an AgentOS-native, English-optimized local
+ML model (MiniLM embeddings + ONNX) that picks the tier on-device with no LLM
+call.
+
+Read: [`features/agentos-router.md`](features/agentos-router.md#the-pilot-strategy)
 
 ## Tool Compression
 

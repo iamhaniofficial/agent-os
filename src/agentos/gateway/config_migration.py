@@ -315,11 +315,11 @@ def migrate_config_payload(data: dict[str, Any]) -> ConfigMigrationResult:
     agentos_router = builder.payload.get("agentos_router")
     if isinstance(agentos_router, dict):
         # Force default-flip: pilot-v1 is the default strategy, but historical
-        # onboarding persisted `strategy = "v4_phase3"` explicitly, so an upgraded
+        # onboarding once persisted `strategy = "v4_phase3"` explicitly, so an upgraded
         # install would silently stay on the legacy router. Unconditionally rewrite
         # a persisted v4_phase3 to pilot-v1 on load — there is no supported way to
-        # keep v4_phase3 in config; the legacy engine stays in-tree only as an
-        # evaluation baseline (removed in Phase C). The rewrite is idempotent:
+        # keep v4_phase3 in config; the legacy engine and its model bundle were
+        # removed from the tree (Phase C). The rewrite is idempotent:
         # once flipped the value is pilot-v1, so re-running is a no-op. "pilot-v1"
         # and "llm_judge" configs are left untouched, and a config with no strategy
         # key already resolves to the default and is not rewritten here.

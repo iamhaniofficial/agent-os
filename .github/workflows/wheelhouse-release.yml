@@ -75,7 +75,6 @@ jobs:
 
           root = Path("src/agentos/memory/models/bge_onnx")
           minilm = Path("src/agentos/memory/models/embeddings/all-MiniLM-L6-v2-int8")
-          bundle = Path("src/agentos/agentos_router/models/v4.2_phase3_inference")
           pilot = Path("src/agentos/agentos_router/models/pilot_v1")
           required = [
               root / "config.json",
@@ -92,21 +91,10 @@ jobs:
               minilm / "tokenizer.json",
               minilm / "tokenizer_config.json",
               minilm / "vocab.txt",
-              # v4_phase3 router bundle. It shares the bge_onnx export above
-              # rather than carrying a second copy.
-              bundle / "lgbm_main.bin",
-              bundle / "lgbm_aux.bin",
-              bundle / "mlp/model.onnx",
-              bundle / "mlp/scaler.joblib",
-              bundle / "features/tfidf.pkl",
-              bundle / "features/svd.pkl",
-              bundle / "features/bge_pca.joblib",
-              bundle / "router.runtime.yaml",
-              bundle / "runtime_src/src/router/inference/core.py",
               # Pilot production bundle (strategy="pilot-v1", the default).
               # A non-hydrated model.onnx pointer would silently degrade
               # every turn to pilot_unavailable, so guard it exactly like the
-              # v4/MiniLM assets above.
+              # MiniLM assets above.
               pilot / "model.onnx",
               pilot / "manifest.json",
           ]
@@ -225,9 +213,11 @@ jobs:
                       f"Git LFS pointer leaked into wheel: {info.filename}"
                   )
 
-              bundle = "agentos/agentos_router/models/v4.2_phase3_inference/"
-              for name in ("lgbm_main.bin", "router.runtime.yaml", "features/tfidf.pkl"):
-                  assert bundle + name in names, f"router bundle missing from wheel: {name}"
+              # The legacy v4_phase3 model bundle must NOT ship anymore — it
+              # was removed to slim the wheel (~52MB).
+              assert not any(
+                  "agentos_router/models/v4.2_phase3_inference/" in name for name in names
+              ), "legacy v4_phase3 bundle leaked back into the wheel"
 
               # Pilot production bundle (default strategy). Assert present and
               # real: a non-hydrated model.onnx is a ~130-byte LFS pointer.

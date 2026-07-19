@@ -16,8 +16,8 @@ IMAGE_TIER = "image_model"
 #
 # Default flipped v4_phase3 -> pilot-v1 (2026-07-19): under the owner's
 # relative-to-incumbent ship gate the pilot bundle beats v4 on 11/12 axes.
-# v4_phase3 stays fully selectable — rollback is this one line (or a config
-# `strategy = "v4_phase3"` override).
+# The v4_phase3 engine and bundle have since been removed (Phase C); a
+# persisted `strategy = "v4_phase3"` is force-migrated to pilot-v1 on load.
 DEFAULT_ROUTER_STRATEGY = "pilot-v1"
 
 LEGACY_TEXT_TIER_ALIASES: dict[str, str] = {

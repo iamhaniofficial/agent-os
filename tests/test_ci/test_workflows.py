@@ -328,28 +328,26 @@ def test_wheelhouse_release_hydrates_current_embedding_bundle() -> None:
     assert "intent_head.joblib" not in text
 
 
-def test_wheelhouse_release_hydrates_v4_router_bundle() -> None:
-    """strategy="v4_phase3" is the default; a bundle that fails to hydrate
-    degrades every turn to the default tier with only a boot warning, so the
-    release must fail loudly instead."""
+def test_wheelhouse_release_dropped_v4_router_bundle() -> None:
+    """The legacy v4_phase3 model bundle was removed from the tree to slim
+    the wheel; the release must still hydrate the pilot bundle and must
+    guard against the legacy bundle sneaking back into the wheel."""
     text = (WORKFLOW_DIR / "wheelhouse-release.yml").read_text(encoding="utf-8")
 
     assert 'git lfs pull --include="src/agentos/agentos_router/models/**"' in text
-    assert "v4.2_phase3_inference" in text
-    assert 'bundle / "lgbm_main.bin"' in text
-    assert 'bundle / "features/tfidf.pkl"' in text
-    assert 'bundle / "router.runtime.yaml"' in text
-    # The bundle shares memory's bge_onnx export rather than carrying a copy.
-    assert "v4.2_phase3_inference/bge_onnx" not in text
+    assert 'bundle / "lgbm_main.bin"' not in text
+    assert "legacy v4_phase3 bundle leaked back into the wheel" in text
 
 
-def test_pypi_publish_hydrates_v4_router_bundle() -> None:
+def test_pypi_publish_dropped_v4_router_bundle() -> None:
     text = (WORKFLOW_DIR / "pypi-publish.yml").read_text(encoding="utf-8")
 
     assert 'git lfs pull --include="src/agentos/memory/models/**"' in text
     assert 'git lfs pull --include="src/agentos/agentos_router/models/**"' in text
-    assert "v4.2_phase3_inference" in text
-    assert "lgbm_main.bin" in text
+    # The v4 hydration asserts are gone, replaced by the same anti-regression
+    # guard the wheelhouse release carries.
+    assert "lgbm_main.bin" not in text
+    assert "legacy v4_phase3 bundle leaked back into the tree" in text
 
 
 def test_wheelhouse_release_hydrates_pilot_minilm_export() -> None:

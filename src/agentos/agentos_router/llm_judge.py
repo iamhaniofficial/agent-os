@@ -1,6 +1,6 @@
 """LLM-judge router strategy: classify turns R0-R3 via a forced tool call.
 
-Self-contained replacement path for the local ML ensemble (``v4_phase3``).
+Self-contained alternative to the local ML router (``pilot-v1``).
 The judge builds its own provider client lazily via ``build_provider`` and
 never re-enters TurnRunner, so recursion is structurally impossible. Errors,
 unparseable output (after one repair re-prompt), and internal timeout all
@@ -633,7 +633,7 @@ class _JudgeCallError(RuntimeError):
 class LLMJudgeStrategy:
     """History-aware router strategy backed by a small LLM judge call.
 
-    Implements the same ``classify()`` contract as ``V4Phase3Strategy``. The
+    Implements the same ``classify()`` contract as ``PilotStrategy``. The
     provider client is built lazily from the resolved judge target; every
     failure mode collapses to the configured default tier with
     ``routing_source="judge_unavailable"``.

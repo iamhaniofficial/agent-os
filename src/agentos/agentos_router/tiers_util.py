@@ -3,9 +3,12 @@
 ``_find_valid_tier`` walks ``TIER_ORDER`` upward to honour a ``valid_tiers``
 allowlist: given a desired starting tier, it returns the nearest configured
 tier at or above it, falling back to any configured tier (in canonical order)
-when the desired tier sits above every valid one. Extracted here so
-``V4Phase3Strategy`` and ``PilotStrategy`` share one implementation rather than
-each carrying a private copy.
+when the desired tier sits above every valid one. Used by ``PilotStrategy``
+(and historically by the removed ``V4Phase3Strategy``). ``LLMJudgeStrategy``
+deliberately keeps its OWN ``_find_valid_tier`` variant: its over-range
+fallback clamps to the HIGHEST valid tier (never the cheapest), so do not
+"de-duplicate" the judge onto this helper — the two diverge on exactly that
+branch.
 """
 
 from __future__ import annotations

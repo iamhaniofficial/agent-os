@@ -196,7 +196,12 @@ def test_strategy_name_dispatches_and_defaults_to_the_canonical_strategy() -> No
     fall back to llm_judge while AgentOSRouterSettings.strategy defaulted to
     v4_phase3, so the effective default depended on which code path asked."""
     assert agentos_router_step._strategy_name(SimpleNamespace(strategy="llm_judge")) == "llm_judge"
-    assert agentos_router_step._strategy_name(SimpleNamespace(strategy="v4_phase3")) == "v4_phase3"
+    # v4_phase3 was removed (Phase C): the retired id maps through
+    # LEGACY_STRATEGY_ALIASES to pilot-v1.
+    assert (
+        agentos_router_step._strategy_name(SimpleNamespace(strategy="v4_phase3"))
+        == "pilot-v1"
+    )
     assert (
         agentos_router_step._strategy_name(SimpleNamespace(strategy=None))
         == DEFAULT_ROUTER_STRATEGY

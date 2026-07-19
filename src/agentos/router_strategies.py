@@ -32,15 +32,23 @@ __all__ = [
     "is_known_strategy",
     "known_strategy_ids",
     "pilot_asset_probe",
-    "v4_asset_probe",
     "PILOT_STRATEGY_ID",
-    "V4_STRATEGY_ID",
     "LLM_JUDGE_STRATEGY_ID",
 ]
 
+#: Legacy strategy id. The v4_phase3 engine and its model bundle were removed
+#: (Phase C); the id survives only so config migration and the legacy-alias
+#: map below can rewrite persisted ``strategy = "v4_phase3"`` selections to
+#: ``pilot-v1``. Deliberately NOT in ``__all__``: it is not a live strategy id.
 V4_STRATEGY_ID = "v4_phase3"
 LLM_JUDGE_STRATEGY_ID = "llm_judge"
 PILOT_STRATEGY_ID = "pilot-v1"
+
+#: Retired ids and the live strategy each one resolves to. The single source
+#: of truth consulted by both config validation and runtime resolution, so a
+#: legacy selection maps to the SAME strategy on every path even if
+#: ``DEFAULT_ROUTER_STRATEGY`` changes later.
+LEGACY_STRATEGY_ALIASES: dict[str, str] = {V4_STRATEGY_ID: PILOT_STRATEGY_ID}
 
 #: MiniLM embedder id that the Pilot feature builder depends on. Kept as a bare
 #: literal (not imported) so the registry stays import-light; the value is
@@ -57,17 +65,13 @@ _PILOT_REQUIRED_FILES = ("model.onnx", "manifest.json")
 #: or boot/doctor report ready while every turn degrades.
 _MINILM_REQUIRED_FILES = ("model.onnx", "tokenizer.json")
 
-#: Files the v4 bundle must carry.
-_V4_REQUIRED_FILES = ("runtime_src", "router.runtime.yaml")
-
 
 @dataclass(frozen=True)
 class RouterStrategyInfo:
     """Immutable descriptor for one router strategy.
 
     Attributes:
-        strategy_id: canonical id (``"v4_phase3"`` | ``"pilot-v1"`` |
-            ``"llm_judge"``).
+        strategy_id: canonical id (``"pilot-v1"`` | ``"llm_judge"``).
         source: healthy telemetry ``routing_source`` tag.
         degraded_source: telemetry tag emitted when the strategy degrades.
         requires_local_assets: whether boot preflight must probe on-disk assets.
@@ -147,37 +151,7 @@ def _resolve_pilot_artifact_dir(config: object | None) -> Path:
     return _pilot_default_artifact_dir()
 
 
-def _v4_bundle_dir(config: object | None) -> Path:
-    configured = getattr(config, "v4_bundle_dir", None) if config is not None else None
-    if configured:
-        return Path(configured).expanduser()
-    return (
-        Path(__file__).resolve().parent
-        / "agentos_router"
-        / "models"
-        / "v4.2_phase3_inference"
-    )
-
-
-def v4_asset_probe(config: object | None = None) -> list[str]:
-    """Return the v4 bundle files that are missing (empty when present)."""
-    bundle_dir = _v4_bundle_dir(config)
-    return [
-        str(bundle_dir / name)
-        for name in _V4_REQUIRED_FILES
-        if not (bundle_dir / name).exists()
-    ]
-
-
 _REGISTRY: dict[str, RouterStrategyInfo] = {
-    V4_STRATEGY_ID: RouterStrategyInfo(
-        strategy_id=V4_STRATEGY_ID,
-        source="v4_phase3",
-        degraded_source="v4_unavailable",
-        requires_local_assets=True,
-        uses_judge=False,
-        asset_probe=v4_asset_probe,
-    ),
     LLM_JUDGE_STRATEGY_ID: RouterStrategyInfo(
         strategy_id=LLM_JUDGE_STRATEGY_ID,
         source="llm_judge",
@@ -215,11 +189,14 @@ def get_strategy_info(strategy_id: object) -> RouterStrategyInfo | None:
 def resolve_strategy_id(value: object) -> str:
     """Return a registered strategy id, falling back to the default.
 
-    Mirrors the historical ``_strategy_name`` behavior: an unknown/blank id
-    resolves to :data:`DEFAULT_ROUTER_STRATEGY` (the caller decides whether to
-    warn).
+    A retired id maps through :data:`LEGACY_STRATEGY_ALIASES` first, so e.g.
+    ``"v4_phase3"`` resolves to ``pilot-v1`` explicitly rather than by luck of
+    the unknown-id fallback. Otherwise mirrors the historical
+    ``_strategy_name`` behavior: an unknown/blank id resolves to
+    :data:`DEFAULT_ROUTER_STRATEGY` (the caller decides whether to warn).
     """
     candidate = str(value or "").strip() or DEFAULT_ROUTER_STRATEGY
+    candidate = LEGACY_STRATEGY_ALIASES.get(candidate, candidate)
     if candidate in _REGISTRY:
         return candidate
     return DEFAULT_ROUTER_STRATEGY

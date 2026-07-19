@@ -570,7 +570,7 @@ def test_upsert_router_recommended_keeps_local_provider_enabled_with_pinned_tier
         cfg, provider_id="ollama", model="qwen3.5:2b", base_url="http://localhost:11434"
     )
 
-    res = upsert_router(provider_res.config, mode="recommended", strategy="v4_phase3")
+    res = upsert_router(provider_res.config, mode="recommended", strategy="pilot-v1")
     router = res.config.agentos_router
 
     assert router.enabled is True
@@ -596,7 +596,7 @@ def test_upsert_router_recommended_respects_custom_local_tiers():
         agentos_router={"enabled": True, "tiers": custom},
     )
 
-    res = upsert_router(cfg, mode="recommended", strategy="v4_phase3")
+    res = upsert_router(cfg, mode="recommended", strategy="pilot-v1")
     router = res.config.agentos_router
 
     assert router.enabled is True
@@ -677,14 +677,9 @@ def test_upsert_router_rejects_out_of_range_safety_net_threshold():
         )
 
 
-def test_upsert_router_still_accepts_v4_and_judge_strategies():
+def test_upsert_router_still_accepts_judge_strategy():
     cfg = GatewayConfig(llm={"provider": "openrouter", "model": "deepseek/x"})
 
-    assert (
-        upsert_router(cfg, mode="recommended", strategy="v4_phase3")
-        .config.agentos_router.strategy
-        == "v4_phase3"
-    )
     assert (
         upsert_router(cfg, mode="recommended", strategy="llm_judge")
         .config.agentos_router.strategy
@@ -692,17 +687,14 @@ def test_upsert_router_still_accepts_v4_and_judge_strategies():
     )
 
 
-def test_upsert_router_accepts_v4_phase3_despite_selector_drop():
-    """v4_phase3 remains a valid id at the API/registry level even though the
-    human-facing selectors (CLI + setup UI) dropped it: the engine and eval
-    baseline still use it, and direct API callers may set it (a persisted
-    v4_phase3 is force-migrated to pilot-v1 on the next config load, not
-    rejected here)."""
+def test_upsert_router_rejects_removed_v4_phase3():
+    """The v4_phase3 engine was removed (Phase C), so an explicit new write of
+    the legacy id is rejected with the valid options — unlike a persisted old
+    config, which the load-time migration rewrites to pilot-v1."""
     cfg = GatewayConfig(llm={"provider": "openrouter", "model": "deepseek/x"})
 
-    result = upsert_router(cfg, mode="recommended", strategy="v4_phase3")
-
-    assert result.config.agentos_router.strategy == "v4_phase3"
+    with pytest.raises(ValueError, match="strategy"):
+        upsert_router(cfg, mode="recommended", strategy="v4_phase3")
 
 
 def test_upsert_router_rejects_unknown_strategy():

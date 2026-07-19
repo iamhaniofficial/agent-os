@@ -30,13 +30,15 @@ from agentos.router_strategies import (
 from agentos.router_tiers import DEFAULT_ROUTER_STRATEGY
 
 
-def test_registry_knows_all_three_strategies() -> None:
+def test_registry_knows_both_strategies() -> None:
     assert known_strategy_ids() == {
-        V4_STRATEGY_ID,
         LLM_JUDGE_STRATEGY_ID,
         PILOT_STRATEGY_ID,
     }
     assert is_known_strategy("pilot-v1")
+    # The legacy v4_phase3 engine was removed (Phase C); its id survives only
+    # as a migration source and must NOT register as a live strategy.
+    assert not is_known_strategy(V4_STRATEGY_ID)
     assert not is_known_strategy("nope")
 
 
@@ -51,13 +53,7 @@ def test_pilot_registry_entry_matches_strategy_source_tags() -> None:
     assert info.asset_probe is pilot_asset_probe
 
 
-def test_v4_and_judge_registry_entries() -> None:
-    v4 = get_strategy_info(V4_STRATEGY_ID)
-    assert v4 is not None
-    assert v4.requires_local_assets is True
-    assert v4.uses_judge is False
-    assert v4.asset_probe is not None
-
+def test_judge_registry_entry() -> None:
     judge = get_strategy_info(LLM_JUDGE_STRATEGY_ID)
     assert judge is not None
     assert judge.requires_local_assets is False
@@ -75,7 +71,10 @@ def test_registry_minilm_id_tracks_feature_builder() -> None:
 
 def test_resolve_strategy_id_falls_back_to_default() -> None:
     assert resolve_strategy_id("pilot-v1") == "pilot-v1"
-    assert resolve_strategy_id("v4_phase3") == "v4_phase3"
+    # v4_phase3 maps through LEGACY_STRATEGY_ALIASES to pilot-v1 explicitly —
+    # the same target the config validator produces — independent of whatever
+    # DEFAULT_ROUTER_STRATEGY happens to be.
+    assert resolve_strategy_id("v4_phase3") == PILOT_STRATEGY_ID
     assert resolve_strategy_id("bogus") == DEFAULT_ROUTER_STRATEGY
     assert resolve_strategy_id(None) == DEFAULT_ROUTER_STRATEGY
     assert resolve_strategy_id("") == DEFAULT_ROUTER_STRATEGY

@@ -81,15 +81,9 @@ recommended = [
     "numpy>=1.26",
     "onnxruntime>=1.17",
     "tokenizers>=0.15",
-    # Local ML router (strategy="v4_phase3", the default). The ~75MB model
-    # bundle ships out-of-git; these libs run its inference core.
-    "lightgbm>=4.0",
-    "joblib>=1.3",
-    "scikit-learn>=1.8,<1.9",
 ]
-# Just the local ML router deps, for installs that want v4_phase3 without the
-# rest of `recommended`. numpy/onnxruntime come transitively via recommended or
-# can be added alongside this extra.
+# Just the local ML router deps, for installs that want the Pilot router
+# without the rest of `recommended`.
 ml-router = [
     "numpy>=1.26",
     "onnxruntime>=1.17",
@@ -98,9 +92,6 @@ ml-router = [
     # together in the router extras (spec §4.4), else pilot-v1 degrades on an
     # ml-router-only install.
     "tokenizers>=0.15",
-    "lightgbm>=4.0",
-    "joblib>=1.3",
-    "scikit-learn>=1.8,<1.9",
 ]
 # External memory provider (Plan B). Optional: the mem0 provider layer is
 # never imported unless `memory.provider.name = "mem0"` is set. Floor `0.1.70`
@@ -187,7 +178,7 @@ warn_return_any = true
 warn_unused_configs = true
 exclude = [
     "^src/agentos/memory/models/",
-    # V4 phase3 ML router bundle: git-ignored vendored inference core.
+    # Bundled router model asset directories (no first-party Python).
     "^src/agentos/agentos_router/models/",
     "^src/agentos/skills/bundled/.*/scripts/",
     # video-merger ships an upstream MIT-0 library under src/; same
@@ -206,9 +197,6 @@ module = [
     "numpy.*",
     "onnxruntime.*",
     "readability.*",
-    # v4_phase3 loads its inference core dynamically from the bundle's
-    # runtime_src (added to sys.path at runtime); mypy can't resolve it.
-    "src.router.*",
     "tiktoken.*",
     "tokenizers.*",
     "websockets.*",

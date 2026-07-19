@@ -1,7 +1,6 @@
 *.sh text eol=lf
 
-# Bundled BGE ONNX export. Shared by memory's local embedder and the
-# agentos_router v4 bundle, which no longer carries its own copy.
+# Bundled BGE ONNX export used by memory's local embedder.
 src/agentos/memory/models/bge_onnx/*.onnx filter=lfs diff=lfs merge=lfs -text
 src/agentos/memory/models/bge_onnx/*.json text eol=lf
 src/agentos/memory/models/bge_onnx/*.txt text eol=lf
@@ -13,18 +12,7 @@ src/agentos/memory/models/embeddings/**/*.onnx filter=lfs diff=lfs merge=lfs -te
 src/agentos/memory/models/embeddings/**/*.json text eol=lf
 src/agentos/memory/models/embeddings/**/*.txt text eol=lf
 
-# V4 Phase 3 ML router bundle: LightGBM heads, MLP ONNX, and the sklearn/joblib
-# feature artifacts.
-src/agentos/agentos_router/models/v4.2_phase3_inference/*.bin filter=lfs diff=lfs merge=lfs -text
-src/agentos/agentos_router/models/v4.2_phase3_inference/**/*.onnx filter=lfs diff=lfs merge=lfs -text
-src/agentos/agentos_router/models/v4.2_phase3_inference/**/*.pkl filter=lfs diff=lfs merge=lfs -text
-src/agentos/agentos_router/models/v4.2_phase3_inference/**/*.joblib filter=lfs diff=lfs merge=lfs -text
-src/agentos/agentos_router/models/v4.2_phase3_inference/*.json text eol=lf
-src/agentos/agentos_router/models/v4.2_phase3_inference/*.yaml text eol=lf
-src/agentos/agentos_router/models/v4.2_phase3_inference/**/*.json text eol=lf
-
-# Pilot router (Rev 4) production bundle: self-trained model.onnx + manifest.
-# Pre-staged ahead of T7 (training), which will populate the directory itself
-# and add the required-files hydration assertions in the release workflows.
+# Pilot router (Rev 4) production bundle: self-trained model.onnx + manifest,
+# guarded by required-files hydration assertions in the release workflows.
 src/agentos/agentos_router/models/pilot_v1/*.onnx filter=lfs diff=lfs merge=lfs -text
 src/agentos/agentos_router/models/pilot_v1/*.json text eol=lf

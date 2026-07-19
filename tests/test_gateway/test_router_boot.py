@@ -1109,24 +1109,23 @@ def test_router_boot_validation_warns_when_judge_provider_lacks_credentials(
     )
 
 
-def test_router_boot_validation_warns_on_missing_v4_bundle(
+def test_router_boot_validation_warns_on_missing_pilot_bundle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    # v4_phase3 is the reintegrated default local ML router. Its 75MB bundle is
-    # git-ignored (absent in CI/public checkouts). When the bundle is missing,
-    # boot validation only warns (build_services.agentos_router_bundle_missing)
-    # and never raises, because require_router_runtime defaults False — routing
-    # degrades to the default tier at runtime instead of blocking startup.
-    # A nonexistent v4_bundle_dir forces the missing-bundle path deterministically.
+    # When the pilot bundle is missing, boot validation only warns
+    # (build_services.agentos_router_bundle_missing) and never raises, because
+    # require_router_runtime defaults False — routing degrades to the default
+    # tier at runtime instead of blocking startup. A nonexistent
+    # pilot_artifact_dir forces the missing-bundle path deterministically.
     warnings: list[dict[str, Any]] = []
     monkeypatch.setattr(
         "agentos.gateway.boot.log.warning",
         lambda event, **kwargs: warnings.append({"event": event, **kwargs}),
     )
     config = GatewayConfig()
-    config.agentos_router.strategy = "v4_phase3"
-    config.agentos_router.v4_bundle_dir = str(tmp_path / "does-not-exist")
+    config.agentos_router.strategy = "pilot-v1"
+    config.agentos_router.pilot.pilot_artifact_dir = str(tmp_path / "does-not-exist")
 
     validate_agentos_router_runtime(config)
 
@@ -1136,17 +1135,17 @@ def test_router_boot_validation_warns_on_missing_v4_bundle(
     )
 
 
-def test_router_boot_validation_raises_on_missing_v4_bundle_when_required(
+def test_router_boot_validation_raises_on_missing_pilot_bundle_when_required(
     tmp_path: Path,
 ) -> None:
-    # With require_router_runtime=True a missing v4 bundle is fatal: boot
+    # With require_router_runtime=True a missing pilot bundle is fatal: boot
     # validation raises so the operator cannot silently run degraded.
     config = GatewayConfig()
-    config.agentos_router.strategy = "v4_phase3"
-    config.agentos_router.v4_bundle_dir = str(tmp_path / "does-not-exist")
+    config.agentos_router.strategy = "pilot-v1"
+    config.agentos_router.pilot.pilot_artifact_dir = str(tmp_path / "does-not-exist")
     config.agentos_router.require_router_runtime = True
 
-    with pytest.raises(RuntimeError, match="V4 bundle"):
+    with pytest.raises(RuntimeError, match="pilot-v1 router assets"):
         validate_agentos_router_runtime(config)
 
 

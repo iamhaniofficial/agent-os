@@ -1,7 +1,7 @@
 """Pilot router strategy — assembles T1/T2/T3 into a ``RouterStrategy`` (T4).
 
 ``PilotStrategy`` implements the same ``classify`` contract as
-``V4Phase3Strategy`` / ``LLMJudgeStrategy`` (Pilot router spec, Rev 4, §4):
+``LLMJudgeStrategy`` (Pilot router spec, Rev 4, §4):
 
     build_features (T1)  →  PilotModel.predict_proba (T2, calibrated)
         →  apply_safety_net (T3)  →  route class + confidence
@@ -17,7 +17,7 @@ yields identical raw probabilities regardless of session history. All history
 policy is the engine's; the safety net (T3) is Pilot's only probability-space
 adjustment — no sticky tier, no history-based policy, no other adjustment.
 
-**Fail-soft.** Mirrors ``V4Phase3Strategy``: a missing artifact directory, a
+**Fail-soft.** A missing artifact directory, a
 missing/corrupt file, or any exception at load or predict time degrades to
 ``DEFAULT_TEXT_TIER`` (via the shared ``_find_valid_tier``) with confidence
 ``0.0``, source ``"pilot_unavailable"``, and a degraded ``extra`` dict — never
@@ -195,7 +195,7 @@ class PilotStrategy:
         """Classify the CURRENT turn into AgentOS tier format.
 
         The history/context kwargs are accepted for protocol compatibility with
-        ``V4Phase3Strategy`` / ``LLMJudgeStrategy`` but are deliberately unused:
+        ``LLMJudgeStrategy`` but are deliberately unused:
         Pilot classifies the current turn only. History policy is the engine's.
         """
         if not self._available or self._model is None:

@@ -52,10 +52,10 @@ def test_agentos_router_defaults_match_runtime_router_config() -> None:
     assert cfg.complaint_upgrade_enabled is True
     assert cfg.complaint_upgrade_steps == 1
     assert cfg.complaint_upgrade_max_chars == 160
-    # Restored with the reintegrated v4_phase3 ML router; real fields with
-    # defaults.
-    assert cfg.v4_bundle_dir is None
-    assert cfg.v4_use_aux_head is True
+    # The legacy v4_* fields were removed with the v4_phase3 engine (Phase C);
+    # extra="ignore" tolerates them in old config files.
+    assert not hasattr(cfg, "v4_bundle_dir")
+    assert not hasattr(cfg, "v4_use_aux_head")
     assert cfg.require_router_runtime is False
 
     assert cfg.tiers["c0"]["model"] == "deepseek/deepseek-v4-flash"
@@ -92,13 +92,15 @@ def test_confidence_threshold_is_bounded_to_unit_interval() -> None:
         agentos_router_config_cls(confidence_threshold=-0.1)
 
 
-def test_agentos_router_strategy_accepts_v4_phase3() -> None:
-    # v4_phase3 is the reintegrated default local ML router strategy.
+def test_agentos_router_strategy_normalizes_v4_phase3_to_pilot() -> None:
+    # The v4_phase3 engine was removed (Phase C). A value that bypasses the
+    # config-file migration (env override, direct construction) must normalize
+    # to pilot-v1 instead of hard-failing validation.
     agentos_router_config_cls = _agentos_router_config_cls()
 
     cfg = agentos_router_config_cls(strategy="v4_phase3")
 
-    assert cfg.strategy == "v4_phase3"
+    assert cfg.strategy == "pilot-v1"
 
 
 def test_agentos_router_strategy_rejects_unknown_value() -> None:
@@ -455,12 +457,18 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
     assert tiers["image_model"]["image_only"] is True
 
 
-def test_v4_phase3_module_is_present() -> None:
-    # The v4_phase3 ML router was reintegrated as the default strategy, so its
-    # tracked module ships in the package again. The 75MB model bundle under
-    # agentos_router/models/ is git-ignored (present locally, absent in CI /
-    # public checkouts), so this test deliberately asserts nothing about that
-    # directory's presence — only the tracked source module and the relocated
-    # BGE ONNX export (memory embedding).
-    assert (REPO_ROOT / "src" / "agentos" / "agentos_router" / "v4_phase3.py").is_file()
+def test_v4_phase3_module_is_removed() -> None:
+    # Phase C: the v4_phase3 engine module and its model bundle are gone from
+    # the tree. The relocated BGE ONNX export stays (memory embedding).
+    assert not (
+        REPO_ROOT / "src" / "agentos" / "agentos_router" / "v4_phase3.py"
+    ).exists()
+    assert not (
+        REPO_ROOT
+        / "src"
+        / "agentos"
+        / "agentos_router"
+        / "models"
+        / "v4.2_phase3_inference"
+    ).exists()
     assert (REPO_ROOT / "src" / "agentos" / "memory" / "models" / "bge_onnx").is_dir()

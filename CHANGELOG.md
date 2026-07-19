@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- The legacy `v4_phase3` router engine and its ~52MB model bundle no longer
+  ship (Phase C): the module, the bundled weights, and the `lightgbm` /
+  `joblib` / `scikit-learn` dependencies are gone from the wheel and the
+  `recommended` / `ml-router` extras. A config that still pins
+  `strategy = "v4_phase3"` keeps migrating to `pilot-v1` on load, and the
+  removed `v4_bundle_dir` / `v4_use_aux_head` keys are ignored.
+
 ## [2026.7.19] - 2026-07-19
 
 ### Added

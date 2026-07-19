@@ -273,7 +273,7 @@ def _router_payload(ctx: RpcContext) -> dict[str, Any]:
     judge_base_url: str | None = None
     strategy = getattr(router, "strategy", None)
 
-    # Local ML routers (strategy="v4_phase3" default, or "pilot-v1") need no
+    # Local ML routers (strategy="pilot-v1", the default) need no
     # judge and no cloud credentials — their health is purely local-asset
     # presence, which validate_agentos_router_runtime already checked above
     # (runtime_invalid_reason == "assets" when an asset is missing). Short-
@@ -289,7 +289,7 @@ def _router_payload(ctx: RpcContext) -> dict[str, Any]:
     # normal Phase-A state): validate_agentos_router_runtime above only warns,
     # so runtime_valid is still True here. Run the registry asset_probe to
     # surface that degradation as a WARNING (not "Router ready") — registry-
-    # driven, so this covers pilot-v1 and v4_phase3 alike. A raise already
+    # driven, so it covers any local-asset strategy. A raise already
     # flipped runtime_valid=False with reason="assets"; only probe otherwise.
     if (
         _info is not None

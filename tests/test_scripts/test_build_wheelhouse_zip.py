@@ -169,18 +169,18 @@ def test_release_wheel_allows_tokenjuice_provenance_markdown() -> None:
 def test_release_wheel_allows_router_bundle_provenance_markdown() -> None:
     module = load_script()
     bundle_provenance = (
-        "agentos/agentos_router/models/v4.2_phase3_inference/PROVENANCE.md"
+        "agentos/agentos_router/models/pilot_v1/PROVENANCE.md"
     )
     other_bundle_doc = (
-        "agentos/agentos_router/models/v4.2_phase3_inference/NOTES.md"
+        "agentos/agentos_router/models/pilot_v1/NOTES.md"
     )
 
     violations = module.forbidden_release_wheel_entries(
         (bundle_provenance, other_bundle_doc)
     )
 
-    # The weights are OpenSquilla-derived (Apache-2.0), so their attribution
-    # ships with them; unrelated bundle markdown stays forbidden.
+    # Router model bundles may ship a PROVENANCE.md so attribution travels
+    # with the weights; unrelated bundle markdown stays forbidden.
     assert bundle_provenance not in violations
     assert other_bundle_doc in violations
 

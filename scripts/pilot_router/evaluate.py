@@ -19,9 +19,10 @@ post-guards), mapped back to the 4-class ``R0..R3`` space.
 * Pilot strategy: the T7 staging artifact
   (``scripts/pilot_router/artifacts/pilot_v1/``), the production ``_MiniLMEncoder``,
   thresholds at the defaults (safety_net 0.5 / confidence 0.5).
-* v4 strategy: the shipped bundle
-  (``src/agentos/agentos_router/models/v4.2_phase3_inference/``) exactly as
-  dispatched today.
+* v4 strategy: the legacy engine and bundle were removed from the tree
+  (Phase C, including the ``v4_bundle_dir`` config key) — run this script from
+  a pre-removal checkout to reproduce the baseline rows, or reuse the
+  committed baseline report under ``tests/data/router_eval/reports/``.
 
 **Turn ordering.** Within a conversation, ``turn_id`` (WildChat's
 ``turn_identifier``, a per-turn ordinal that ascends with dialogue position) is
@@ -343,12 +344,12 @@ def build_pilot_strategy() -> Any:
 
 
 def build_v4_strategy() -> Any:
-    from agentos.agentos_router.v4_phase3 import V4Phase3Strategy
-
-    strat = V4Phase3Strategy(confidence_threshold=0.5)
-    if not strat._available:
-        raise RuntimeError("v4 bundle not loadable — cannot run the gate")
-    return strat
+    raise RuntimeError(
+        "the v4_phase3 engine and bundle were removed from the tree (Phase C); "
+        "to reproduce the T9 baseline rows, run this script from a pre-removal "
+        "checkout, or reuse the committed baseline report under "
+        "tests/data/router_eval/reports/"
+    )
 
 
 # --------------------------------------------------------------------------- #

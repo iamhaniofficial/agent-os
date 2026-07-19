@@ -106,31 +106,6 @@ def test_doctor_reports_pilot_degraded_when_bundle_missing_not_required(
     assert payload["judgeModel"] is None
 
 
-def test_doctor_reports_v4_degraded_when_bundle_missing_not_required(
-    tmp_path: Path,
-) -> None:
-    """Registry-driven: v4_phase3 degrades identically when its bundle is
-    missing and require_router_runtime is unset."""
-    import agentos.gateway.rpc_doctor as rpc_doctor
-
-    absent = tmp_path / "v4_absent"
-    config = GatewayConfig(
-        agentos_router={
-            "strategy": "v4_phase3",
-            "default_tier": "balanced",
-            "v4_bundle_dir": str(absent),
-        }
-    )
-    ctx = RpcContext(conn_id="test", config=config)
-
-    payload = rpc_doctor._router_payload(ctx)
-
-    assert payload["strategy"] == "v4_phase3"
-    assert payload["runtimeValid"] is False
-    assert payload["runtimeInvalidReason"] == "assets_degraded"
-    assert str(absent / "runtime_src") in str(payload["error"])
-
-
 def test_doctor_reports_pilot_runtime_valid_with_fixture_bundle() -> None:
     import agentos.gateway.rpc_doctor as rpc_doctor
     from agentos.memory.embedding import LocalEmbeddingProvider

@@ -50,19 +50,13 @@ jobs:
                       f"LFS pointer not hydrated: {path}"
                   )
 
-          # The v4_phase3 router bundle is the wheel's routing brain; a missing
-          # weight silently degrades every turn to the default tier.
-          bundle = Path("src/agentos/agentos_router/models/v4.2_phase3_inference")
-          for name in (
-              "lgbm_main.bin",
-              "lgbm_aux.bin",
-              "mlp/model.onnx",
-              "features/tfidf.pkl",
-              "features/svd.pkl",
-              "router.runtime.yaml",
-              "runtime_src/src/router/inference/core.py",
-          ):
-              assert (bundle / name).is_file(), f"missing router asset: {name}"
+          # The legacy v4_phase3 model bundle must NOT ship anymore — it was
+          # removed to slim the wheel (~52MB). Same guard as the wheelhouse
+          # release, so both publish paths fail loudly if it leaks back.
+          legacy = Path("src/agentos/agentos_router/models/v4.2_phase3_inference")
+          assert not legacy.exists(), (
+              "legacy v4_phase3 bundle leaked back into the tree"
+          )
 
           # Pilot router MiniLM INT8 export (T1). Lives under the
           # memory/models LFS root checked above; listed explicitly so a
