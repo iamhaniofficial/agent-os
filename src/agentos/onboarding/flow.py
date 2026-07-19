@@ -950,7 +950,6 @@ _IMAGE_TIER_LABEL = "Image model"
 _DONE_LABEL = "Done"
 
 
-_ROUTER_LOCAL_ML_LABEL = "Smart routing (on-device)"
 _ROUTER_LLM_JUDGE_LABEL = "Smart routing (LLM-based)"
 _ROUTER_PILOT_LABEL = "Local ML — English-optimized (Pilot)"
 _ROUTER_DISABLED_LABEL = "Off"
@@ -975,8 +974,11 @@ def _search_fallback_choice_to_value(choice: str | None) -> str:
 
 
 def _router_mode_choices(provider_id: str) -> list[str]:
+    # The legacy on-device ML strategy (v4_phase3) is intentionally NOT offered:
+    # it is no longer a supported persisted strategy (a config pinning it is
+    # force-migrated to pilot-v1 on load), so the human-facing selector is a
+    # clean 3-way — Pilot / LLM judge / off.
     return [
-        _ROUTER_LOCAL_ML_LABEL,
         _ROUTER_PILOT_LABEL,
         _ROUTER_LLM_JUDGE_LABEL,
         _ROUTER_DISABLED_LABEL,
@@ -988,9 +990,9 @@ def _router_mode_default(provider_id: str, requested: str) -> str:
         return _ROUTER_DISABLED_LABEL
     if requested == "llm_judge":
         return _ROUTER_LLM_JUDGE_LABEL
-    if requested == "pilot-v1":
-        return _ROUTER_PILOT_LABEL
-    return _ROUTER_LOCAL_ML_LABEL
+    # pilot-v1 is the default, and a legacy v4_phase3 request maps to it too:
+    # v4 is force-migrated away, so it must never preselect a dropped option.
+    return _ROUTER_PILOT_LABEL
 
 
 def _router_mode_to_internal(selected: str | None) -> str:
@@ -1001,14 +1003,16 @@ def _router_mode_to_internal(selected: str | None) -> str:
 
 
 def _router_mode_to_strategy(selected: str | None) -> str | None:
-    """Return the router ``strategy`` for the choice (None when disabled)."""
+    """Return the router ``strategy`` for the choice (None when disabled).
+
+    Any enabled selection other than the LLM judge resolves to pilot-v1 (the
+    default); the legacy v4_phase3 label was dropped from the selector.
+    """
     if selected == _ROUTER_DISABLED_LABEL:
         return None
     if selected == _ROUTER_LLM_JUDGE_LABEL:
         return "llm_judge"
-    if selected == _ROUTER_PILOT_LABEL:
-        return "pilot-v1"
-    return "v4_phase3"
+    return "pilot-v1"
 
 
 def _text_tier_label(tier: str | None) -> str:

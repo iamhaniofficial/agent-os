@@ -998,26 +998,29 @@ def test_setup_router_step_uses_effective_provider_without_hardcoded_fallback():
     assert "Save the provider before saving router tiers." in save_body
 
 
-def test_setup_router_step_offers_four_way_selector_with_explicit_pilot():
-    """T10: the Mode control is a 4-way selector with explicit per-strategy
-    handling (v4_phase3 / pilot-v1 / llm_judge / disabled). The mode must be
-    derived by explicit strategy id — a persisted ``pilot-v1`` config shows
-    Pilot selected, never silently re-derived to judge or v4."""
+def test_setup_router_step_offers_three_way_selector_with_explicit_pilot():
+    """The Mode control is a 3-way selector (pilot-v1 / llm_judge / disabled).
+    The legacy v4_phase3 strategy is dropped from the human-facing dropdown — it
+    is force-migrated to pilot-v1 on load — so a persisted (or otherwise unknown)
+    strategy falls back to pilot-v1 and shows the Pilot option selected."""
     txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
     start = txt.index("function _renderRouterStep()")
     end = txt.index("  function _tierRow", start)
     body = txt[start:end]
 
     # Explicit strategy derivation: the render must recognise 'pilot-v1' and
-    # 'llm_judge' by id and fall back to v4_phase3, not a judge-else-v4 branch.
+    # 'llm_judge' by id and fall back to pilot-v1, not a judge-else-v4 branch.
     assert "router.strategy === 'llm_judge' ? 'llm_judge'" not in body
     assert "'pilot-v1'" in body
 
-    # All four options present, each selected off the explicit `mode` value.
-    assert "<option value=\"v4_phase3\"" in body
+    # The three offered options are present; v4_phase3 is NOT offered.
     assert "<option value=\"pilot-v1\"" in body
     assert "<option value=\"llm_judge\"" in body
     assert "<option value=\"disabled\"" in body
+    assert "<option value=\"v4_phase3\"" not in body
+    # v4_phase3 is not one of the selectable strategy ids the mode derives from.
+    assert "const ROUTER_STRATEGIES = ['pilot-v1', 'llm_judge'];" in body
+    assert "'v4_phase3'" not in body.replace("legacy 'v4_phase3'", "")
 
     # The Pilot option carries the CLI-consistent label + a short description.
     assert "Local ML — English-optimized (Pilot)" in body

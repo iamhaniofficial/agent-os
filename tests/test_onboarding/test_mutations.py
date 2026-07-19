@@ -692,6 +692,19 @@ def test_upsert_router_still_accepts_v4_and_judge_strategies():
     )
 
 
+def test_upsert_router_accepts_v4_phase3_despite_selector_drop():
+    """v4_phase3 remains a valid id at the API/registry level even though the
+    human-facing selectors (CLI + setup UI) dropped it: the engine and eval
+    baseline still use it, and direct API callers may set it (a persisted
+    v4_phase3 is force-migrated to pilot-v1 on the next config load, not
+    rejected here)."""
+    cfg = GatewayConfig(llm={"provider": "openrouter", "model": "deepseek/x"})
+
+    result = upsert_router(cfg, mode="recommended", strategy="v4_phase3")
+
+    assert result.config.agentos_router.strategy == "v4_phase3"
+
+
 def test_upsert_router_rejects_unknown_strategy():
     cfg = GatewayConfig(llm={"provider": "openrouter", "model": "deepseek/x"})
 

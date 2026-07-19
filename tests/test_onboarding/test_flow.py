@@ -8,22 +8,23 @@ from io import StringIO
 from rich.console import Console
 
 
-def test_router_mode_selector_is_four_way_with_pilot_label():
+def test_router_mode_selector_is_three_way_with_pilot_label():
     from agentos.onboarding import flow
 
     choices = flow._router_mode_choices("openrouter")
 
-    # 4-way: on-device v4, Pilot, LLM-judge, off.
-    assert len(choices) == 4
+    # 3-way: Pilot, LLM-judge, off. The legacy on-device v4 strategy is dropped
+    # from the human-facing selector (it is force-migrated to pilot-v1 on load).
+    assert len(choices) == 3
     assert flow._ROUTER_PILOT_LABEL == "Local ML — English-optimized (Pilot)"
     assert flow._ROUTER_PILOT_LABEL in choices
+    assert "Smart routing (on-device)" not in choices
 
 
 def test_router_mode_to_strategy_maps_pilot_choice():
     from agentos.onboarding import flow
 
     assert flow._router_mode_to_strategy(flow._ROUTER_PILOT_LABEL) == "pilot-v1"
-    assert flow._router_mode_to_strategy(flow._ROUTER_LOCAL_ML_LABEL) == "v4_phase3"
     assert flow._router_mode_to_strategy(flow._ROUTER_LLM_JUDGE_LABEL) == "llm_judge"
     assert flow._router_mode_to_strategy(flow._ROUTER_DISABLED_LABEL) is None
     # A pilot choice keeps the router enabled (mode="recommended").
@@ -35,6 +36,17 @@ def test_router_mode_default_selects_pilot_for_existing_pilot_config():
 
     assert (
         flow._router_mode_default("openrouter", "pilot-v1")
+        == flow._ROUTER_PILOT_LABEL
+    )
+
+
+def test_router_mode_default_maps_legacy_v4_request_to_pilot():
+    # A legacy v4_phase3 request must never preselect a dropped option — it maps
+    # to the Pilot label (the strategy it force-migrates to).
+    from agentos.onboarding import flow
+
+    assert (
+        flow._router_mode_default("openrouter", "v4_phase3")
         == flow._ROUTER_PILOT_LABEL
     )
 
@@ -352,13 +364,12 @@ def test_interactive_onboard_prompts_router_defaults_before_persist(tmp_path, mo
                 return _Answer("Use environment variable OPENROUTER_API_KEY")
             if message == "Router mode":
                 assert kwargs.get("choices") == [
-                    "Smart routing (on-device)",
                     "Local ML — English-optimized (Pilot)",
                     "Smart routing (LLM-based)",
                     "Off",
                 ]
-                assert kwargs.get("default") == "Smart routing (on-device)"
-                return _Answer("Smart routing (on-device)")
+                assert kwargs.get("default") == "Local ML — English-optimized (Pilot)"
+                return _Answer("Local ML — English-optimized (Pilot)")
             if message == "Default text model":
                 assert kwargs.get("choices") == [
                     "Route c0",
