@@ -122,6 +122,18 @@ title comes from `/new <title>` (or is loaded from the gateway on
 active. `/status` mirrors the same fields plus the active permissions
 posture.
 
+**Experimental full-screen surface.** Set `AGENTOS_CHAT_FULLSCREEN=1`
+to render the conversation in a scrollable in-app pane above a
+permanently-pinned input frame (Claude Code style), so the frame stays
+visible while the assistant streams. `PgUp`/`PgDn` scroll back through
+history; new output re-pins to the newest line. This trades away native
+terminal scrollback and is opt-in while it matures; the default surface
+streams to native scrollback as before.
+
+```sh
+AGENTOS_CHAT_FULLSCREEN=1 agentos chat
+```
+
 One-shot automation:
 
 ```sh

@@ -71,7 +71,9 @@ The assistant speaker label on the `◢` marker defaults to `agentos`; override
 with the `AGENTOS_ASSISTANT_LABEL` env var. The active input row is framed by a
 top and bottom rule so it reads as a distinct box; the bottom toolbar renders
 `title · model · [tier:cN]` while typing, with the title sourced from
-`/new <title>` or loaded on `/resume`.
+`/new <title>` or loaded on `/resume`. Set `AGENTOS_CHAT_FULLSCREEN=1` for the
+experimental full-screen surface that keeps the input frame pinned while the
+assistant streams (`PgUp`/`PgDn` scroll history).
 
 ## CLI map
 
