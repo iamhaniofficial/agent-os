@@ -37,6 +37,7 @@ from prompt_toolkit.layout import (
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.mouse_events import MouseEventType
 
 from agentos.cli.tui.terminal.paste import (
     pasted_content_summary,
@@ -87,6 +88,24 @@ _EOF_SENTINEL: object = object()
 _DOUBLE_CTRL_C_WINDOW_S: float = 1.5
 _ACTIVE_INPUT_PREFIX_WIDTH: int = 7
 _MAX_INPUT_HEIGHT: int = 10
+_MOUSE_SCROLL_LINES: int = 3
+
+
+class _TranscriptControl(FormattedTextControl):
+    """Formatted transcript content with wheel events routed to chat scroll state."""
+
+    def __init__(self, *args, scroll: Callable[[int], None], **kwargs) -> None:  # noqa: ANN002, ANN003
+        super().__init__(*args, **kwargs)
+        self._scroll = scroll
+
+    def mouse_handler(self, mouse_event):  # type: ignore[no-untyped-def]
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            self._scroll(_MOUSE_SCROLL_LINES)
+            return None
+        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            self._scroll(-_MOUSE_SCROLL_LINES)
+            return None
+        return super().mouse_handler(mouse_event)
 
 
 def _fullscreen_env() -> bool | None:
@@ -152,6 +171,18 @@ def _build_key_bindings() -> KeyBindings:
         # distinguish Shift+Enter commonly emit LF, the same sequence as
         # Ctrl+J, so Ctrl+J is also the portable fallback.
         event.current_buffer.newline(copy_margin=False)
+
+    @bindings.add(Keys.Home)
+    @bindings.add("c-a")
+    def _start_of_line(event) -> None:  # type: ignore[no-untyped-def]
+        buffer = event.current_buffer
+        buffer.cursor_position += buffer.document.get_start_of_line_position()
+
+    @bindings.add(Keys.End)
+    @bindings.add("c-e")
+    def _end_of_line(event) -> None:  # type: ignore[no-untyped-def]
+        buffer = event.current_buffer
+        buffer.cursor_position += buffer.document.get_end_of_line_position()
 
     @bindings.add("c-c")
     def _ctrl_c(event) -> None:  # type: ignore[no-untyped-def]
@@ -419,8 +450,9 @@ class ChatApplication:
         top_element: Window
         if self._fullscreen:
             top_element = Window(
-                content=FormattedTextControl(
+                content=_TranscriptControl(
                     lambda: ANSI(self._transcript),
+                    scroll=self.scroll_transcript,
                     get_cursor_position=self._transcript_cursor_position,
                     focusable=False,
                     show_cursor=False,
@@ -473,6 +505,7 @@ class ChatApplication:
             key_bindings=_build_key_bindings(),
             style=style,
             full_screen=self._fullscreen,
+            mouse_support=self._fullscreen,
             refresh_interval=0.1,
             input=input,
             output=output,
