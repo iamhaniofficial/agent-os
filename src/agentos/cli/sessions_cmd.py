@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,20 @@ _ACTION_FAILED = object()
 
 # Rows pulled before a client-side --search filter runs.
 _SEARCH_FETCH_LIMIT = 500
+
+
+_UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _safe_export_stem(session_id: str) -> str:
+    """Filename stem for a session export, with path separators removed.
+
+    ``session_id`` is user-supplied and used to build the default output path,
+    so everything outside ``[A-Za-z0-9_.-]`` collapses to ``-`` — the same rule
+    ``session/manager.py`` applies to archive filenames. Without it an id like
+    ``../../etc/pwned`` writes outside the working directory.
+    """
+    return _UNSAFE_FILENAME_RE.sub("-", session_id).strip("-.") or "session"
 
 
 def _resolved_key(payload: dict[str, Any], fallback: str) -> str:
@@ -377,7 +392,7 @@ def sessions_export(
     if result is None:
         console.print("[red]Session export returned no data.[/red]")
         return
-    target = output or Path(f"{session_id.replace(':', '-')}.{format}")
+    target = output or Path(f"{_safe_export_stem(session_id)}.{format}")
     if format == "json":
         target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     else:
