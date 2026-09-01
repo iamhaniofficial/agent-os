@@ -8,6 +8,7 @@ import httpx
 
 from agentos.engine.types import ThinkingLevel
 from agentos.provider.openai import OpenAIProvider
+from agentos.provider.selector import ProviderConfig, _build_provider
 from agentos.provider.types import (
     ChatConfig,
     ContentBlockToolResult,
@@ -1847,3 +1848,31 @@ def test_stream_consumer_stage_persists_thought_signature_and_history_rebuilds_i
     assistant_msg = messages[0]
     tool_use_block = next(b for b in assistant_msg.content if b.type == "tool_use")
     assert tool_use_block.thought_signature == "gemini_sig_transcript_persist"
+
+
+def test_mistral_http_error_names_provider_end_to_end(monkeypatch: Any) -> None:
+    """A provider built the way the runtime builds it names itself on failure.
+
+    Goes through `_build_provider` so the registry's `provider_kind` — not a
+    hand-passed one — is what reaches the display table.
+    """
+
+    captured: dict[str, Any] = {}
+    _patch_transport_response(
+        monkeypatch,
+        captured,
+        httpx.Response(
+            401,
+            json={"error": {"message": "Unauthorized"}},
+            request=httpx.Request("POST", "https://api.mistral.ai/v1/chat/completions"),
+        ),
+    )
+    provider = _build_provider(
+        ProviderConfig(provider="mistral", model="mistral-large-latest", api_key="test")
+    )
+
+    events = _collect_events(provider, ChatConfig())
+
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "401"
+    assert error.message == "Mistral chat request failed (HTTP 401): Unauthorized"

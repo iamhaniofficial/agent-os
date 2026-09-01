@@ -35,6 +35,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The offline vision fallback recognizes `gpt-5.6-*`, `glm-5.3-flash` and
   `muse-spark-*` as image-capable. Previously, if the catalog fetch failed, the
   `c1` default was reported as text-only and image turns had nowhere to route.
+- HTTP errors from an OpenAI-compatible provider name the provider again.
+  `_provider_display_name` mapped 10 provider kinds while the registry ships 21
+  that reach `OpenAIProvider`, so Azure, Mistral, Groq, SiliconFlow, AIHubMix,
+  MiniMax, BytePlus, Bailian Coding, Bankr, LM Studio and OVMS all reported
+  `Provider chat request failed (HTTP 401)` — on an install with several
+  providers configured that does not say which key to rotate. The table is now
+  complete, and a registry-derived test fails if a new `openai_compat` provider
+  is added without a display name.
 
 ### Added
 

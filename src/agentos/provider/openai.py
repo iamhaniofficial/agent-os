@@ -78,19 +78,39 @@ def _openai_tool_result_content(block: Any) -> str:
     )
 
 
+# Keyed on `ProviderSpec.provider_kind` — the value `provider/selector.py`
+# hands `OpenAIProvider` — not on the provider id. Several ids share one kind
+# (`vllm` and the coding-plan providers all run as `openai`, every MiniMax
+# variant as `minimax`). Covers every runtime-supported `openai_compat` kind in
+# the registry; `tests/test_provider_display_names.py` fails if the two drift.
+# Display strings follow each vendor's own casing.
+_PROVIDER_DISPLAY_NAMES: dict[str, str] = {
+    "aihubmix": "AIHubMix",
+    "azure": "Azure OpenAI",
+    "bailian_coding": "Bailian Coding",
+    "bankr": "Bankr",
+    "byteplus": "BytePlus",
+    "dashscope": "DashScope",
+    "deepseek": "DeepSeek",
+    "gemini": "Gemini",
+    "groq": "Groq",
+    "lm_studio": "LM Studio",
+    "minimax": "MiniMax",
+    "mistral": "Mistral",
+    "moonshot": "Moonshot",
+    "openai": "OpenAI",
+    "opencap": "OpenCAP",
+    "openrouter": "OpenRouter",
+    "ovms": "OVMS",
+    "qianfan": "Qianfan",
+    "siliconflow": "SiliconFlow",
+    "volcengine": "Volcengine",
+    "zhipu": "Zhipu",
+}
+
+
 def _provider_display_name(provider_kind: str) -> str:
-    return {
-        "openai": "OpenAI",
-        "openrouter": "OpenRouter",
-        "opencap": "OpenCAP",
-        "deepseek": "DeepSeek",
-        "moonshot": "Moonshot",
-        "dashscope": "DashScope",
-        "gemini": "Gemini",
-        "zhipu": "Zhipu",
-        "qianfan": "Qianfan",
-        "volcengine": "Volcengine",
-    }.get(provider_kind, "Provider")
+    return _PROVIDER_DISPLAY_NAMES.get(provider_kind, "Provider")
 
 
 def _http_error_body_text(body: bytes | str) -> str:
