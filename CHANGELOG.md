@@ -24,6 +24,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- The gateway's WebSocket `SubscriptionManager` no longer leaks an empty
+  subscriber set for every session key it has ever served. Unsubscribing from
+  session messages, or dropping a connection, discarded the connection id but
+  left the now-empty `session_key -> set()` entry in place, so a long-running
+  gateway accumulated one dead dict entry per distinct session key. Both paths
+  now delete the key once its last subscriber goes away, matching the pruning
+  the topic subscriptions already did.
 - The email channel no longer honours an off-allowlist `Reply-To`. The From
   address was checked against the fail-closed `allowed_senders` list, but the
   `Reply-To` header — equally attacker-controlled on an admitted message — was
