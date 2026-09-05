@@ -81,6 +81,26 @@ The terminal chat supports:
 Use these commands when you need to inspect or reset cached approval decisions
 during a chat.
 
+### Cached Intents
+
+Approving a destructive action caches the *intent* — kind plus target path —
+rather than the literal command, so a paraphrased retry (`rm /tmp/x` followed by
+`os.remove("/tmp/x")`) proceeds without a second prompt.
+
+The kind carries a destructiveness grade, and an approval only covers a retry
+whose grade it already includes:
+
+| Cached kind | Covers |
+|---|---|
+| `delete` | `rm X`, `os.remove`, `os.rmdir`, `Path(X).unlink()` |
+| `delete:recursive` | the above plus `shutil.rmtree(X)`, `os.removedirs(X)` |
+| `delete:force` | the above plus `rm -f X` |
+| `delete:recursive+force` | everything, including `rm -rf X` |
+
+Escalation always re-prompts: approving `rm /tmp/logs` does **not** authorize
+`rm -rf /tmp/logs`. `/approvals` lists cached entries as `scope kind:target`,
+and `/forget <path>` drops every grade recorded for that path.
+
 The Web UI also provides an approvals surface for reviewing pending actions
 outside the message scrollback.
 

@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Security
+
+- The intent approval cache grades a delete by how destructive it is, so an
+  approval never silently covers a stronger operation on the same path. Flags
+  were dropped during normalisation, which made `rm /tmp/logs` and
+  `rm -rf /tmp/logs` the same cache key: approving the first — a no-op on a
+  directory, since plain `rm` refuses it — let the second run without a prompt,
+  and `-rf` had never appeared on anything the user saw. The key now carries a
+  capability set (`delete`, `delete:recursive`, `delete:force`,
+  `delete:recursive+force`) parsed from `-r`/`-R`/`-f`/`--recursive`/`--force`
+  (bundles and `--` terminator included) and from the Python spelling —
+  `shutil.rmtree` and `os.removedirs` are recursive, `os.remove`, `os.rmdir` and
+  `Path.unlink` are not. A cached approval satisfies a retry only when its
+  capability set is a superset, which keeps the module's reason for existing
+  intact: `rm -rf X` still covers `shutil.rmtree("X")` and `rm X` still covers
+  `os.remove("X")`, so paraphrased retries at the same destructiveness do not
+  re-prompt. `/forget <path>` clears every grade for the path, not just the
+  plain one ([#849](https://github.com/use-agent-os/agent-os/issues/849)).
+
 ## [2026.9.5] - 2026-09-05
 
 ### Added
