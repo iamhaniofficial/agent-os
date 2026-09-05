@@ -171,3 +171,116 @@ async def test_close_works_from_a_different_task_than_connect(
     await asyncio.create_task(client.close())
 
     assert closed == ["session", "transport"]
+
+
+def _patch_transport(monkeypatch: pytest.MonkeyPatch, session: Any, closed: list[str]) -> None:
+    """Wire fakes whose ``__aexit__`` suspends, which is what exposes a cut unwind."""
+    from mcp.client import session as session_module
+    from mcp.client import streamable_http as transport_module
+
+    @asynccontextmanager
+    async def fake_http_client(**_kwargs: Any):
+        try:
+            yield object()
+        finally:
+            await asyncio.sleep(0)
+            closed.append("http")
+
+    @asynccontextmanager
+    async def fake_transport(_url: str, **_kwargs: Any):
+        try:
+            yield object(), object(), None
+        finally:
+            await asyncio.sleep(0)
+            closed.append("transport")
+
+    monkeypatch.setattr("agentos.mcp.streamable_http.httpx.AsyncClient", fake_http_client)
+    monkeypatch.setattr(transport_module, "streamable_http_client", fake_transport)
+    monkeypatch.setattr(session_module, "ClientSession", lambda *_a, **_k: session)
+
+
+def _client() -> MCPStreamableHTTPClient:
+    return MCPStreamableHTTPClient(
+        MCPServerConfig(
+            name="remote",
+            transport="streamable_http",
+            url="https://example.test/mcp",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_handshake_unwinds_every_entered_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A handshake that fails on its own must finish its own unwind.
+
+    Handing the failure to ``connect()`` wakes it while the runner is still
+    suspended inside ``aclose()``; cancelling the runner from there stops the
+    unwind at the first ``__aexit__`` that awaits.
+    """
+    closed: list[str] = []
+
+    class FakeSession:
+        async def __aenter__(self) -> FakeSession:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            await asyncio.sleep(0)
+            closed.append("session")
+
+        async def initialize(self) -> None:
+            raise RuntimeError("server refused the handshake")
+
+    _patch_transport(monkeypatch, FakeSession(), closed)
+
+    client = _client()
+    with pytest.raises(RuntimeError, match="server refused the handshake"):
+        await client.connect()
+
+    assert closed == ["session", "transport", "http"]
+    assert client._session is None
+    assert client._runner is None
+
+
+@pytest.mark.asyncio
+async def test_closing_mid_handshake_never_publishes_the_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``close()`` during a handshake must not leave a torn-down session behind.
+
+    ``_require_session()`` is the only connectedness gate the rest of the code
+    has, so publishing a session the runner is about to unwind would turn the
+    next tool call into a ``ClosedResourceError``.
+    """
+    closed: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class FakeSession:
+        async def __aenter__(self) -> FakeSession:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            closed.append("session")
+
+        async def initialize(self) -> None:
+            started.set()
+            await release.wait()
+
+    _patch_transport(monkeypatch, FakeSession(), closed)
+
+    client = _client()
+    connecting = asyncio.create_task(client.connect())
+    await started.wait()
+    closing = asyncio.create_task(client.close())
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(RuntimeError, match="was closed while connecting"):
+        await connecting
+    await closing
+
+    assert client._session is None
+    assert client._runner is None
+    assert closed == ["session", "transport", "http"]

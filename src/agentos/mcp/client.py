@@ -80,46 +80,74 @@ class MCPSessionClient(MCPClient):
         loop = asyncio.get_running_loop()
         ready: asyncio.Future[Any] = loop.create_future()
         closing = asyncio.Event()
+        handed_off = asyncio.Event()
         self._closing = closing
         self._runner = loop.create_task(
-            self._run(ready, closing), name=f"mcp-transport-{self.config.name}"
+            self._run(ready, closing, handed_off), name=f"mcp-transport-{self.config.name}"
         )
         try:
             self._session = await ready
         except BaseException:
-            await self._teardown()
+            # A handshake that failed on its own is already unwinding its stack
+            # in the runner; cancelling it there would cut that unwind short at
+            # the first ``__aexit__`` that suspends. Only work still inside
+            # ``_open_session`` — which nothing will finish once we give up —
+            # has to be interrupted.
+            await self._teardown(cancel=not handed_off.is_set())
             raise
 
-    async def _run(self, ready: asyncio.Future[Any], closing: asyncio.Event) -> None:
-        """Own the transport stack for the life of the connection."""
+    async def _run(
+        self,
+        ready: asyncio.Future[Any],
+        closing: asyncio.Event,
+        handed_off: asyncio.Event,
+    ) -> None:
+        """Own the transport stack for the life of the connection.
+
+        ``handed_off`` is set the moment the handshake is over, however it
+        ended: past that point the unwind belongs to this task and ``connect()``
+        must not cancel it.
+        """
         stack = AsyncExitStack()
         try:
             try:
                 session = await self._open_session(stack)
             except asyncio.CancelledError:
+                handed_off.set()
                 if not ready.done():
                     ready.cancel()
                 raise
             except BaseException as exc:
+                handed_off.set()
                 if not ready.done():
                     ready.set_exception(exc)
                 return
+            handed_off.set()
             if ready.done():
                 # ``connect()`` gave up while the handshake was in flight.
+                return
+            if closing.is_set():
+                # ``close()`` disowned this client mid-handshake. Publishing the
+                # session now would hand ``connect()`` a live-looking session
+                # that the ``finally`` below is about to tear down.
+                ready.set_exception(
+                    RuntimeError(f"{self.transport_label} client was closed while connecting")
+                )
                 return
             ready.set_result(session)
             await closing.wait()
         finally:
             await stack.aclose()
 
-    async def _teardown(self) -> None:
-        """Cancel the runner and forget the connection, swallowing its unwind."""
+    async def _teardown(self, *, cancel: bool) -> None:
+        """Forget the connection and let the runner unwind, swallowing its failure."""
         runner, self._runner = self._runner, None
         self._closing = None
         self._session = None
         if runner is None:
             return
-        runner.cancel()
+        if cancel:
+            runner.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await runner
 
@@ -132,8 +160,14 @@ class MCPSessionClient(MCPClient):
             return
         if closing is not None:
             closing.set()
-        with contextlib.suppress(asyncio.CancelledError):
+        try:
             await runner
+        except asyncio.CancelledError:
+            # The runner ending cancelled is an unwind we asked for; this task
+            # being cancelled while waiting on it is the caller's business —
+            # absorbing that would let a shutdown deadline pass unnoticed.
+            if not runner.cancelled():
+                raise
 
     def _require_session(self) -> Any:
         if self._session is None:

@@ -121,7 +121,8 @@ class MCPSSEClient(MCPSessionClient):
             if isinstance(unwrapped, TimeoutError):
                 raise TimeoutError(
                     f"MCP SSE handshake with {self.config.url} did not complete within "
-                    f"{timeout}s; the server never advertised a usable endpoint"
+                    f"{timeout}s: the server never advertised a usable endpoint, or "
+                    f"never answered initialize"
                 ) from exc
             if unwrapped is not exc:
                 raise unwrapped

@@ -13,6 +13,7 @@ transport would happily accept the old order.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import Callable
 from typing import Any
@@ -54,7 +55,12 @@ class LegacySSEServer:
 
     async def stop(self) -> None:
         self._server.close()
-        await self._server.wait_closed()
+        # ``wait_closed()`` does not return while a connection is still live, so
+        # a test that failed before closing its client would hang the run here
+        # instead of reporting the assertion.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(5):
+                await self._server.wait_closed()
 
     @property
     def url(self) -> str:
@@ -278,9 +284,10 @@ async def test_concurrent_calls_are_correlated_by_request_id(
 async def test_close_ends_the_receive_stream(server: LegacySSEServer) -> None:
     client = MCPSSEClient(_config(server.url))
     await client.connect()
-    assert not server.stream_closed.is_set()
-
-    await client.close()
+    try:
+        assert not server.stream_closed.is_set()
+    finally:
+        await client.close()
 
     async with asyncio.timeout(5):
         await server.stream_closed.wait()
@@ -302,9 +309,10 @@ async def test_close_works_from_a_different_task_than_connect(
     """
     client = MCPSSEClient(_config(server.url))
     await asyncio.create_task(client.connect())
-    assert await asyncio.create_task(client.list_tools())
-
-    await asyncio.create_task(client.close())
+    try:
+        assert await asyncio.create_task(client.list_tools())
+    finally:
+        await asyncio.create_task(client.close())
 
     async with asyncio.timeout(5):
         await server.stream_closed.wait()
