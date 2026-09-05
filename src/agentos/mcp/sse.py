@@ -74,7 +74,7 @@ class MCPSSEClient(MCPSessionClient):
 
         return factory
 
-    async def connect(self) -> None:
+    async def _open_session(self, stack: AsyncExitStack) -> Any:
         """Open the SSE stream, adopt the advertised endpoint, then initialize."""
         if not self.config.url:
             raise ValueError("SSE MCP server requires a URL")
@@ -92,7 +92,6 @@ class MCPSSEClient(MCPSessionClient):
             ) from exc
 
         timeout = self.config.tool_timeout_seconds
-        stack = AsyncExitStack()
         try:
             # The whole handshake is bounded, not just the HTTP calls inside it.
             # A server that opens the stream and then never emits an ``endpoint``
@@ -118,7 +117,6 @@ class MCPSSEClient(MCPSessionClient):
                 )
                 await session.initialize()
         except BaseException as exc:
-            await stack.aclose()
             unwrapped = _unwrap_single_exception(exc)
             if isinstance(unwrapped, TimeoutError):
                 raise TimeoutError(
@@ -128,6 +126,4 @@ class MCPSSEClient(MCPSessionClient):
             if unwrapped is not exc:
                 raise unwrapped
             raise
-
-        self._stack = stack
-        self._session = session
+        return session

@@ -27,6 +27,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   instead of hanging the caller. The unused `MCPServerConfig.message_endpoint`
   field, which no configuration surface ever set, is gone
   ([#922](https://github.com/use-agent-os/agent-os/issues/922)).
+- Both SDK-backed MCP HTTP transports open and unwind their transport in a task
+  the client owns. The SDK transports and `ClientSession` are built on anyio
+  task groups, and an anyio cancel scope may only be exited by the task that
+  entered it — but nothing closes an MCP client from the task that opened it:
+  `discover_and_register` runs during boot or in an RPC handler while
+  `close_active_clients` runs from gateway shutdown or a later `mcp.disconnect`.
+  Closing therefore raised `RuntimeError: Attempted to exit cancel scope in a
+  different task`, which `close_active_clients` swallows, leaking the stream and
+  its connection for the life of the process. This was already reachable on
+  `streamable_http`; the shared `MCPSessionClient` base fixes it for both
+  ([#922](https://github.com/use-agent-os/agent-os/issues/922)).
 
 ## [2026.9.5] - 2026-09-05
 

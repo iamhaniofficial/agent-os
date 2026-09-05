@@ -6,6 +6,7 @@ import stat
 from contextlib import asynccontextmanager
 from typing import Any
 
+import anyio
 import pytest
 
 from agentos.mcp.discovery import create_client
@@ -126,3 +127,47 @@ async def test_calls_before_connect_name_this_transport() -> None:
         await client.list_tools()
     with pytest.raises(RuntimeError, match="MCP Streamable HTTP client is not connected"):
         await client.call_tool("anything", {})
+
+
+@pytest.mark.asyncio
+async def test_close_works_from_a_different_task_than_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same task-affinity requirement as the SSE transport; same shared base."""
+    from mcp.client import session as session_module
+    from mcp.client import streamable_http as transport_module
+
+    closed: list[str] = []
+
+    @asynccontextmanager
+    async def fake_transport(_url: str, **_kwargs: Any):
+        async with anyio.create_task_group():
+            try:
+                yield object(), object(), None
+            finally:
+                closed.append("transport")
+
+    class FakeSession:
+        async def __aenter__(self) -> FakeSession:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            closed.append("session")
+
+        async def initialize(self) -> None:
+            return None
+
+    monkeypatch.setattr(transport_module, "streamable_http_client", fake_transport)
+    monkeypatch.setattr(session_module, "ClientSession", lambda *_a, **_k: FakeSession())
+
+    client = MCPStreamableHTTPClient(
+        MCPServerConfig(
+            name="remote",
+            transport="streamable_http",
+            url="https://example.test/mcp",
+        )
+    )
+    await asyncio.create_task(client.connect())
+    await asyncio.create_task(client.close())
+
+    assert closed == ["session", "transport"]

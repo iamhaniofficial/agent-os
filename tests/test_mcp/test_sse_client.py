@@ -285,7 +285,53 @@ async def test_close_ends_the_receive_stream(server: LegacySSEServer) -> None:
     async with asyncio.timeout(5):
         await server.stream_closed.wait()
     assert client._session is None
-    assert client._stack is None
+    assert client._runner is None
+
+
+@pytest.mark.asyncio
+async def test_close_works_from_a_different_task_than_connect(
+    server: LegacySSEServer,
+) -> None:
+    """The gateway never closes an MCP client from the task that opened it.
+
+    ``discover_and_register`` runs during boot or in an RPC handler;
+    ``close_active_clients`` runs from shutdown or a later ``mcp.disconnect``.
+    Entering the SDK's anyio task groups inline would make this raise
+    ``RuntimeError: Attempted to exit cancel scope in a different task``, which
+    ``close_active_clients`` swallows — leaking the connection.
+    """
+    client = MCPSSEClient(_config(server.url))
+    await asyncio.create_task(client.connect())
+    assert await asyncio.create_task(client.list_tools())
+
+    await asyncio.create_task(client.close())
+
+    async with asyncio.timeout(5):
+        await server.stream_closed.wait()
+
+
+@pytest.mark.asyncio
+async def test_connecting_twice_is_refused(server: LegacySSEServer) -> None:
+    client = MCPSSEClient(_config(server.url))
+    await client.connect()
+    try:
+        with pytest.raises(RuntimeError, match="already connected"):
+            await client.connect()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_connect_leaves_nothing_to_close(server: LegacySSEServer) -> None:
+    """After a refused handshake the client is reusable and ``close()`` is a no-op."""
+    client = MCPSSEClient(_config("http://127.0.0.1:1/sse", timeout=1.0))
+    with pytest.raises(Exception) as excinfo:
+        await client.connect()
+    assert not isinstance(excinfo.value, BaseExceptionGroup)
+    await client.close()
+
+    assert client._runner is None
+    assert client._session is None
 
 
 @pytest.mark.asyncio

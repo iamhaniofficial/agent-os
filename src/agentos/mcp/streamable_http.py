@@ -142,7 +142,7 @@ class MCPStreamableHTTPClient(MCPSessionClient):
             self.config.state_dir,
         )
 
-    async def connect(self) -> None:
+    async def _open_session(self, stack: AsyncExitStack) -> Any:
         if not self.config.url:
             raise ValueError("Streamable HTTP MCP server requires a URL")
         # Checked here as well as inside ``mcp_http_client`` so an unusable URL
@@ -178,30 +178,23 @@ class MCPStreamableHTTPClient(MCPSessionClient):
                 callback_handler=self._callback_handler,
             )
 
-        stack = AsyncExitStack()
-        try:
-            http_client = await stack.enter_async_context(
-                mcp_http_client(
-                    self.config.url,
-                    auth=auth,
-                    headers=self.config.headers,
-                    timeout=httpx.Timeout(self.config.tool_timeout_seconds),
-                )
+        http_client = await stack.enter_async_context(
+            mcp_http_client(
+                self.config.url,
+                auth=auth,
+                headers=self.config.headers,
+                timeout=httpx.Timeout(self.config.tool_timeout_seconds),
             )
-            read_stream, write_stream, _ = await stack.enter_async_context(
-                streamable_http_client(self.config.url, http_client=http_client)
+        )
+        read_stream, write_stream, _ = await stack.enter_async_context(
+            streamable_http_client(self.config.url, http_client=http_client)
+        )
+        session = await stack.enter_async_context(
+            ClientSession(
+                read_stream,
+                write_stream,
+                read_timeout_seconds=timedelta(seconds=self.config.tool_timeout_seconds),
             )
-            session = await stack.enter_async_context(
-                ClientSession(
-                    read_stream,
-                    write_stream,
-                    read_timeout_seconds=timedelta(seconds=self.config.tool_timeout_seconds),
-                )
-            )
-            await session.initialize()
-        except BaseException:
-            await stack.aclose()
-            raise
-
-        self._stack = stack
-        self._session = session
+        )
+        await session.initialize()
+        return session
