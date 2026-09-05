@@ -110,3 +110,19 @@ async def test_cancelled_connect_closes_all_partial_transport_contexts(
         await client.connect()
 
     assert closed == ["session", "transport", "http"]
+
+
+@pytest.mark.asyncio
+async def test_calls_before_connect_name_this_transport() -> None:
+    """Both SDK-backed transports share one base; the error still says which one."""
+    client = MCPStreamableHTTPClient(
+        MCPServerConfig(
+            name="remote",
+            transport="streamable_http",
+            url="https://example.test/mcp",
+        )
+    )
+    with pytest.raises(RuntimeError, match="MCP Streamable HTTP client is not connected"):
+        await client.list_tools()
+    with pytest.raises(RuntimeError, match="MCP Streamable HTTP client is not connected"):
+        await client.call_tool("anything", {})

@@ -16,9 +16,9 @@ from typing import Any
 import httpx
 
 from agentos import __version__
-from agentos.mcp.client import MCPClient
+from agentos.mcp.client import MCPSessionClient
 from agentos.mcp.http import assert_supported_mcp_url, mcp_http_client
-from agentos.mcp.types import MCPServerConfig, MCPToolDef, MCPToolResult
+from agentos.mcp.types import MCPServerConfig
 from agentos.paths import state_dir as default_state_dir
 
 
@@ -117,8 +117,10 @@ class FileOAuthStorage:
             pass
 
 
-class MCPStreamableHTTPClient(MCPClient):
+class MCPStreamableHTTPClient(MCPSessionClient):
     """MCP SDK-backed Streamable HTTP client."""
+
+    transport_label = "MCP Streamable HTTP"
 
     def __init__(
         self,
@@ -130,8 +132,6 @@ class MCPStreamableHTTPClient(MCPClient):
         super().__init__(config)
         self._redirect_handler = redirect_handler
         self._callback_handler = callback_handler
-        self._stack: AsyncExitStack | None = None
-        self._session: Any = None
 
     def oauth_storage(self) -> FileOAuthStorage:
         if not self.config.url:
@@ -205,42 +205,3 @@ class MCPStreamableHTTPClient(MCPClient):
 
         self._stack = stack
         self._session = session
-
-    async def close(self) -> None:
-        if self._stack is not None:
-            await self._stack.aclose()
-        self._stack = None
-        self._session = None
-
-    async def list_tools(self) -> list[MCPToolDef]:
-        if self._session is None:
-            raise RuntimeError("MCP Streamable HTTP client is not connected")
-        result = await self._session.list_tools()
-        return [
-            MCPToolDef(
-                name=tool.name,
-                description=tool.description or "",
-                input_schema=tool.inputSchema,
-            )
-            for tool in result.tools
-        ]
-
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> MCPToolResult:
-        if self._session is None:
-            raise RuntimeError("MCP Streamable HTTP client is not connected")
-        result = await self._session.call_tool(name, arguments)
-        chunks: list[str] = []
-        for block in result.content:
-            text = getattr(block, "text", None)
-            if isinstance(text, str):
-                chunks.append(text)
-                continue
-            if hasattr(block, "model_dump_json"):
-                chunks.append(block.model_dump_json())
-        structured = getattr(result, "structuredContent", None)
-        if not chunks and structured is not None:
-            chunks.append(json.dumps(structured, ensure_ascii=False))
-        return MCPToolResult(
-            content="\n".join(chunks),
-            is_error=bool(getattr(result, "isError", False)),
-        )

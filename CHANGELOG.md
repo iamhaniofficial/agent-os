@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The legacy MCP `sse` transport follows the 2024-11-05 HTTP+SSE lifecycle
+  instead of inverting it. `MCPSSEClient.connect()` POSTed the `initialize`
+  request before any stream existed, sent it to a guessed `/message` path, and
+  then opened a fresh `GET` per request — so a compliant server, which picks its
+  own message URI and announces it in an `endpoint` event on a stream the client
+  must open first, either rejected the handshake or emitted the response into a
+  window with nothing listening. The client now drives `mcp.client.sse`, the
+  sibling of the SDK transport the Streamable HTTP client already uses: the
+  stream opens first, the advertised endpoint is resolved against the configured
+  URL and is the only POST target, one receive stream serves the connection with
+  responses correlated by JSON-RPC id, and `close()` cancels the reader task. An
+  endpoint pointing at a different origin is refused before anything is posted,
+  and both channels — the stream and the POST — dial through the same
+  connect-time SSRF guard as before, which matters more now that the server
+  chooses the POST target. The handshake is bounded by `tool_timeout_seconds`,
+  so a server that opens the stream and never advertises an endpoint fails
+  instead of hanging the caller. The unused `MCPServerConfig.message_endpoint`
+  field, which no configuration surface ever set, is gone
+  ([#922](https://github.com/use-agent-os/agent-os/issues/922)).
+
 ## [2026.9.5] - 2026-09-05
 
 ### Added
