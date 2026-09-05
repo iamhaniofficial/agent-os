@@ -270,7 +270,63 @@ class TestAbbreviatedLongOptions:
         assert cache.check("rm /tmp/a -rf") is False
 
     def test_terminator_shields_a_filename_that_looks_like_flags(self) -> None:
+        """After ``--`` the tokens are filenames, so the delete stays plain."""
         cache = IntentApprovalCache()
+        # Two targets: /tmp/a and a file literally named "-rf". Both stay plain.
+        assert {kind for kind, _ in _extract_intents("rm /tmp/a -- -rf")} == {"delete"}
         cache.record("rm /tmp/a -- -rf")
         assert cache.check("rm /tmp/a") is True
-        assert cache.check("rm -rf") is False
+        assert cache.check("rm -rf /tmp/a") is False
+
+
+class TestParentPruningIsItsOwnEscalation:
+    """``os.removedirs`` reaches *above* its target — no ``rm`` spelling does."""
+
+    def test_recursive_rm_does_not_cover_removedirs(self) -> None:
+        cache = IntentApprovalCache()
+        cache.record("rm -rf /tmp/build/cache")
+        assert cache.check('shutil.rmtree("/tmp/build/cache")') is True
+        assert cache.check('os.removedirs("/tmp/build/cache")') is False
+
+    def test_removedirs_covers_the_plain_recursive_delete(self) -> None:
+        cache = IntentApprovalCache()
+        cache.record('os.removedirs("/tmp/build/cache")')
+        assert cache.check("rm -r /tmp/build/cache") is True
+        assert cache.check('shutil.rmtree("/tmp/build/cache")') is True
+
+
+class TestDocumentedAsymmetries:
+    """Boundaries that are deliberate, not accidental — pin them so they show up
+    in review if anyone changes the grading table.
+    """
+
+    def test_every_shell_to_python_paraphrase_still_short_circuits(self) -> None:
+        """The direction the module exists for is preserved in full."""
+        for approved, retry in [
+            ("rm /tmp/x", 'os.remove("/tmp/x")'),
+            ("rm /tmp/x", 'Path("/tmp/x").unlink()'),
+            ("rm -f /tmp/x", 'os.remove("/tmp/x")'),
+            ("rm -r /tmp/x", 'shutil.rmtree("/tmp/x")'),
+            ("rm -rf /tmp/x", 'shutil.rmtree("/tmp/x")'),
+        ]:
+            cache = IntentApprovalCache()
+            cache.record(approved)
+            assert cache.check(retry) is True, f"{approved!r} should cover {retry!r}"
+
+    def test_python_recursive_delete_does_not_grant_the_force_flag(self) -> None:
+        """``-f`` has no Python analogue, so the reverse costs one prompt."""
+        cache = IntentApprovalCache()
+        cache.record('shutil.rmtree("/tmp/x")')
+        assert cache.check("rm -r /tmp/x") is True
+        assert cache.check("rm -rf /tmp/x") is False
+
+    def test_empty_directory_removal_is_deliberately_ungraded(self) -> None:
+        """``rm -d`` and ``os.rmdir`` delete an empty dir plain ``rm`` refuses.
+
+        Ungraded on purpose: an empty directory holds nothing, so grading it
+        would cost a prompt and protect nothing.
+        """
+        cache = IntentApprovalCache()
+        cache.record("rm /tmp/d")
+        assert cache.check("rm -d /tmp/d") is True
+        assert cache.check('os.rmdir("/tmp/d")') is True

@@ -57,8 +57,9 @@ _DELETE = "delete"
 # approval covers a retry only when the cached capability set is a *superset*
 # of the retry's, so a plain delete never satisfies a recursive one.
 _RECURSIVE = "recursive"
+_PARENTS = "parents"
 _FORCE = "force"
-_CAPABILITY_ORDER: tuple[str, ...] = (_RECURSIVE, _FORCE)
+_CAPABILITY_ORDER: tuple[str, ...] = (_RECURSIVE, _PARENTS, _FORCE)
 
 # Every capability combination, for the superset scan in ``check``/``forget``.
 _CAPABILITY_SETS: tuple[frozenset[str], ...] = tuple(
@@ -78,8 +79,14 @@ def _graded_kind(capabilities: frozenset[str], family: str = _DELETE) -> str:
 # with the capabilities each call carries. Each regex uses ``finditer`` so
 # ``shutil.rmtree("a"); os.remove("b")`` yields both paths.
 #
-# ``os.removedirs`` counts as recursive: it deletes the leaf and then prunes
-# empty parents, so it reaches past the path it was handed.
+# ``os.removedirs`` carries ``parents`` on top of ``recursive``: it deletes the
+# leaf and then prunes empty ancestors, so it reaches *above* the path it was
+# handed — something no ``rm`` spelling does. Nothing else grants ``parents``,
+# so only a prior ``os.removedirs`` approval for the same target covers it.
+#
+# ``os.rmdir``/``Path.rmdir`` stay plain. They remove an empty directory, which
+# plain ``rm`` refuses, but an empty directory holds nothing; grading it would
+# buy a prompt and no protection. Same reasoning excludes ``rm -d``/``--dir``.
 _PY_DELETE_PATTERNS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
     (
         re.compile(r"\bos\.(?:remove|unlink|rmdir)\s*\(\s*[\"']([^\"']+)[\"']"),
@@ -87,7 +94,7 @@ _PY_DELETE_PATTERNS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
     ),
     (
         re.compile(r"\bos\.removedirs\s*\(\s*[\"']([^\"']+)[\"']"),
-        frozenset({_RECURSIVE}),
+        frozenset({_RECURSIVE, _PARENTS}),
     ),
     (
         re.compile(r"\bshutil\.rmtree\s*\(\s*[\"']([^\"']+)[\"']"),
@@ -102,8 +109,19 @@ _PY_DELETE_PATTERNS: tuple[tuple[re.Pattern[str], frozenset[str]], ...] = (
     ),
 )
 
-# ``rm`` flags that raise destructiveness. Everything else (``-v``, ``-i``,
-# ``-d``) leaves the intent at the level the user approved.
+# ``rm`` flags that raise destructiveness. ``-i``/``-I`` only add prompting and
+# ``-v`` only adds output, so neither is graded. ``-d``/``--dir`` is deliberately
+# ungraded: it removes an *empty* directory that plain ``rm`` refuses, but an
+# empty directory holds nothing, so grading it would cost a prompt and protect
+# nothing — the same call made for ``os.rmdir`` above.
+#
+# The Python spellings carry no ``force`` grade, because ``-f`` has no Python
+# analogue that changes *what* gets deleted. The asymmetry that leaves is
+# one-directional and deliberate: every shell -> Python paraphrase this module
+# exists for still short-circuits (``rm X`` covers ``os.remove("X")``,
+# ``rm -rf X`` and ``rm -r X`` both cover ``shutil.rmtree("X")``), while the
+# rare reverse -- approving ``shutil.rmtree("X")`` and then running ``rm -rf X``
+# -- costs one prompt.
 #
 # Long options are matched by prefix because ``getopt_long`` accepts any
 # unambiguous abbreviation — ``rm --recu`` is a recursive delete, and grading it
@@ -364,9 +382,7 @@ class IntentApprovalCache:
         """Drop every entry whose scope matches, leaving other scopes intact."""
         with self._lock:
             self._entries = {
-                intent: data
-                for intent, data in self._entries.items()
-                if data[1] != scope
+                intent: data for intent, data in self._entries.items() if data[1] != scope
             }
 
 
