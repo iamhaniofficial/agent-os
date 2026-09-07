@@ -67,6 +67,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   cleanup, so there is one exit path for the tempdir instead of six that skip
   it. A configured workspace still sets no `cleanup_dir` and is never removed
   ([#1010](https://github.com/use-agent-os/agent-os/issues/1010)).
+- Three residual bypasses of the `code_exec` destructive gate are closed.
+  `compile()` was invisible to it: `_eval_const_str` returned `None` for every
+  `ast.Call`, so `exec(compile('os.re' + 'move("/x")', '', 'exec'))` carried
+  the payload past a scanner that never read the source argument. The module
+  resolver understood `__import__("os")` as a bare name and
+  `importlib.import_module("os")` as an attribute, but not
+  `getattr(__builtins__, "__import__")("os")` — a nested call — so the module
+  it produced stayed unresolved and `.system("rm -rf …")` on the result went
+  unnoticed. And `os.system`, `os.popen` and `subprocess.run`/`Popen` are
+  deliberately absent from `_ALL_DESTRUCTIVE_NAMES`, because only their argv is
+  destructive, which meant the `getattr` branch skipped them outright while the
+  attribute branch never saw `getattr(os, "sys" + "tem")("…")` at all — its
+  callee is a call, not an attribute. `compile()` now resolves to its source
+  argument, the resolver reads `getattr`-obtained `__import__`, and an
+  indirect-callee check covers the shell-exec entry points
+  ([#1102](https://github.com/use-agent-os/agent-os/issues/1102)).
 - A replacement agent task stays in `AgentTaskRegistry` when its predecessor
   finishes winding down. Cancellation is not synchronous: `register()` may put
   a new task under a session key while the cancelled one is still settling,

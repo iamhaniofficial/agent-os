@@ -80,6 +80,62 @@ def test_benign_code_does_not_trigger_warning(code: str) -> None:
     assert warning is None, f"Unexpected warning for safe code: {warning}"
 
 
+@pytest.mark.parametrize(
+    ("code", "expected_keyword"),
+    [
+        # compile() as a code carrier: exec()/eval() receive the compiled form,
+        # so the source argument has to be read or the inner code is never
+        # scanned. _eval_const_str returned None for every ast.Call.
+        ("exec(compile('os.re' + 'move(\"/tmp/x\")', '', 'exec'))", "remove"),
+        ("eval(compile('os.remove(\"/tmp/x\")', '', 'eval'))", "remove"),
+        ("exec(compile(source='os.remove(\"/tmp/x\")', filename='', mode='exec'))", "remove"),
+        # getattr(__builtins__, "__import__")("os") — the module resolver
+        # handled __import__ as a bare Name and importlib.import_module as an
+        # Attribute, but not this nested-Call spelling.
+        ('getattr(__builtins__, "__import__")("os").system("rm -rf /tmp/x")', "os.system"),
+        ('import builtins; builtins.__import__("os").remove("/tmp/x")', "remove"),
+        ('getattr(__builtins__, "__im" + "port__")("shutil").rmtree("/tmp/x")', "rmtree"),
+        # Shell-exec attrs via getattr: os.system/os.popen and subprocess.* are
+        # deliberately not in _ALL_DESTRUCTIVE_NAMES (only their argv is
+        # destructive), so the getattr branch skipped them, and the callee is
+        # an ast.Call rather than an ast.Attribute so that branch missed it too.
+        ('import os; getattr(os, "system")("rm -rf /tmp/x")', "os.system"),
+        ('import os; getattr(os, "sys" + "tem")("rm -rf /tmp/x")', "os.system"),
+        ('import os; getattr(os, "popen")("rm -rf /tmp/x")', "os.popen"),
+        (
+            'import subprocess; getattr(subprocess, "run")(["rm", "-rf", "/tmp/x"])',
+            "subprocess invoking rm",
+        ),
+        (
+            'import subprocess as sp; getattr(sp, "Popen")("rm -rf /tmp/x")',
+            "subprocess invoking rm",
+        ),
+    ],
+)
+def test_indirect_destructive_calls_detected(code: str, expected_keyword: str) -> None:
+    # Residual bypasses of the Issue #848 gate (Issue #1102).
+    warning = _check_code_destructive(code)
+    assert warning is not None, f"Expected warning for: {code}"
+    assert "destructive Python operation detected:" in warning
+    assert expected_keyword.lower() in warning.lower()
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        # compile()/getattr are ordinary tools; only destructive payloads count.
+        "exec(compile('print(1)', '', 'exec'))",
+        "code = compile('x = 1 + 1', '<gen>', 'exec')",
+        "import os; getattr(os, 'system')('ls -la')",
+        "import subprocess; getattr(subprocess, 'run')(['ls', '-la'])",
+        "import os; fn = getattr(os, 'popen')",
+        "getattr(__builtins__, '__import__')('math').sqrt(16)",
+    ],
+)
+def test_benign_indirect_calls_do_not_trigger(code: str) -> None:
+    assert _check_code_destructive(code) is None, f"Unexpected warning for: {code}"
+
+
 def test_syntax_error_code_falls_back_to_regex() -> None:
     # Syntax error with os.remove() still caught by regex fallback
     bad_syntax_destructive = "os.remove( unclosed string"

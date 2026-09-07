@@ -55,6 +55,9 @@ _ALL_DESTRUCTIVE_NAMES: frozenset[str] = frozenset(
 _SUBPROCESS_CALL_NAMES: frozenset[str] = frozenset(
     {"run", "call", "Popen", "check_output", "check_call"}
 )
+#: Shell-exec entry points. Not destructive on their own — only the argv is —
+#: so they are deliberately kept out of ``_ALL_DESTRUCTIVE_NAMES``.
+_OS_SHELL_EXEC_ATTRS: frozenset[str] = frozenset({"system", "popen"})
 
 
 def _eval_const_str(node: ast.AST) -> str | None:
@@ -76,6 +79,18 @@ def _eval_const_str(node: ast.AST) -> str | None:
                 return None
             parts.append(part)
         return "".join(parts)
+    if isinstance(node, ast.Call):
+        # compile("os.rem" + "ove('/x')", "", "exec") is a code carrier: what
+        # exec()/eval() receives is the compiled form of this string, so the
+        # source argument has to be read here or the inner code is never
+        # scanned at all.
+        if isinstance(node.func, ast.Name) and node.func.id == "compile":
+            source: ast.AST | None = node.args[0] if node.args else None
+            for keyword in node.keywords:
+                if keyword.arg == "source":
+                    source = keyword.value
+            if source is not None:
+                return _eval_const_str(source)
     return None
 
 
@@ -96,7 +111,55 @@ def _resolve_module_from_node(node: ast.AST, aliases: dict[str, str]) -> str | N
                 mod = _eval_const_str(node.args[0])
                 if mod:
                     return aliases.get(mod, mod)
+        # builtins.__import__("os") and getattr(__builtins__, "__import__")("os"):
+        # the callee is an Attribute or a nested Call, so neither branch above
+        # sees it and the resulting module went unresolved.
+        callee_attr: str | None = None
+        if isinstance(node.func, ast.Attribute):
+            callee_attr = node.func.attr
+        else:
+            target = _resolve_getattr_target(node.func, aliases)
+            if target is not None:
+                callee_attr = target[1]
+        if callee_attr == "__import__" and node.args:
+            mod = _eval_const_str(node.args[0])
+            if mod:
+                return aliases.get(mod, mod)
     return None
+
+
+def _resolve_getattr_target(
+    node: ast.AST, aliases: dict[str, str]
+) -> tuple[str | None, str] | None:
+    """Return ``(module, attr)`` when *node* is a statically readable ``getattr``.
+
+    ``getattr(os, "sys" + "tem")`` resolves to ``("os", "system")``. The module
+    is ``None`` when the object is not one of the tracked modules, which still
+    lets callers act on the attribute name alone.
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    if not (isinstance(node.func, ast.Name) and node.func.id == "getattr"):
+        return None
+    if len(node.args) < 2:
+        return None
+    attr = _eval_const_str(node.args[1])
+    if attr is None:
+        return None
+    return _resolve_module_from_node(node.args[0], aliases), attr
+
+
+def _argv_removes(node: ast.AST) -> bool:
+    """True when a command argument statically resolves to an ``rm``/``rmdir``.
+
+    Handles both argv shapes a shell-exec call takes: a list of parts, and a
+    single command string.
+    """
+    if isinstance(node, ast.List):
+        parts = [_eval_const_str(elt) for elt in node.elts]
+        return any(part in ("rm", "rmdir") for part in parts if part is not None)
+    command = _eval_const_str(node)
+    return bool(command and re.search(r"\b(rm|rmdir)\b", command))
 
 
 class _DestructiveCodeVisitor(ast.NodeVisitor):
@@ -143,8 +206,37 @@ class _DestructiveCodeVisitor(ast.NodeVisitor):
                     self.destructive_funcs[target] = f"shutil.{name}()"
         self.generic_visit(node)
 
+    def _indirect_call_reason(self, node: ast.Call) -> str | None:
+        """Reason when the callee is a ``getattr`` result rather than a name.
+
+        ``getattr(os, "system")("rm -rf /etc")`` puts an ``ast.Call`` in the
+        callee position, so neither the ``ast.Name`` branch nor the
+        ``ast.Attribute`` branch below ever inspects it. The plain ``getattr``
+        branch does not help either: it only matches attributes in
+        ``_ALL_DESTRUCTIVE_NAMES``, and the shell-exec entry points are
+        deliberately not in that set because only their argv is destructive.
+        """
+        resolved = _resolve_getattr_target(node.func, self.module_aliases)
+        if resolved is None:
+            return None
+        mod, attr = resolved
+        if not node.args:
+            return None
+        if mod == "os" and attr in _OS_SHELL_EXEC_ATTRS and _argv_removes(node.args[0]):
+            return f"destructive Python operation detected: os.{attr} with rm via getattr"
+        if mod == "subprocess" and attr in _SUBPROCESS_CALL_NAMES and _argv_removes(node.args[0]):
+            return "destructive Python operation detected: subprocess invoking rm via getattr"
+        return None
+
     def visit_Call(self, node: ast.Call) -> None:
         if self.warning is not None:
+            return
+
+        # 0. Indirect callee: getattr(os, "system")("rm -rf /") — an ast.Call
+        #    sits where a Name or Attribute normally would.
+        indirect = self._indirect_call_reason(node)
+        if indirect is not None:
+            self.warning = indirect
             return
 
         # 1. Direct function call: remove(), r(), etc.
@@ -209,28 +301,23 @@ class _DestructiveCodeVisitor(ast.NodeVisitor):
                 self.warning = f"destructive Python operation detected: Path.{attr_name}()"
                 return
 
-            if mod == "os" and attr_name in ("system", "popen") and node.args:
-                cmd_str = _eval_const_str(node.args[0])
-                if cmd_str and re.search(r"\b(rm|rmdir)\b", cmd_str):
-                    self.warning = f"destructive Python operation detected: os.{attr_name} with rm"
-                    return
+            if (
+                mod == "os"
+                and attr_name in _OS_SHELL_EXEC_ATTRS
+                and node.args
+                and _argv_removes(node.args[0])
+            ):
+                self.warning = f"destructive Python operation detected: os.{attr_name} with rm"
+                return
 
-            if mod == "subprocess" and attr_name in _SUBPROCESS_CALL_NAMES and node.args:
-                first_arg = node.args[0]
-                if isinstance(first_arg, ast.List):
-                    parts = [_eval_const_str(elt) for elt in first_arg.elts]
-                    if any(p in ("rm", "rmdir") for p in parts if p is not None):
-                        self.warning = (
-                            "destructive Python operation detected: subprocess invoking rm"
-                        )
-                        return
-                else:
-                    cmd_str = _eval_const_str(first_arg)
-                    if cmd_str and re.search(r"\b(rm|rmdir)\b", cmd_str):
-                        self.warning = (
-                            "destructive Python operation detected: subprocess invoking rm"
-                        )
-                        return
+            if (
+                mod == "subprocess"
+                and attr_name in _SUBPROCESS_CALL_NAMES
+                and node.args
+                and _argv_removes(node.args[0])
+            ):
+                self.warning = "destructive Python operation detected: subprocess invoking rm"
+                return
 
         self.generic_visit(node)
 
