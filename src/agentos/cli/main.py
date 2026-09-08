@@ -91,6 +91,38 @@ app = typer.Typer(
     pretty_exceptions_enable=False,
 )
 
+
+def _version_callback(value: bool) -> None:
+    """Print the installed version and exit before any command runs.
+
+    Eager so ``agentos --version`` answers on its own, without a subcommand
+    and without ``no_args_is_help`` turning it into a help dump. The bare
+    version string is what a script wants; the same value is reported as
+    ``cliVersion`` by ``agentos gateway status``.
+    """
+
+    if not value:
+        return
+    from agentos import __version__
+
+    typer.echo(__version__)
+    raise typer.Exit(0)
+
+
+@app.callback()
+def main_callback(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        help="Print the installed AgentOS version and exit.",
+        callback=_version_callback,
+        is_eager=True,
+    ),
+) -> None:
+    """AgentOS - Python agent runtime with multi-channel support."""
+
+
 # ── Sub-apps ─────────────────────────────────────────────────────────────────
 
 app.add_typer(auth_app, name="auth")

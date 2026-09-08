@@ -6,9 +6,14 @@ automate AgentOS.
 Run:
 
 ```sh
+agentos --version
 agentos --help
 agentos <command> --help
 ```
+
+`agentos --version` (short form `-V`) prints the installed version on its own
+line and exits 0 — the same value `agentos gateway status` reports as
+`cliVersion`.
 
 ## Main Commands
 

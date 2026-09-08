@@ -119,7 +119,9 @@ non-TTY contexts fall back automatically.
 ## CLI map
 
 Top-level: `init`, `onboard`, `configure`, `doctor`, `upgrade`, `chat`,
-`agent`, `reset`, plus these groups (each supports `--help`):
+`agent`, `reset`, plus these groups (each supports `--help`).
+`agentos --version` (`-V`) prints the installed version on stdout and exits 0 —
+use it instead of `uv tool list` / `pip show` to answer "which version is this?":
 
 | Group | Subcommands |
 | --- | --- |
