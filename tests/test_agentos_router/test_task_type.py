@@ -115,6 +115,43 @@ class TestProgrammingLanguageTarget:
         assert verdict.task_type is None
         assert verdict.blocked_by == BLOCK_CODE_TARGET
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            # Names ending in a non-word character: a trailing ``\b`` used to
+            # demand a word character right after ``+``/``#``, so the guard
+            # never fired at the end of a sentence.
+            "Translate this function to C++.",
+            "Translate this function to C++",
+            "Translate this code to C#.",
+            "Translate this code to C#",
+            "Please translate the parser to c++ and keep the tests.",
+            # Names starting with a non-word character: a leading ``\b`` used
+            # to demand a word character right before the dot.
+            "Translate this service to .NET.",
+            "Translate this service to .NET",
+            "Translate the handler to .net, please.",
+            # Already worked before (a word character precedes the dot) and
+            # must keep working.
+            "Translate this service to ASP.NET.",
+        ],
+    )
+    def test_non_word_edge_language_names_block(self, message: str) -> None:
+        verdict = detect_task_type(message)
+        assert verdict.task_type is None
+        assert verdict.blocked_by == BLOCK_CODE_TARGET
+
+    def test_word_boundary_languages_still_require_a_whole_word(self) -> None:
+        """The relaxed edges must not turn substrings into matches."""
+        verdict = detect_task_type("Translate this scalable rustic javanese text to French.")
+        assert verdict.task_type == TASK_TYPE_TRANSLATE
+        assert verdict.blocked_by is None
+
+    def test_dotnet_prefix_of_a_longer_word_does_not_block(self) -> None:
+        verdict = detect_task_type("Translate this to French, then post it to the .network wiki.")
+        assert verdict.task_type == TASK_TYPE_TRANSLATE
+        assert verdict.blocked_by is None
+
     def test_language_named_only_in_the_body_does_not_block(self) -> None:
         """A document mentioning Python is not a porting request."""
         body = ("The team migrated the Python service last quarter. " * 40) + ("z" * 1500)

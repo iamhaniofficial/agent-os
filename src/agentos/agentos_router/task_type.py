@@ -123,11 +123,20 @@ _TRANSLATE_RES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 #: is the only guard — it exists because the task is different, not because the
 #: translation is judged hard. Suppression is the safe direction: it forfeits a
 #: saving and hands the turn back to ordinary model routing.
+#:
+#: Names that begin or end in a non-word character need their own edges: a
+#: blanket ``\b(?:...)\b`` silently never matches them. ``c++`` and ``c#``
+#: end in ``+``/``#``, so a trailing ``\b`` would demand a word character
+#: right after them — which "port this to C++." does not have. ``.net``
+#: starts with ``.``, so a leading ``\b`` would demand a word character right
+#: before the dot, which " .NET" does not have (only "ASP.NET" did).
 _CODE_TARGET_RE = re.compile(
     r"\b(?:python|javascript|typescript|golang|rust|java|kotlin|swift|scala"
     r"|haskell|ruby|php|perl|sql|bash|powershell|matlab|fortran|cobol"
-    r"|c\+\+|c#|\.net|react|vue|svelte|jquery|regex|assembly|solidity"
-    r"|dart|elixir|erlang|clojure|lua|zig)\b",
+    r"|react|vue|svelte|jquery|regex|assembly|solidity"
+    r"|dart|elixir|erlang|clojure|lua|zig)\b"
+    r"|\b(?:c\+\+|c#)(?!\w)"
+    r"|\.net\b",
     re.IGNORECASE,
 )
 
