@@ -71,6 +71,25 @@ _MAX_TOTAL_ATTACHMENT_BYTES = _attachment_ingest.MAX_TOTAL_ATTACHMENT_BYTES
 _MAX_ATTACHMENTS = _attachment_ingest.MAX_ATTACHMENTS
 
 
+async def _probe_fresh_user_session(get_transcript: Any, key: str) -> bool:
+    """True when ``key`` has no transcript yet, reading at most one row.
+
+    This runs on every user message, and only a single boolean is being
+    decided, so an unbounded ``get_transcript(key)`` would read and
+    deserialise the entire history of the conversation the user is currently
+    having — cost that grows with the conversation, on its own send path.
+
+    The call is duck-typed through ``getattr``: several session managers take
+    the key alone, and passing ``limit=`` to those would raise ``TypeError``
+    instead of merely reading too much, so the bound is only applied when the
+    callable actually accepts it.
+    """
+
+    if accepts_keyword_arg(get_transcript, "limit"):
+        return not bool(await get_transcript(key, limit=1))
+    return not bool(await get_transcript(key))
+
+
 def _clean_cancel_source(value: Any, default: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -1053,7 +1072,7 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
         nonlocal message_text, persisted_entry, fresh_user_session
         get_transcript = getattr(ctx.session_manager, "get_transcript", None)
         if callable(get_transcript):
-            fresh_user_session = not bool(await get_transcript(key))
+            fresh_user_session = await _probe_fresh_user_session(get_transcript, key)
         if raw_attachments:
             from agentos.gateway.transcripts import (
                 build_transcript_attachment_envelope,
