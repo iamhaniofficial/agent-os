@@ -48,6 +48,7 @@ _BINARY_EXTENSIONS = {
     *_OFFICE_BINARY_EXTENSIONS,
 }
 _XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_XLSX_MAX_ROWS = 1_048_576  # OpenXML worksheet row ceiling
 _XLSX_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 _XLSX_OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _BOOTSTRAP_SOURCE_FILENAMES = frozenset(BOOTSTRAP_FILENAMES)
@@ -673,8 +674,31 @@ def _read_xlsx_worksheet(raw_xml: bytes, shared_strings: list[str]) -> list[list
             row.append(_xlsx_cell_value(cell_el, shared_strings))
         while row and row[-1] == "":
             row.pop()
+        # OpenXML omits empty rows from <sheetData>, so the sheet is sparse in
+        # the same way a row is sparse in its cells. Pad to the declared row
+        # number or every later row shifts up, which both mislabels the row an
+        # agent is told it read and puts real data past the end of `offset`.
+        row_number = _xlsx_row_index(row_el.attrib.get("r", ""))
+        if row_number is not None:
+            while len(rows) < row_number - 1:
+                rows.append([])
         rows.append(row)
     return rows
+
+
+def _xlsx_row_index(row_ref: str) -> int | None:
+    """Return the 1-based row number from a ``<row r=...>`` attribute.
+
+    ``None`` for a missing, malformed, or out-of-range reference — those fall
+    back to positional append rather than padding a sheet to an absurd height.
+    """
+
+    if not row_ref.isdigit():
+        return None
+    number = int(row_ref)
+    if number < 1 or number > _XLSX_MAX_ROWS:
+        return None
+    return number
 
 
 def _xlsx_column_index(cell_ref: str) -> int:
