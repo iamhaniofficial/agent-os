@@ -759,7 +759,7 @@ async def exec_command(
             status = approval_response.get("status")
             if status == "approval_denied":
                 await _record_shell_denial(
-                    "exec_command", command, workdir, DenialReason.HUMAN_REJECTED
+                    "exec_command", command, cwd, DenialReason.HUMAN_REJECTED
                 )
             return json.dumps(approval_response)
 
@@ -926,7 +926,7 @@ async def background_process(
             status = approval_response.get("status")
             if status == "approval_denied":
                 await _record_shell_denial(
-                    "background_process", command, workdir, DenialReason.HUMAN_REJECTED
+                    "background_process", command, cwd, DenialReason.HUMAN_REJECTED
                 )
             return json.dumps(approval_response)
 
@@ -1288,15 +1288,27 @@ def _sandbox_request_for(
         return None
     action_kind = "shell.background" if tool_name == "background_process" else "shell.exec"
     ctx = current_tool_context.get()
+    ctx_workspace: Path | None = None
+    if ctx is not None and ctx.workspace_dir:
+        wp = Path(ctx.workspace_dir).expanduser()
+        if wp.is_absolute():
+            ctx_workspace = wp
     workspace = None
     if workdir:
-        p = Path(workdir)
+        p = Path(workdir).expanduser()
         if p.is_absolute():
             workspace = p
-    if workspace is None and ctx is not None and ctx.workspace_dir:
-        wp = Path(ctx.workspace_dir)
-        if wp.is_absolute():
-            workspace = wp
+        elif ctx_workspace is not None:
+            # A relative workdir is relative to the workspace, and cwd is part
+            # of the ledger fingerprint: dropping it hashed a denial under
+            # ``subproject/`` as a denial at the workspace root, so two
+            # different targets shared one denial count. A traversing workdir
+            # is deliberately left as it resolves — this request is only ever
+            # fingerprinted, never handed to a backend, so keeping distinct
+            # targets distinct is the whole point and grants nothing.
+            workspace = (ctx_workspace / p).resolve()
+    if workspace is None:
+        workspace = ctx_workspace
     if workspace is None:
         workspace = runtime.workspace if runtime.workspace.is_absolute() else Path.cwd()
 
