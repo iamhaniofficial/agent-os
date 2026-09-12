@@ -1057,12 +1057,17 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
 
 
 @_d.method("cron.remove")
-async def _handle_cron_remove(params: dict | None, ctx: RpcContext) -> None:
+async def _handle_cron_remove(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict) or "id" not in params:
         raise ValueError("params.id is required")
     scheduler = _require_scheduler(ctx)
-    await scheduler.remove_job(params["id"])
-    return None
+    # ``remove_job`` answers False for an unknown id. Discarding that bool
+    # turned "nothing was deleted" into an RPC success; fail the way
+    # ``cron.status`` / ``cron.update`` already do for a missing job.
+    removed = await scheduler.remove_job(params["id"])
+    if not removed:
+        raise KeyError(f"Cron job not found: {params['id']}")
+    return {"id": params["id"], "removed": True}
 
 
 @_d.method("cron.run")

@@ -1122,7 +1122,12 @@ def cron_remove(
     confirm_or_exit(f"Remove cron job {job_id!r}?", yes=yes, json_output=json_output)
 
     async def _run(client):
-        await client.call("cron.remove", {"id": job_id})
+        # A missing id surfaces as a NOT_FOUND RPC error and never reaches
+        # here; the payload is whatever the gateway actually did rather than
+        # a hardcoded ``removed: True``. Older gateways answer ``null``.
+        payload = await client.call("cron.remove", {"id": job_id})
+        if isinstance(payload, dict) and payload:
+            return payload
         return {"id": job_id, "removed": True}
 
     payload = run_gateway_sync(_run, json_output=json_output)

@@ -706,7 +706,13 @@ agentos cron add --every 1h --text "Summarize important updates" --name hourly-s
 agentos cron status <job-id>
 agentos cron runs <job-id>
 agentos cron output <job-id>
+agentos cron remove <job-id> --yes
 ```
+
+`cron status`, `cron update` and `cron remove` all fail the same way for an
+unknown id: exit code 2 and a `Cron job not found: <job-id>` error (`NOT_FOUND`
+under `--json`). `cron remove` never reports `removed: true` for a job that was
+not there.
 
 `--job-kind` picks what fires: `reminder` (delivers `--text` verbatim, no LLM),
 `script` (runs a file, no LLM), `agent_turn` (the agent runs `--text` as a
