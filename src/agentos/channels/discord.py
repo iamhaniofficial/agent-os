@@ -92,6 +92,11 @@ FATAL_ERROR_CLASSES: tuple[str, ...] = (
 class DiscordChannelConfig(BaseModel):
     """Pydantic config for Discord channel adapter."""
 
+    # The gateway entry name. Session keys embed it
+    # (``agent:<id>:<entry name>:group:<channel>``), and the registry only
+    # copies ``entry.name`` into a config that declares the field, so without
+    # it the adapter could never recognise its own approvals (#1600).
+    name: str = "discord"
     token: str
     application_id: str = ""
     default_channel_id: str = ""
@@ -731,7 +736,7 @@ class DiscordChannel:
                 session_mode = parts[3]
                 session_peer = parts[4]
                 expected_peer = channel_id if session_mode in ("group", "channel") else user_id
-                if session_channel != "discord" or session_peer != expected_peer:
+                if session_channel != self.config.name or session_peer != expected_peer:
                     log.warning(
                         "discord.component_mismatch",
                         session_key=session_key,
