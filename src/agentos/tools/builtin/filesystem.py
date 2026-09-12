@@ -11,6 +11,7 @@ import json
 import os
 import posixpath
 import re
+import threading
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -594,9 +595,43 @@ def _read_delimited_rows(path: Path, delimiter: str) -> list[tuple[str, dict[int
         text = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ToolError(f"Cannot read spreadsheet as UTF-8 text: {path}") from exc
-    parsed = [list(row) for row in csv.reader(io.StringIO(text), delimiter=delimiter)]
+    try:
+        parsed = _parse_delimited_text(text, delimiter)
+    except csv.Error as exc:
+        raise ToolError(f"Cannot parse {path.name} as delimited text: {exc}") from exc
     rows = dict(enumerate(parsed, start=1))
     return [(path.name, rows, len(parsed))]
+
+
+# ``csv.field_size_limit`` is process-global and spreadsheet reads run on
+# executor threads. Every parse takes this lock, not just the ones that raise
+# the limit: a small read that checked the limit outside it could see a
+# neighbour's temporary raise, skip the lock, and then fail when that
+# neighbour restores the default mid-parse.
+_CSV_FIELD_LIMIT_LOCK = threading.Lock()
+
+
+def _parse_delimited_text(text: str, delimiter: str) -> list[list[str]]:
+    """Parse *text* with the field limit raised just far enough for it.
+
+    ``csv.reader`` refuses any single cell over ``csv.field_size_limit()``
+    (128 KB by default), which one embedded JSON blob or base64 column trips.
+    A cell can never be longer than the text it lives in, so the limit is
+    raised to the text's own length rather than ``sys.maxsize`` -- a
+    malformed quote can then absorb at most this file, which is already in
+    memory -- and it is restored as soon as the parse ends.
+    """
+    needed = len(text) + 1
+    with _CSV_FIELD_LIMIT_LOCK:
+        previous = csv.field_size_limit()
+        raised = needed > previous
+        if raised:
+            csv.field_size_limit(needed)
+        try:
+            return [list(row) for row in csv.reader(io.StringIO(text), delimiter=delimiter)]
+        finally:
+            if raised:
+                csv.field_size_limit(previous)
 
 
 def _read_xlsx_sheets(path: Path) -> list[tuple[str, dict[int, list[str]], int]]:
