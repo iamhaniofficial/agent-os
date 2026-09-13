@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from agentos.tools.builtin import web
-from agentos.tools.types import ToolError
+from agentos.tools.types import ToolContext, ToolError, current_tool_context
 
 HttpRequestCallable = Callable[..., Awaitable[str]]
 
@@ -261,6 +261,76 @@ async def test_http_request_output_path_saves_inside_fetch_directory(
     assert payload["body_saved"] is True
     assert payload["body"] is None
     assert payload["body_base64"] is None
+
+
+@pytest.mark.asyncio
+async def test_http_request_output_path_records_workspace_file_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A body saved via output_path is a workspace write like write_file /
+    # edit_file / apply_patch, so the turn backstop can deliver it later.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    raw = b"%PDF-1.4 fake"
+    _patch_response(
+        monkeypatch,
+        httpx.Response(
+            200,
+            content=raw,
+            headers={"content-type": "application/pdf"},
+            request=httpx.Request("GET", "https://example.test/report.pdf"),
+        ),
+    )
+    ctx = ToolContext(workspace_dir=str(workspace))
+    token = current_tool_context.set(ctx)
+    try:
+        payload = json.loads(
+            await _original_http_request()(
+                url="https://example.test/report.pdf",
+                output_path="report.pdf",
+            )
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    saved_path = (workspace / ".fetch" / "report.pdf").resolve()
+    assert Path(payload["path"]) == saved_path
+    assert ctx.workspace_file_writes == [
+        {
+            "path": str(saved_path),
+            "relative_path": ".fetch/report.pdf",
+            "name": "report.pdf",
+            "suffix": ".pdf",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_http_request_without_output_path_records_no_workspace_file_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _patch_response(
+        monkeypatch,
+        httpx.Response(
+            200,
+            content=b'{"ok":true}',
+            headers={"content-type": "application/json"},
+            request=httpx.Request("GET", "https://example.test/data"),
+        ),
+    )
+    ctx = ToolContext(workspace_dir=str(workspace))
+    token = current_tool_context.set(ctx)
+    try:
+        payload = json.loads(await _original_http_request()(url="https://example.test/data"))
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["path"] is None
+    assert ctx.workspace_file_writes == []
 
 
 @pytest.mark.asyncio
