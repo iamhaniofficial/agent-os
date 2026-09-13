@@ -411,3 +411,66 @@ async def test_events_wait_preserves_max_events_below_the_cap() -> None:
     result = await bridge.events_wait("agent:main:main", timeout_ms=200, max_events=2)
 
     assert len(result["events"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_events_wait_reaching_max_events_is_not_a_timeout() -> None:
+    """Stopping because ``max_events`` filled up -- well inside the deadline --
+    is a successful poll, not deadline expiry (#1798)."""
+    client = EndlessEventClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    result = await bridge.events_wait("agent:main:main", timeout_ms=30_000, max_events=2)
+
+    assert len(result["events"]) == 2
+    assert result["timed_out"] is False
+
+
+@pytest.mark.asyncio
+async def test_events_wait_terminal_event_is_not_a_timeout() -> None:
+    client = FakeGatewayClient()
+    await client.events.put(
+        {
+            "event": "session.event.done",
+            "payload": {"session_key": "agent:main:main", "stream_seq": 8, "reason": "stop"},
+        }
+    )
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    result = await bridge.events_wait("agent:main:main", since_stream_seq=7, timeout_ms=1000)
+
+    assert result["timed_out"] is False
+
+
+@pytest.mark.asyncio
+async def test_events_wait_reports_timeout_when_the_deadline_expires() -> None:
+    """Deadline expiry is a timeout whether or not anything was collected."""
+    client = FakeGatewayClient()
+    await client.events.put(
+        {
+            "event": "session.event.text_delta",
+            "payload": {"session_key": "agent:main:main", "stream_seq": 8, "text": "hi"},
+        }
+    )
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    with_partial = await bridge.events_wait("agent:main:main", timeout_ms=50, max_events=10)
+    assert [event["event"] for event in with_partial["events"]] == ["session.event.text_delta"]
+    assert with_partial["timed_out"] is True
+
+    with_nothing = await bridge.events_wait("agent:main:main", timeout_ms=50, max_events=10)
+    assert with_nothing["events"] == []
+    assert with_nothing["timed_out"] is True
+
+
+@pytest.mark.asyncio
+async def test_events_wait_zero_budget_reports_timeout() -> None:
+    """A zero-millisecond wait cannot collect anything; its deadline is already
+    spent, which is what ``timed_out`` describes."""
+    client = EndlessEventClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    result = await bridge.events_wait("agent:main:main", timeout_ms=0)
+
+    assert result["events"] == []
+    assert result["timed_out"] is True

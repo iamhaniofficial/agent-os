@@ -159,16 +159,22 @@ class AgentOSMCPBridge:
             timeout_ms = min(max(0, timeout_ms), _MAX_EVENTS_WAIT_TIMEOUT_MS)
             timeout_s = timeout_ms / 1000
             deadline = time.monotonic() + timeout_s
+            # Only deadline expiry is a timeout: stopping on a terminal event
+            # or because ``max_events`` filled up is a successful poll, even
+            # though both leave a non-terminal (or no) last event.
+            timed_out = False
 
             while len(events) < max_events:
                 # Re-clamp: on coarse clocks ``deadline - now`` can round a hair
                 # above ``timeout_s``, handing ``recv_event`` more than the cap.
                 remaining = min(deadline - time.monotonic(), timeout_s)
                 if remaining <= 0:
+                    timed_out = True
                     break
                 try:
                     frame = await client.recv_event(timeout=remaining)
                 except TimeoutError:
+                    timed_out = True
                     break
                 normalized = _normalize_event_frame(frame)
                 payload = normalized.get("payload")
@@ -190,7 +196,7 @@ class AgentOSMCPBridge:
                 "current_stream_seq": current_stream_seq,
                 "replay_complete": subscription.get("replay_complete"),
                 "replay_gap_reason": subscription.get("replay_gap_reason"),
-                "timed_out": not events or (events[-1]["event"] not in _TERMINAL_EVENTS),
+                "timed_out": timed_out,
             }
         finally:
             await client.close()

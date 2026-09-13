@@ -60,7 +60,11 @@ def create_mcp_server(
         max_events: int = 100,
         terminal_only: bool = False,
     ) -> dict[str, Any]:
-        """Wait for live or replayed gateway events for an AgentOS session."""
+        """Wait for live or replayed gateway events for an AgentOS session.
+
+        ``timed_out`` in the result is true only when ``timeout_ms`` elapsed;
+        stopping on a terminal event or on ``max_events`` reports it false.
+        """
 
         return await bridge.events_wait(
             key,
