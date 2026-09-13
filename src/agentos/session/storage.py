@@ -1001,6 +1001,15 @@ class SessionStorage:
         limit: int = 100,
         offset: int = 0,
     ) -> list[AgentTaskRecord]:
+        """Return the newest ``limit`` matching tasks, oldest first.
+
+        The window is anchored at the *end* of the ledger: ``offset`` pages
+        backwards from the most recent task. Callers rely on ``rows[-1]``
+        being the latest task (``sessions_yield`` waits on it, and the
+        session reset/delete sweep cancels whatever is still active), so an
+        ascending ``LIMIT`` -- which pins the page to the 100 oldest rows once
+        a session outgrows it -- would hide every in-flight task.
+        """
         clauses: list[str] = []
         params: list[Any] = []
         if session_key is not None:
@@ -1013,10 +1022,11 @@ class SessionStorage:
         params += [limit, offset]
         sql = (
             f"SELECT * FROM agent_tasks {where} "
-            "ORDER BY created_at ASC, rowid ASC LIMIT ? OFFSET ?"
+            "ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?"
         )
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
+        rows.reverse()
         return [AgentTaskRecord(**_deserialize_row(dict(row))) for row in rows]
 
     @_serialized_write
