@@ -539,6 +539,40 @@ def test_error_handler_drops_unpaired_tool_use_on_output_truncation() -> None:
     assert state.turn_segments == [{"type": "text", "text": "partial"}]
 
 
+def test_error_handler_flushes_held_back_text_into_final_text() -> None:
+    """A stream error right after a false-positive marker prefix must not lose
+    the text the guard was holding (#1796). Mirrors ``_DoneHandler``: the
+    pending text lands in both text buffers and the guard is emptied.
+    """
+    state = _make_state()
+    _TextDeltaHandler().handle(TextDeltaEvent(text="Sure, here is a section: "), state)
+    held = _TextDeltaHandler().handle(TextDeltaEvent(text="<details>"), state)
+    assert held.text == ""  # ordinary markdown, held back pending disambiguation
+    assert state.final_text_parts == ["Sure, here is a section: "]
+
+    result = _ErrorHandler().handle(ErrorEvent(message="boom", code="agent_error"), state)
+
+    assert result is _SUPPRESS
+    assert "".join(state.final_text_parts) == "Sure, here is a section: <details>"
+    assert "".join(state.current_text_parts) == "Sure, here is a section: <details>"
+    assert state.protocol_text_guard.flush() == ""
+
+
+def test_error_handler_drops_suppressed_tool_protocol_leak() -> None:
+    """The flush must still discard text the guard already classified as a
+    tool-protocol leak -- only genuine held-back text is recovered."""
+    state = _make_state()
+    _TextDeltaHandler().handle(
+        TextDeltaEvent(text='Writing it now.\n\n<tvoe_calls><invoke name="write_file">'),
+        state,
+    )
+
+    _ErrorHandler().handle(ErrorEvent(message="boom", code="agent_error"), state)
+
+    assert "".join(state.final_text_parts) == "Writing it now."
+    assert "<invoke" not in "".join(state.final_text_parts)
+
+
 def test_warning_handler_forwards_through_transformer() -> None:
     captured: list[WarningEvent] = []
 
@@ -947,6 +981,22 @@ async def test_outer_stage_suppresses_error_event_and_records_pending() -> None:
     assert inp.state.pending_error_event is not None
     assert inp.state.pending_error_event.code == "agent_error"
     assert inp.state.error_message == "boom"
+
+
+@pytest.mark.asyncio
+async def test_outer_stage_error_keeps_text_held_by_protocol_guard() -> None:
+    agent_run = _RecordingAgentRun(
+        events=[
+            TextDeltaEvent(text="Sure, here is a collapsible section: "),
+            TextDeltaEvent(text="<details>"),
+            ErrorEvent(message="boom", code="agent_error"),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+    inp = _make_input()
+    await _drain(stage, inp)
+    assert "".join(inp.state.final_text_parts) == "Sure, here is a collapsible section: <details>"
+    assert inp.state.pending_error_event is not None
 
 
 @pytest.mark.asyncio

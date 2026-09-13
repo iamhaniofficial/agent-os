@@ -425,6 +425,14 @@ class _ErrorHandler:
             )
         if event.code in {"incomplete_tool_stream", "provider_output_truncated"}:
             state.turn_segments[:] = _drop_unpaired_tool_use_segments(state.turn_segments)
+        # The stream is over: release any text the leak guard was holding
+        # back as a possible tool-protocol prefix (e.g. ``<details>``), the
+        # same way ``_DoneHandler`` does, so the finalizer's ``final_text``
+        # keeps everything the model actually produced before the error.
+        pending_text = state.protocol_text_guard.flush()
+        if pending_text:
+            state.final_text_parts.append(pending_text)
+            state.current_text_parts.append(pending_text)
         state.error_message = event.message or "Unknown error"
         state.pending_error_event = event
         return _SUPPRESS
