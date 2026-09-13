@@ -68,3 +68,54 @@ def test_shape_text_and_table_text_extraction(tmp_path: Path) -> None:
     assert "Secondary point" in slide_data["text"]
     assert "Metric | Value" in slide_data["text"]
     assert "Q1 Revenue (USD) | $100M" in slide_data["text"]
+
+
+def _deck_with(text: str, tmp_path: Path) -> Path:
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    tb = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+    tb.text_frame.text = text
+    path = tmp_path / "deck.pptx"
+    prs.save(str(path))
+    return path
+
+
+def _code_page_stdout(encoding: str) -> io.TextIOWrapper:
+    """A piped stdout whose text layer cannot encode CJK or emoji (#1834)."""
+    return io.TextIOWrapper(io.BytesIO(), encoding=encoding, newline="")
+
+
+def _stdout_bytes(stream: io.TextIOWrapper) -> bytes:
+    stream.flush()
+    return stream.buffer.getvalue()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("code_page", ["cp936", "cp1252"])
+def test_plain_output_is_utf8_on_a_non_utf8_code_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code_page: str
+) -> None:
+    """The agent captures stdout through a pipe, where Python picks the locale
+    code page; extracted CJK or emoji text must still arrive as UTF-8 bytes."""
+    deck = _deck_with("季度回顾 🎉", tmp_path)
+    stdout = _code_page_stdout(code_page)
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    ret = extract_text.main([str(deck)])
+
+    assert ret == 0
+    assert _stdout_bytes(stdout) == "--- slide 1 ---\n季度回顾 🎉\n".encode()
+
+
+def test_json_output_is_utf8_on_a_non_utf8_code_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deck = _deck_with("季度回顾 🎉", tmp_path)
+    stdout = _code_page_stdout("cp1252")
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    ret = extract_text.main([str(deck), "--json"])
+
+    assert ret == 0
+    raw = _stdout_bytes(stdout)
+    assert raw.endswith(b"\n")
+    assert json.loads(raw.decode("utf-8")) == [{"slide": 1, "text": ["季度回顾 🎉"]}]

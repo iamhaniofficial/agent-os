@@ -24,6 +24,11 @@ Exit codes:
     0  success
     1  unexpected error (file unreadable, parse failure)
     2  argument error or python-pptx not installed
+
+Output is written as UTF-8 bytes to the binary stdout buffer: the agent runs
+this through a pipe, where Python would otherwise pick the locale code page
+(cp936, cp1252) and any CJK or emoji text in the deck would raise
+``UnicodeEncodeError`` instead of reaching the caller.
 """
 
 from __future__ import annotations
@@ -102,6 +107,25 @@ def _notes_text(slide) -> str:
     return "\n".join(p.text for p in tf.paragraphs if p.text.strip())
 
 
+def _write_utf8(text: str) -> None:
+    """Write ``text`` to stdout as UTF-8, bypassing the stream's own encoder.
+
+    Falls back to the text layer with ``backslashreplace`` when stdout has no
+    binary buffer (a ``StringIO`` harness), so nothing is silently lost.
+    """
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        try:
+            buffer.write(text.encode("utf-8"))
+            buffer.flush()
+            return
+        except (AttributeError, OSError, ValueError):
+            pass
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    sys.stdout.write(text.encode(encoding, errors="backslashreplace").decode(encoding))
+    sys.stdout.flush()
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Extract slide text from a .pptx file.")
     ap.add_argument("path", type=Path, help="Path to .pptx file")
@@ -141,17 +165,17 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.json:
-        json.dump(slides_data, sys.stdout, ensure_ascii=False, indent=2)
-        sys.stdout.write("\n")
+        _write_utf8(json.dumps(slides_data, ensure_ascii=False, indent=2) + "\n")
         return 0
 
+    lines: list[str] = []
     for entry in slides_data:
-        sys.stdout.write(f"--- slide {entry['slide']} ---\n")
-        for line in entry["text"]:
-            sys.stdout.write(line + "\n")
+        lines.append(f"--- slide {entry['slide']} ---")
+        lines.extend(entry["text"])
         if args.include_notes and entry.get("notes"):
-            sys.stdout.write("[notes]\n")
-            sys.stdout.write(entry["notes"] + "\n")
+            lines.append("[notes]")
+            lines.append(entry["notes"])
+    _write_utf8("".join(line + "\n" for line in lines))
     return 0
 
 
