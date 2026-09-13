@@ -1035,6 +1035,10 @@ async def glob_search(pattern: str, path: str | None = None) -> str:
     if blocked is not None:
         return json.dumps(blocked)
     _gate_workspace_strict_read("glob_search", base, path or str(base))
+    if not base.exists():
+        # ``Path.glob`` on a missing directory yields nothing, which would read
+        # as "no files matched" rather than "you mistyped the path".
+        raise FileNotFoundError(f"Path not found: {path or base}")
 
     loop = asyncio.get_running_loop()
     strict_roots = _strict_read_roots()
@@ -1117,6 +1121,9 @@ async def grep_search(
     if blocked is not None:
         return json.dumps(blocked)
     _gate_workspace_strict_read("grep_search", base, path or str(base))
+    if not base.exists():
+        # Same as glob_search: ``rglob`` on a missing base is silently empty.
+        raise FileNotFoundError(f"Path not found: {path or base}")
 
     loop = asyncio.get_running_loop()
     strict_roots = _strict_read_roots()
