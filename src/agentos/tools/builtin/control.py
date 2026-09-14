@@ -1777,17 +1777,15 @@ async def gateway(
     if action == "config_get":
         assert key is not None
         cfg_dict = config.to_toml_dict() if hasattr(config, "to_toml_dict") else {}
-        # Navigate dot-path key
+        # Navigate dot-path key. Presence is a membership test, not a None
+        # check: an optional setting configured as null is a real key whose
+        # value happens to be None, and the caller asked to see it.
         parts = key.split(".")
-        val = cfg_dict
+        val: Any = cfg_dict
         for p in parts:
-            if isinstance(val, dict):
-                val = val.get(p)
-            else:
-                val = None
-                break
-        if val is None:
-            raise ToolError(f"Config key not found: {key}")
+            if not isinstance(val, dict) or p not in val:
+                raise ToolError(f"Config key not found: {key}")
+            val = val[p]
         return json.dumps({"action": "config_get", "key": key, "value": val})
 
     # config_set
