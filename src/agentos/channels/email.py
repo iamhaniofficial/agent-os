@@ -197,7 +197,14 @@ def sender_allowed(sender: str, allowlist: list[str] | tuple[str, ...]) -> bool:
     address = normalize_address(sender) or (sender or "").strip().lower()
     if not address:
         return False
-    domain = address.rpartition("@")[2]
+    # ``rpartition`` hands back the whole string as the tail when there is no
+    # ``@``, so a bare ``example.com`` in the addr-spec was its own domain and
+    # cleared an ``@example.com`` entry. A value with no ``@`` -- or nothing in
+    # front of it -- is not an address at that domain; it can still match an
+    # exact entry (``root`` on a local MTA).
+    local_part, at_sign, domain = address.rpartition("@")
+    if not at_sign or not local_part:
+        domain = ""
     for raw in allowlist:
         pattern = (raw or "").strip().lower()
         if not pattern:
