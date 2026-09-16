@@ -29,6 +29,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   results carry a routable URL instead of a raw redirect path. An organic
   result that merely carries a `uddg` parameter, or a `/l/` path on another
   host, is left untouched. (#2082)
+- `apply_patch`: a stray `*** End Patch` ahead of `*** Begin Patch` — a quoted
+  example in a preamble, say — no longer pairs with the opening marker and
+  empties the patch, which reported "no changes" while dropping every
+  operation. The end marker is now the first one after the begin marker, and
+  a patch with none there is rejected instead of applied as empty. (#2084)
+- Discord channel: the channel-type and thread-parent caches fed by gateway
+  events are `BoundedRegistry` instances with a channel-count ceiling instead
+  of plain dicts, so a long-running connection to an active guild no longer
+  grows them for the life of the process. (#2088)
+- `cron.add` / `cron.update` / `agentos cron add`: a channel delivery block
+  keeps its recipient when it arrives as `to` — the key the CLI sends — and its
+  `bestEffort` flag, which was reset to strict delivery even when set; the
+  flag also survives on a delivery inferred from the session when no channel
+  is named. `cron.update` no longer raises on a job whose stored delivery is
+  `None`. (#2093)
+- `execute_code` destructive check: a PowerShell flag that takes a value
+  (`-ExecutionPolicy Bypass`, `-WindowStyle Hidden`) no longer has its value
+  mistaken for the command, so `powershell -ExecutionPolicy Bypass -c
+  Remove-Item …` needs approval like `Remove-Item` does; `bash`, `sh`, `zsh`,
+  `dash`, `ksh`, `fish`, `csh` and `tcsh` are recognised as wrappers, so
+  `["bash", "-c", "rm -rf …"]` and `os.system("sh -c 'rm …'")` — including
+  scripts written over several lines — are inspected. A long run of flags is
+  checked in linear time. (#2096)
 - `pdf` tool: a page range that names the same page twice (`1-3,2`) no longer
   extracts it twice, which duplicated the text and charged the duplicate
   against the page budget.
