@@ -66,15 +66,18 @@ def _parse_patch(patch_text: str) -> list[PatchOp]:
     """Parse patch text into a list of PatchOp objects."""
     lines = patch_text.splitlines()
 
-    # Validate markers
-    if not any(line.strip() == "*** Begin Patch" for line in lines):
+    # Trim to content between markers. The end marker is searched only after
+    # the begin marker: a stray "*** End Patch" quoted in a preamble must not
+    # pair with the opening marker and silently empty the body.
+    start_idx = next((i for i, ln in enumerate(lines) if ln.strip() == "*** Begin Patch"), None)
+    if start_idx is None:
         raise ValueError("Missing '*** Begin Patch' marker")
-    if not any(line.strip() == "*** End Patch" for line in lines):
-        raise ValueError("Missing '*** End Patch' marker")
-
-    # Trim to content between markers
-    start_idx = next(i for i, ln in enumerate(lines) if ln.strip() == "*** Begin Patch")
-    end_idx = next(i for i, ln in enumerate(lines) if ln.strip() == "*** End Patch")
+    end_idx = next(
+        (i for i in range(start_idx + 1, len(lines)) if lines[i].strip() == "*** End Patch"),
+        None,
+    )
+    if end_idx is None:
+        raise ValueError("Missing '*** End Patch' marker after '*** Begin Patch'")
     body = lines[start_idx + 1 : end_idx]
 
     ops: list[PatchOp] = []
