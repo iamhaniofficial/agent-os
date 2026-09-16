@@ -373,7 +373,7 @@ def test_single_underscore_leaves_identifiers_alone(markdown: str) -> None:
     with several underscores must not sprout <i> tags."""
     rendered = render_telegram_html(markdown)
     assert "<i>" not in rendered
-    assert rendered == markdown.replace("__init__", "<b>init</b>")
+    assert rendered == markdown
 
 
 def test_single_underscore_does_not_touch_a_parked_link_or_code_span() -> None:

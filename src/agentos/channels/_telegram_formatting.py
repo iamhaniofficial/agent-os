@@ -15,6 +15,71 @@ _LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s)<]+)\)")
 # one space before the content. `>quote` (no space) and `>` alone (an empty
 # quote line, used to separate paragraphs within one quote) both match.
 _BLOCKQUOTE_RE = re.compile(r"^ {0,3}>[ ]?(?P<text>.*)$")
+_BOLD_UNDERSCORE_RE = re.compile(r"__(?=\S)(.+?)(?<=\S)__")
+# Word-boundary guards keep `snake_case_identifiers` intact: an opening `_`
+# must not follow a word character and a closing one must not precede one.
+_ITALIC_UNDERSCORE_RE = re.compile(r"(?<!\w)_(?=[^\s_])(.+?)(?<=[^\s_])_(?!\w)")
+
+# `__init__` has exactly the shape of `__bold__`, so the bold pass turned
+# `call __init__ method` into `call <b>init</b> method` -- and a coding
+# assistant mentions these names constantly. Nothing about the delimiters
+# tells the two apart; what does is that Python's special names are a fixed
+# vocabulary -- the data model's special methods, the module, class, function,
+# typing and exception attributes, the legacy names that come up when porting
+# code, and the handful of framework hooks (SQLAlchemy, pytest, pydantic,
+# attrs) that an assistant writes as often as the stdlib ones -- so a
+# `__name__` from that vocabulary is kept literal and any other `__word__`
+# still renders bold.
+_DUNDER_OPERATORS = (
+    "add", "sub", "mul", "matmul", "truediv", "floordiv", "mod", "divmod",
+    "pow", "lshift", "rshift", "and", "or", "xor",
+)  # fmt: skip
+_DUNDER_NAMES = frozenset(
+    {
+        # object lifecycle, representation, comparison, hashing
+        "new", "init", "del", "repr", "str", "bytes", "format", "hash", "bool",
+        "eq", "ne", "lt", "le", "gt", "ge", "sizeof", "dir", "class",
+        # attribute access, descriptors, class creation
+        "getattr", "getattribute", "setattr", "delattr", "get", "set",
+        "delete", "set_name", "init_subclass", "class_getitem", "mro_entries",
+        "prepare", "instancecheck", "subclasscheck", "subclasshook", "slots",
+        "weakref", "dict", "mro", "bases", "subclasses", "abstractmethods",
+        "isabstractmethod", "objclass", "orig_bases", "orig_class",
+        "type_params", "static_attributes", "firstlineno", "classcell",
+        # callables, containers, iteration, context managers, async
+        "call", "len", "length_hint", "getitem", "setitem", "delitem",
+        "missing", "iter", "next", "reversed", "contains", "enter", "exit",
+        "await", "aiter", "anext", "aenter", "aexit",
+        # numeric conversions and unary operators
+        "neg", "pos", "abs", "invert", "complex", "int", "float", "index",
+        "round", "trunc", "floor", "ceil",
+        # pickling, copying, buffers
+        "getstate", "setstate", "reduce", "reduce_ex", "getnewargs",
+        "getnewargs_ex", "copy", "deepcopy", "buffer", "release_buffer",
+        # module / function / class / exception attributes
+        "name", "qualname", "module", "doc", "annotations", "annotate",
+        "all", "file", "path", "package", "loader", "spec", "builtins",
+        "main", "future", "version", "author", "debug", "import",
+        "build_class", "func", "self", "code", "defaults", "kwdefaults",
+        "closure", "globals", "wrapped", "signature", "text_signature",
+        "args", "origin", "parameters", "dataclass_fields", "dataclass_params",
+        "match_args", "post_init", "replace", "cause", "context", "traceback",
+        "suppress_context", "notes", "fspath", "pycache", "cached", "slotnames",
+        "getformat", "classdictcell", "self_class", "thisclass", "license",
+        "copyright", "credits", "email", "maintainer", "status", "date",
+        # typing: TypedDict / NewType / TypeVar / Protocol / decorators
+        "required_keys", "optional_keys", "total", "supertype", "bound",
+        "constraints", "covariant", "contravariant", "protocol_attrs", "final",
+        "override",
+        # legacy names that come up when porting Python 2 code
+        "metaclass", "unicode", "nonzero", "cmp", "div", "rdiv", "idiv",
+        "coerce", "long", "oct", "hex",
+        # framework hooks an assistant writes as often as the stdlib names
+        "tablename", "table_args", "mapper_args", "tracebackhide", "test",
+        "fields", "fields_set", "config", "attrs_attrs", "attrs_post_init",
+    }
+    | {f"{prefix}{name}" for name in _DUNDER_OPERATORS for prefix in ("", "r", "i")}
+)  # fmt: skip
 
 
 def _replace_code_spans(text: str) -> tuple[str, list[str]]:
@@ -49,6 +114,16 @@ def _replace_code_spans(text: str) -> tuple[str, list[str]]:
     return "".join(output), chunks
 
 
+def _bold_underscore_html(match: re.Match[str]) -> str:
+    content = match.group(1)
+    return match.group(0) if content in _DUNDER_NAMES else f"<b>{content}</b>"
+
+
+def _bold_underscore_plain(match: re.Match[str]) -> str:
+    content = match.group(1)
+    return match.group(0) if content in _DUNDER_NAMES else content
+
+
 def _render_inline(text: str) -> str:
     protected, code_chunks = _replace_code_spans(text)
     rendered = html.escape(protected)
@@ -69,12 +144,10 @@ def _render_inline(text: str) -> str:
 
     rendered = _LINK_RE.sub(_park_href, rendered)
     rendered = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"<b>\1</b>", rendered)
-    rendered = re.sub(r"__(?=\S)(.+?)(?<=\S)__", r"<b>\1</b>", rendered)
+    rendered = _BOLD_UNDERSCORE_RE.sub(_bold_underscore_html, rendered)
     rendered = re.sub(r"~~(?=\S)(.+?)(?<=\S)~~", r"<s>\1</s>", rendered)
     rendered = re.sub(r"(?<!\*)\*(?=\S)(.+?)(?<=\S)\*(?!\*)", r"<i>\1</i>", rendered)
-    # Word-boundary guards keep `snake_case_identifiers` intact: an opening `_`
-    # must not follow a word character and a closing one must not precede one.
-    rendered = re.sub(r"(?<!\w)_(?=[^\s_])(.+?)(?<=[^\s_])_(?!\w)", r"<i>\1</i>", rendered)
+    rendered = _ITALIC_UNDERSCORE_RE.sub(r"<i>\1</i>", rendered)
     # Restore in reverse order of protection: code spans were parked first, so
     # they come back last and a restored code span is never rescanned.
     for index, href in enumerate(hrefs):
@@ -98,8 +171,14 @@ def _plain_inline(text: str) -> str:
 
     text = _LINK_RE.sub(_park_href, text)
     text = text.replace("`", "")
-    for marker in ("**", "__", "~~"):
+    for marker in ("**", "~~"):
         text = text.replace(marker, "")
+    # Underscores get the same treatment as the HTML path rather than a blind
+    # `str.replace`: a dunder name keeps its markers instead of collapsing to
+    # `init`, and `_italic_` is stripped with the word-boundary guards that
+    # leave `snake_case` and `_private` names alone.
+    text = _BOLD_UNDERSCORE_RE.sub(_bold_underscore_plain, text)
+    text = _ITALIC_UNDERSCORE_RE.sub(r"\1", text)
     for index, href in enumerate(hrefs):
         text = text.replace(f"\x00TG_HREF_{index}\x00", href)
     return text.strip()
