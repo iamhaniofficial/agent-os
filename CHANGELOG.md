@@ -8,6 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `srt-from-script` `build_srt.py`: a fractional `DURATION_S` (`3.5`) keeps
+  its fraction instead of being truncated to whole seconds, so cue timestamps
+  no longer drift earlier with every shot. (#2070)
+- Telegram rendering: Python dunder names (`__init__`, `__main__`,
+  `__tablename__`, …) stay literal instead of rendering as bold `init`, in
+  body text and in table labels alike; table labels now also strip `_italic_`
+  markers while leaving `snake_case` and `_private` names intact. (#2076)
+- Email channel: a `From` with no `@` — or nothing in front of it — no longer
+  counts as its own domain, so a bare `example.com` in the addr-spec cannot
+  clear an `@example.com` / `*@example.com` sender allowlist at poll time, in
+  `evaluate_access`, or as a `Reply-To` target. Exact entries are unchanged.
+  (#2078)
+- Email channel: `References` / `In-Reply-To` ids written without the optional
+  whitespace between them (`<a@x><b@x>`) parse as separate ids, so the thread
+  key stays the root id, the same mail thread stays in one session whichever
+  client replied, and the outbound `References` chain is well formed. (#2080)
+- DuckDuckGo search: a relative `/l/?uddg=` redirect link is resolved to its
+  target the same way the protocol-relative and absolute spellings are, so
+  results carry a routable URL instead of a raw redirect path. An organic
+  result that merely carries a `uddg` parameter, or a `/l/` path on another
+  host, is left untouched. (#2082)
 - `pdf` tool: a page range that names the same page twice (`1-3,2`) no longer
   extracts it twice, which duplicated the text and charged the duplicate
   against the page budget.
