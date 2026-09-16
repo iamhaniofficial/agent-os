@@ -964,10 +964,12 @@ def _message_ids(raw: Any) -> list[str]:
     """Return the bare message ids in a threading header value, in order.
 
     Clients decorate these headers with comments and drop the angle brackets, so
-    a plain ``split()`` yields tokens that are not ids at all.
+    a plain ``split()`` yields tokens that are not ids at all. The CFWS between
+    two ids is optional (RFC 5322 3.6.4), so ``<a@x><b@x>`` is also one header
+    carrying two ids, not one id with brackets in the middle.
     """
 
-    text = _HEADER_COMMENT_RE.sub(" ", str(raw or ""))
+    text = _HEADER_COMMENT_RE.sub(" ", str(raw or "")).replace("><", "> <")
     return [token for token in (raw_id.strip().strip("<>") for raw_id in text.split()) if token]
 
 
