@@ -34,7 +34,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
-from agentos.channels._util import ChannelAccessPolicy, EventDedupeCache
+from agentos.channels._util import ChannelAccessPolicy, EventDedupeCache, split_text_for_limit
 from agentos.channels.contract import (
     ChannelCapabilityProfile,
     ChannelPlatformCapability,
@@ -69,6 +69,38 @@ FATAL_ERROR_CLASSES: tuple[str, ...] = (
 )
 
 _CONVERSATION_CACHE_SCHEMA_VERSION = 1
+
+# Teams rejects an Activity whose serialized payload exceeds 40 KB with
+# ``413 MessageSizeTooBig`` -- nothing is delivered, not a truncated message.
+# The budget for the text leaves room for the rest of the envelope (ids,
+# the conversation reference, service metadata) so the whole Activity fits.
+_MSTEAMS_ACTIVITY_PAYLOAD_LIMIT = 40 * 1024
+_MSTEAMS_ACTIVITY_ENVELOPE_HEADROOM = 8 * 1024
+_MSTEAMS_MESSAGE_TEXT_LIMIT = _MSTEAMS_ACTIVITY_PAYLOAD_LIMIT - _MSTEAMS_ACTIVITY_ENVELOPE_HEADROOM
+
+
+def _measure_activity_text(text: str) -> int:
+    """Size of *text* as the service counts it: UTF-16 bytes of its JSON form.
+
+    ``len`` undercounts twice over -- the cap is in bytes of a UTF-16 payload,
+    so a CJK or emoji-heavy reply is two or four bytes per character, and JSON
+    escaping grows quotes, backslashes and control characters.
+    """
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-16-le"))
+
+
+def _split_activity_text(content: str) -> list[str]:
+    """Split *content* into one Activity per Teams payload cap, in order."""
+    segments: list[str] = []
+    remaining = content
+    while True:
+        head, tail = split_text_for_limit(
+            remaining, _MSTEAMS_MESSAGE_TEXT_LIMIT, measure=_measure_activity_text
+        )
+        segments.append(head)
+        if not tail:
+            return segments
+        remaining = tail
 
 
 def _default_workspace_dir() -> Path:
@@ -482,19 +514,25 @@ class MSTeamsChannel:
         if ref is None:
             raise RuntimeError("MSTeamsChannel.send has no conversation reference for reply_to")
 
-        holder: dict[str, str | None] = {"id": None}
+        segments = _split_activity_text(message.content)
+        sent_ids: list[str] = []
 
         async def _callback(turn_context: Any) -> None:
-            response = await turn_context.send_activity(message.content)
-            if response is not None and getattr(response, "id", None):
-                holder["id"] = response.id
+            # One Activity per segment, in order, on the same turn: a reply
+            # past the payload cap arrives as consecutive messages instead of
+            # failing with 413 MessageSizeTooBig (#2114).
+            for segment in segments:
+                response = await turn_context.send_activity(segment)
+                if response is not None and getattr(response, "id", None):
+                    sent_ids.append(response.id)
 
         await self._adapter.continue_conversation(
             ref,
             _callback,
             bot_id=self._bot_id,
         )
-        self._remember_sent_message(holder["id"], key)
+        for sent_id in sent_ids:
+            self._remember_sent_message(sent_id, key)
         log.info(
             "msteams.outbound_sent",
             conversation_id=getattr(getattr(ref, "conversation", None), "id", ""),
