@@ -95,6 +95,10 @@ chat channel.
   source or two watchers will suppress each other's items.
 - **A non-zero exit is delivered as an alert**, so a feed that starts returning
   502s surfaces instead of going quiet.
+- **`watch_http_json.py` refuses an `--id-field` that matches nothing.** When
+  items were fetched and none of them carries the field, the run exits 1 and
+  names the field on stderr instead of reporting an empty feed; nothing is
+  recorded, so the corrected run still counts as the first.
 - `watch_github.py` reads `GITHUB_TOKEN` when it is set, for rate limits and
   private repos.
 

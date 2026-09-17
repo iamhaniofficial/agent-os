@@ -111,13 +111,28 @@ def main() -> int:
         return 1
 
     by_id: dict[str, dict[str, Any]] = {}
+    objects = 0
     for item in items:
         if not isinstance(item, dict):
             continue
+        objects += 1
         identifier = item.get(args.id_field)
         if identifier is None:
             continue
         by_id[str(identifier)] = item
+
+    if objects and not by_id:
+        # Every item lacked the field: that is a wrong --id-field, not a
+        # quiet feed. Staying silent here (exit 0, nothing on either stream)
+        # made a typo indistinguishable from "nothing new", and the watermark
+        # must not be touched so the corrected run still counts as the first.
+        print(
+            f"No item carried the id field {args.id_field!r} "
+            f"({objects} item{'s' if objects != 1 else ''} fetched); "
+            "check --id-field against the response",
+            file=sys.stderr,
+        )
+        return 1
 
     fresh = select_new(
         args.name, list(by_id), first_run_reports=args.first_run_reports, limit=args.limit
