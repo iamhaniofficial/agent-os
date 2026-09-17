@@ -146,31 +146,36 @@ _EXFILTRATION_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     ),
 )
 
-# Single source of truth for invisible codepoints that can be used to
-# bypass intent-phrase regexes. This set is shared between the
-# invisible_char threat class and the normalization pass so the two
-# lists cannot drift apart.
+# Invisible codepoints that can be used to split an intent phrase past the
+# regexes above. Every one of them is normalized to a space before the
+# text patterns run (#690), so this is the *widest* set.
 #
 # Categories covered:
 #   U+00AD      SOFT HYPHEN
-#   U+200B-F    zero-width space / ZWNJ / ZWJ / BOM
+#   U+200B-F    zero-width space / ZWNJ / ZWJ / bidi marks
 #   U+202A-E    bidi markers (LTR/RTL override, pop directional)
 #   U+2060-4    word joiner, function application, invisible operators
 #   U+2066-9    bidi isolates (first strong, pop directional)
+#   U+FEFF      BOM / zero-width no-break space
 _INVISIBLE_CODEPOINTS_RE: Final[re.Pattern[str]] = re.compile(
-    "[\u00ad"
-    "\u200b-\u200f"
-    "\u202a-\u202e"
-    "\u2060-\u2064"
-    "\u2066-\u2069"
-    "\ufeff]"
+    "[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
 )
 
-# invisible_char threat class reuses the combined pattern so there is
-# exactly one codepoint list to maintain.
-_INVISIBLE_CHAR_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
-    _INVISIBLE_CODEPOINTS_RE,
+# The ``invisible_char`` threat class is the subset that has no business in
+# ordinary text. Two joiners are left out because they build legitimate
+# content and, in enforce mode, one of them used to blank the whole payload
+# (#2120): ZWJ (U+200D) glues every compound emoji — family, profession,
+# skin-tone and flag sequences — and ZWNJ (U+200C) shapes Persian, Arabic
+# and Indic words. A leading BOM (U+FEFF) is what every UTF-8 file that has
+# been through Excel or Notepad starts with, so it is stripped before this
+# class is matched; a BOM anywhere else is still a smuggling signal. All
+# three still go through the normalization pass above, so they cannot be
+# used to split an intent phrase — the #690 bypass stays closed.
+_INVISIBLE_CHAR_THREAT_RE: Final[re.Pattern[str]] = re.compile(
+    "[\u00ad\u200b\u200e\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
 )
+
+_INVISIBLE_CHAR_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (_INVISIBLE_CHAR_THREAT_RE,)
 
 INJECTION_PATTERNS: Final[dict[str, tuple[re.Pattern[str], ...]]] = {
     "prompt_override": _PROMPT_OVERRIDE_PATTERNS,
@@ -207,20 +212,22 @@ def classify_injection(text: str) -> list[str]:
     space before matching *non*-invisible-character patterns, so
     ``ignore\u00adall prior instructions`` is caught as
     ``prompt_override``. The ``invisible_char`` class is matched against
-    the **original** text so the smuggling technique itself is reported.
+    the **original** text so the smuggling technique itself is reported —
+    minus a leading BOM and the ZWJ/ZWNJ joiners that legitimate emoji and
+    scripts are built from (see ``_INVISIBLE_CHAR_THREAT_RE``).
     """
 
     if not text:
         return []
 
     # Normalize invisible codepoints to space so they don't break
-    # word-boundary patterns. Use the same codepoint set as the
-    # invisible_char threat class — see _INVISIBLE_CODEPOINTS_RE.
+    # word-boundary patterns — see _INVISIBLE_CODEPOINTS_RE.
     normalized = _INVISIBLE_CODEPOINTS_RE.sub(" ", text)
+    original = text.removeprefix("\ufeff")
 
     hits: set[str] = set()
     for threat_class, patterns in INJECTION_PATTERNS.items():
-        search_text = normalized if threat_class != "invisible_char" else text
+        search_text = normalized if threat_class != "invisible_char" else original
         for pattern in patterns:
             if pattern.search(search_text):
                 hits.add(threat_class)
