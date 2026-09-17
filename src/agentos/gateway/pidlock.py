@@ -6,6 +6,13 @@ Design:
 - The pid file (``gateway.pid``) is always readable: written atomically then fsynced.
 - The lock file (``gateway.pid.lock``) carries the OS exclusive byte-range lock so the
   pid file itself stays open for readers even while the lock is held.
+- The lock file is never unlinked. Both platform locks are keyed to the open
+  handle/inode, not the path: a starter that opened the old inode and a starter
+  that created a fresh one would each win their own lock and both proceed (#2119).
+  A zero-byte anchor left on disk costs nothing; removing it costs exclusivity.
+- The lock is taken *before* the pid file is reconciled. Whoever holds the lock
+  is the live gateway, so a pid file found under a freshly won lock is stale by
+  construction and no liveness probe is needed to decide whether to replace it.
 
 Platform locking:
 - Windows: msvcrt.locking(lock_fd, LK_NBLCK, 1) on gateway.pid.lock
@@ -15,7 +22,8 @@ Usage::
 
     lock = GatewayPidLock(state_dir)
     lock.acquire()          # raises SystemExit(1) if another live instance holds it
-    # lock released automatically via atexit + signal handlers registered in acquire()
+    # lock released automatically via atexit registered in acquire(); the OS drops
+    # the handle lock itself if the process dies before atexit runs
 """
 
 from __future__ import annotations
@@ -25,7 +33,6 @@ import datetime
 import json
 import logging
 import os
-import signal
 import sys
 from pathlib import Path
 from typing import IO, Any, cast
@@ -55,49 +62,31 @@ class GatewayPidLock:
         """Acquire the PID file lock.
 
         Algorithm:
-        1. If gateway.pid already exists, read it.
-           - pid alive  → SystemExit(1) with STATE_DIR + pid in message.
-           - pid dead   → log warning (stale), remove pid file, continue.
-        2. Acquire exclusive OS lock on gateway.pid.lock (separate file so
+        1. Acquire the exclusive OS lock on gateway.pid.lock (separate file so
            gateway.pid stays freely readable while the lock is held).
-           - Lock fails (race) → SystemExit(1).
+           - Lock fails → another gateway is live; SystemExit(1) naming its pid
+             (read from gateway.pid) and the STATE_DIR.
+        2. If gateway.pid still exists it belongs to a gateway that died without
+           cleaning up (the holder would have kept the lock): log a warning and
+           overwrite it.
         3. Write pid + start_ts (ISO 8601) to gateway.pid, fsync.
-        4. Register atexit + SIGTERM/SIGINT cleanup.
+        4. Register atexit cleanup.
         """
         self._state_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── Step 1: check existing pid file ──────────────────────────
-        if self._pid_path.exists():
-            existing_pid = _read_pid_from_path(self._pid_path)
-            if existing_pid is not None and _is_alive(existing_pid):
-                log.error(
-                    "gateway.pidlock.already_running",
-                    extra={"pid": existing_pid, "state_dir": str(self._state_dir)},
-                )
-                print(
-                    f"ERROR: Another gateway is already running "
-                    f"(pid={existing_pid}, state_dir={self._state_dir}). "
-                    f"Stop it first or remove {self._pid_path}.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            elif existing_pid is not None:
-                log.warning(
-                    "gateway.pidlock.stale_overwritten",
-                    extra={"stale_pid": existing_pid, "state_dir": str(self._state_dir)},
-                )
-            try:
-                self._pid_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-        # ── Step 2: exclusive OS lock on the lock file ────────────────
-        lock_fh = open(str(self._lock_path), "w+b")  # noqa: WPS515
+        # ── Step 1: exclusive OS lock on the lock file ────────────────
+        # Append mode: the anchor now outlives every holder, and truncating a
+        # file whose first byte another process has locked fails on Windows
+        # before _try_lock gets to report the contention properly.
+        lock_fh = open(str(self._lock_path), "a+b")  # noqa: WPS515
 
         if not _try_lock(lock_fh):
-            # Race: another process won the lock between step 1 and now.
             existing_pid = _read_pid_from_path(self._pid_path)
             lock_fh.close()
+            log.error(
+                "gateway.pidlock.already_running",
+                extra={"pid": existing_pid, "state_dir": str(self._state_dir)},
+            )
             pid_str = str(existing_pid) if existing_pid is not None else "unknown"
             print(
                 f"ERROR: Another gateway is already running "
@@ -107,15 +96,33 @@ class GatewayPidLock:
             )
             sys.exit(1)
 
-        # ── Step 3: write pid + start_ts to the pid file ─────────────
         self._lock_fh = lock_fh
+
+        # ── Step 2: reconcile a leftover pid file ─────────────────────
+        # We hold the lock, so nothing that wrote this file is still the live
+        # gateway. Probing the pid would only add a way to get it wrong: a
+        # false negative used to unlink a live gateway's pid file, and a reused
+        # pid would refuse to start over a process that is not a gateway.
+        if self._pid_path.exists():
+            stale_pid = _read_pid_from_path(self._pid_path)
+            log.warning(
+                "gateway.pidlock.stale_overwritten",
+                extra={"stale_pid": stale_pid, "state_dir": str(self._state_dir)},
+            )
+
+        # ── Step 3: write pid + start_ts to the pid file ─────────────
         self._write_pid()
 
         # ── Step 4: register cleanup ──────────────────────────────────
-        self._register_cleanup()
+        atexit.register(self.release)
 
     def release(self) -> None:
-        """Release the lock and remove the PID file. Safe to call multiple times."""
+        """Release the lock and remove the PID file. Safe to call multiple times.
+
+        ``gateway.pid.lock`` deliberately stays on disk: it is the rendezvous
+        point every starter locks against, and unlinking it hands the next
+        opener a fresh inode with an independent lock.
+        """
         if self._lock_fh is None:
             return
         fh = self._lock_fh
@@ -130,10 +137,6 @@ class GatewayPidLock:
             pass
         try:
             self._pid_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            self._lock_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -162,20 +165,6 @@ class GatewayPidLock:
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
-
-    def _register_cleanup(self) -> None:
-        atexit.register(self.release)
-
-        def _handler(signum: int, frame: object) -> None:
-            self.release()
-            signal.signal(signum, signal.SIG_DFL)
-            os.kill(os.getpid(), signum)
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                signal.signal(sig, _handler)
-            except (OSError, ValueError):
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -231,27 +220,3 @@ def _read_pid_from_path(path: Path) -> int | None:
         return int(info["pid"])
     except Exception:  # noqa: BLE001
         return None
-
-
-def _is_alive(pid: int) -> bool:
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            ctypes_mod = cast(Any, ctypes)
-            synchronize = 0x00100000
-            handle = ctypes_mod.windll.kernel32.OpenProcess(synchronize, False, pid)
-            if handle == 0:
-                return False
-            ctypes_mod.windll.kernel32.CloseHandle(handle)
-            return True
-        except Exception:  # noqa: BLE001
-            return False
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True  # exists but not owned by us
