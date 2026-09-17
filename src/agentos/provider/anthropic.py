@@ -298,6 +298,26 @@ def _anthropic_iteration_token_counts(usage: dict[str, Any]) -> tuple[int, int]:
     return input_tokens, output_tokens
 
 
+def _mid_stream_error_event(event: dict[str, Any]) -> ErrorEvent:
+    """Translate a streaming ``{"type": "error", "error": {...}}`` event.
+
+    ``code`` carries the upstream error type (``overloaded_error``,
+    ``api_error``, ...) so ``classify_provider_error`` can route it exactly
+    like the pre-stream HTTP-status path does; ``message`` keeps both so the
+    surfaced text still names the cause when the type is unfamiliar.
+    """
+    raw = event.get("error")
+    detail = raw if isinstance(raw, dict) else {}
+    error_type = str(detail.get("type") or "") or "stream_error"
+    message = str(detail.get("message") or "")
+    if not message and isinstance(raw, str):
+        message = raw
+    return ErrorEvent(
+        message=f"{error_type}: {message}" if message else error_type,
+        code=error_type,
+    )
+
+
 class AnthropicProvider:
     """Streams from Anthropic Messages API with SSE parsing."""
 
@@ -482,6 +502,19 @@ class AnthropicProvider:
                             continue
 
                         etype = event.get("type", "")
+
+                        if etype == "error":
+                            # Anthropic can fail *after* the 200 and the first
+                            # events: ``event: error`` (overloaded_error,
+                            # api_error, ...) followed by a closed connection
+                            # with no ``message_stop``. Without this branch the
+                            # loop just ran out and the turn ended with
+                            # neither an ErrorEvent nor a DoneEvent, so the
+                            # caller saw a silently truncated reply and the
+                            # circuit breaker never learned the provider was
+                            # unhealthy (#2118).
+                            yield _mid_stream_error_event(event)
+                            return
 
                         if etype == "message_start":
                             usage = event.get("message", {}).get("usage", {})

@@ -175,6 +175,22 @@ def _format_error_body(body: bytes) -> str:
     return text[: _OLLAMA_ERROR_BODY_LIMIT - 1].rstrip() + "…"
 
 
+def _mid_stream_error_event(raw: Any) -> ErrorEvent:
+    """Translate a streamed ``{"error": ...}`` line into an ErrorEvent.
+
+    Ollama sends a plain string; keep the text verbatim so the existing
+    ``classify_provider_error`` markers ("model not found", "pull") still
+    match.
+    """
+    if isinstance(raw, dict):
+        message = raw.get("message") or raw.get("error") or json.dumps(raw)
+        code = raw.get("code") or raw.get("type") or "stream_error"
+    else:
+        message = str(raw)
+        code = "stream_error"
+    return ErrorEvent(message=str(message), code=str(code))
+
+
 def _stream_timeout(timeout: float) -> httpx.Timeout:
     """Bound the connect phase separately from the request timeout.
 
@@ -341,6 +357,16 @@ class OllamaProvider:
 
                         if not isinstance(chunk, dict):
                             continue
+
+                        # Ollama reports a failure after the 200 as an NDJSON
+                        # line ``{"error": "..."}`` and ends the stream with no
+                        # ``done`` chunk. It carried no ``message`` so it was
+                        # skipped and the loop fell through to a DoneEvent,
+                        # which the runtime recorded as a success (#2118).
+                        raw_error = chunk.get("error")
+                        if raw_error:
+                            yield _mid_stream_error_event(raw_error)
+                            return
 
                         raw_message = chunk.get("message", {})
                         msg_chunk = raw_message if isinstance(raw_message, dict) else {}

@@ -408,6 +408,28 @@ def _resolve_tool_call_index(
     return max(pending_calls.keys(), default=-1) + 1
 
 
+def _mid_stream_error_event(raw: Any) -> ErrorEvent:
+    """Translate a streamed ``{"error": ...}`` chunk into an ErrorEvent.
+
+    ``code`` prefers the upstream ``code`` then ``type`` so that
+    ``classify_provider_error`` sees the same tokens it would from the
+    pre-stream HTTP-status branch (``502`` -> PROVIDER_OVERLOADED,
+    ``rate_limit_exceeded`` -> RATE_LIMITED, ...).
+    """
+    if isinstance(raw, dict):
+        code = raw.get("code")
+        if code in (None, ""):
+            code = raw.get("type")
+        message = raw.get("message")
+        if not isinstance(message, str) or not message:
+            message = json.dumps(raw, ensure_ascii=False)
+    else:
+        code = None
+        message = str(raw)
+    code_text = str(code) if code not in (None, "") else "stream_error"
+    return ErrorEvent(message=f"{code_text}: {message}", code=code_text)
+
+
 def _stream_timeout(timeout: float) -> httpx.Timeout:
     connect = _coerce_float(os.environ.get("AGENTOS_LLM_STREAM_CONNECT_TIMEOUT_SECONDS"))
     if connect <= 0:
@@ -1066,6 +1088,21 @@ class OpenAIProvider:
                             chunk = json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
+
+                        if not isinstance(chunk, dict):
+                            continue
+
+                        # OpenAI-compatible gateways report a failure that
+                        # happens after the 200 as a chunk carrying ``error``
+                        # (OpenRouter: ``{"error": {"code": 502, ...}}``)
+                        # and then close the stream, usually without
+                        # ``[DONE]``. That chunk has no ``choices`` so it
+                        # used to fall straight through to the DoneEvent
+                        # below, which the runtime counted as a success
+                        # against the circuit breaker (#2118, #2214).
+                        if chunk.get("error"):
+                            yield _mid_stream_error_event(chunk["error"])
+                            return
 
                         chunk_model = chunk.get("model")
                         if chunk_model:
