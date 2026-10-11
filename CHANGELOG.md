@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [2026.10.11] - 2026-10-11
+
 ### Fixed
 - Desktop: the Bankr LLM Gateway provider tile in Settings → Providers (and
   the setup wizard's provider step) showed a generated "BL" monogram instead
