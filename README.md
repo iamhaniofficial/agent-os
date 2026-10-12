@@ -85,7 +85,7 @@ scheduling. It sends each turn to the Pilot Router, which picks the
 model. Then it runs tool calls inside the safe sandbox.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/use-agent-os/agent-os/main/assets/agentos-architecture.png" alt="AgentOS architecture: Web UI, CLI, and channels connect to the gateway (sessions, approvals, scheduler), which drives the Pilot Router and the sandboxed tools layer">
+  <img src="https://raw.githubusercontent.com/use-agent-os/agent-os/main/assets/agentos-architecture.png" alt="AgentOS architecture: the Web UI, CLI, chat channels, and macOS native app connect to the gateway (sessions, approvals, scheduler), which drives the AgentOS Router (Bankr LLM Gateway, OpenRouter, OpenAI, Anthropic) and the sandboxed tools layer">
 </p>
 
 Here is what happens to one message: it comes in through a channel,
