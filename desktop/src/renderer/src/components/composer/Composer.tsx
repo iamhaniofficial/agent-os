@@ -22,7 +22,8 @@ export type { ComposerHandle }
  * Composer.tsx) so the shared chat hooks drive it unchanged; the markup and
  * styling are the desktop's own. Keyboard behaviour is ported verbatim:
  * Enter sends, Shift+Enter newline, Escape aborts → recovers queue → clears,
- * Alt+↑/↓ pop/enqueue pending, ↑/↓ walk sent history.
+ * Alt+↑/↓ pop/enqueue pending, ↑/↓ walk sent history, Tab takes the
+ * suggested next prompt into an empty composer.
  */
 export interface ComposerProps {
   onSend: (text: string) => void
@@ -63,6 +64,11 @@ export interface ComposerProps {
   seats?: ReactNode
   /** Overrides the default placeholder (the desk rotates real orders). */
   placeholder?: string
+  /**
+   * The suggested next prompt (`chat.suggestNext`): the placeholder while the
+   * composer is empty, ahead of `placeholder`; Tab takes it, Enter sends it.
+   */
+  suggestion?: string | null
   onFocusChange?: (focused: boolean) => void
 }
 
@@ -96,6 +102,7 @@ export function Composer({
   enterToSend = true,
   seats,
   placeholder,
+  suggestion = null,
   onFocusChange,
 }: ComposerProps) {
   const [value, setValue] = useState('')
@@ -242,6 +249,23 @@ export function Composer({
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.nativeEvent.isComposing || e.keyCode === 229) return
       if (onSlashKeyDown?.(e)) return
+      // Bare Tab over an empty composer takes the suggestion; otherwise Tab
+      // keeps moving focus.
+      if (
+        e.key === 'Tab' &&
+        suggestion &&
+        !textareaRef.current?.value &&
+        !e.shiftKey &&
+        !e.altKey &&
+        !e.ctrlKey &&
+        !e.metaKey
+      ) {
+        e.preventDefault()
+        setProgrammatic(suggestion)
+        historyIdxRef.current = null
+        historyDraftRef.current = ''
+        return
+      }
       if (e.key === 'Escape') {
         if (busy) {
           e.preventDefault()
@@ -303,6 +327,7 @@ export function Composer({
     },
     [
       enterToSend,
+      suggestion,
       busy,
       onAbort,
       cycleHistory,
@@ -326,6 +351,8 @@ export function Composer({
     },
     [autoResize, onValueChange],
   )
+
+  const showSuggestion = Boolean(suggestion) && !value
 
   const { disabled: sendDisabled, label: sendLabel } = sendButtonState(
     value,
@@ -430,13 +457,24 @@ export function Composer({
           onKeyDown={onKeyDown}
           onFocus={() => onFocusChange?.(true)}
           onBlur={() => onFocusChange?.(false)}
-          placeholder={placeholder ?? t('composer.placeholder')}
+          placeholder={(showSuggestion && suggestion) || (placeholder ?? t('composer.placeholder'))}
           aria-label={t('composer.placeholder')}
+          aria-keyshortcuts={showSuggestion ? 'Tab' : undefined}
           aria-autocomplete={slashListboxId ? 'list' : undefined}
           aria-expanded={slashListboxId ? Boolean(slashActiveDescendant) : undefined}
           aria-controls={slashActiveDescendant ? slashListboxId : undefined}
           aria-activedescendant={slashActiveDescendant}
         />
+        {showSuggestion ? (
+          <kbd
+            className="composer-suggestion-key"
+            data-testid="composer-suggestion-key"
+            title={t('composer.suggestionKeyTitle')}
+            aria-hidden="true"
+          >
+            {t('composer.suggestionKey')}
+          </kbd>
+        ) : null}
         {routePicker}
         {busy ? (
           <button

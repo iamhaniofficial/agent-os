@@ -164,6 +164,12 @@ remaining pinned above the bottom toolbar. `Up` and `Down` move between lines
 in a multiline draft before moving through chat input history at the first or
 last line.
 
+After each reply the empty input shows a suggested next prompt in grey,
+followed by `· Tab`. Press `Tab` to take it into the input, then `Enter` to
+send it; typing anything else ignores it. Turn it off with
+`[sessions] suggest_next = false` (see
+[Configuration](configuration.md#suggested-next-prompt)).
+
 The bottom toolbar renders `title · model · [tier:cN]` while typing. The
 title comes from `/new <title>` (or is loaded from the gateway on
 `/resume`); the tier chip appears only while a Pilot Router hold is

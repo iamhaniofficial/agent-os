@@ -17,11 +17,13 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
-from prompt_toolkit.application import Application
+from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.auto_suggest import AutoSuggest
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer
 from prompt_toolkit.data_structures import Point
+from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, HTML, to_formatted_text
 from prompt_toolkit.history import FileHistory, History
 from prompt_toolkit.key_binding import KeyBindings
@@ -37,6 +39,7 @@ from prompt_toolkit.layout import (
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
+from prompt_toolkit.layout.processors import Processor, Transformation, TransformationInput
 from prompt_toolkit.mouse_events import MouseButton, MouseEventType
 
 from agentos.cli.tui.terminal.clipboard import copy_to_system_clipboard
@@ -195,6 +198,37 @@ def resolve_chat_fullscreen(explicit: bool | None = None) -> bool:
         return False
 
 
+class _NextPromptProcessor(Processor):
+    """Draws the suggested next prompt as ghost text over an empty input.
+
+    The buffer's own ``auto_suggest`` (history) is never drawn in this
+    surface, so this is a processor of its own rather than an
+    ``AppendAutoSuggestion``: showing history suggestions too would change
+    what users see while they type.
+    """
+
+    def __init__(self, get_suggestion: Callable[[], str | None]) -> None:
+        self._get_suggestion = get_suggestion
+
+    def apply_transformation(self, ti: TransformationInput) -> Transformation:
+        suggestion = self._get_suggestion()
+        if ti.lineno != 0 or ti.document.text or not suggestion:
+            return Transformation(fragments=ti.fragments)
+        return Transformation(
+            fragments=[
+                *ti.fragments,
+                ("class:auto-suggestion", suggestion),
+                ("class:auto-suggestion", "  · Tab"),
+            ]
+        )
+
+
+@Condition
+def _next_prompt_ready() -> bool:
+    chat_app = getattr(get_app(), "_chat_application", None)
+    return chat_app is not None and chat_app.next_prompt_suggestion_ready()
+
+
 def _build_key_bindings() -> KeyBindings:
     """Key bindings shared with the legacy PromptSession driver.
 
@@ -280,6 +314,16 @@ def _build_key_bindings() -> KeyBindings:
         chat_app = getattr(app, "_chat_application", None)
         if chat_app is not None:
             chat_app._invoke_cancel_callback()
+
+    @bindings.add("tab", filter=_next_prompt_ready)
+    def _take_next_prompt(event) -> None:  # type: ignore[no-untyped-def]
+        # Only bound while a suggestion sits over an empty input; otherwise
+        # Tab keeps its default (slash completion).
+        chat_app = getattr(event.app, "_chat_application", None)
+        suggestion = chat_app.next_prompt_suggestion() if chat_app is not None else None
+        if suggestion:
+            # A whole document, not insert_text: no completion pass over it.
+            event.current_buffer.document = Document(suggestion, len(suggestion))
 
     @bindings.add(Keys.BracketedPaste)
     def _bracketed_paste(event) -> None:  # type: ignore[no-untyped-def]
@@ -415,6 +459,11 @@ class ChatApplication:
         self._pasted_content: dict[str, str] = {}
         self._next_paste_index = 1
 
+        # Suggested next prompt (``chat.suggestNext``), drawn over an empty
+        # input by ``_next_prompt_processor`` and taken by Tab.
+        self._next_prompt: str | None = None
+        self._next_prompt_processor = _NextPromptProcessor(lambda: self._next_prompt)
+
         self._buffer = Buffer(
             multiline=True,
             accept_handler=self._on_accept,
@@ -462,7 +511,10 @@ class ChatApplication:
                     width=_input_prefix_width,
                 ),
                 Window(
-                    BufferControl(buffer=self._buffer),
+                    BufferControl(
+                        buffer=self._buffer,
+                        input_processors=[self._next_prompt_processor],
+                    ),
                     height=_input_height,
                     dont_extend_height=True,
                 ),
@@ -1024,7 +1076,23 @@ class ChatApplication:
     # Internals                                                          #
     # ------------------------------------------------------------------ #
 
+    def set_next_prompt_suggestion(self, text: str | None) -> None:
+        """Show ``text`` as ghost text over an empty input (``None`` hides it)."""
+        self._next_prompt = (text or "").strip() or None
+        try:
+            self._app.invalidate()
+        except Exception:
+            pass
+
+    def next_prompt_suggestion(self) -> str | None:
+        return self._next_prompt
+
+    def next_prompt_suggestion_ready(self) -> bool:
+        """True when Tab would take the suggestion: one is set, the input is empty."""
+        return bool(self._next_prompt) and not self._buffer.text
+
     def _on_accept(self, buffer: Buffer) -> bool:
+        self._next_prompt = None
         text = self._expand_pasted_content(buffer.text)
         self._submit_queue.put_nowait(text)
         self._clear_pasted_content()

@@ -32,6 +32,7 @@ import { SlashMenu, type SlashMenuHandle } from './SlashMenu'
 import { Toolbar } from './Toolbar'
 import { useApprovalPending } from './useApprovalPending'
 import { usePendingQueue, type PendingComposerBridge } from './usePendingQueue'
+import { useNextSuggestion } from './useNextSuggestion'
 import { useRoutePin } from './useRoutePin'
 import { useSlashCommands } from './useSlashCommands'
 import { useTranscript } from './useTranscript'
@@ -266,6 +267,8 @@ export function ChatPage() {
     routePinned: route.isPinned,
   })
   const attachments = useAttachments()
+  // Ghost-text next prompt in the composer, asked for when a turn ends.
+  const nextSuggestion = useNextSuggestion(rpc, sessionKey, busy)
 
   // ── Session name (issue #248) ─────────────────────────────────────────────
   // The chip and its rename editor need the session's `display_name`. It is
@@ -665,6 +668,16 @@ export function ChatPage() {
 
   // chat.js:8474 Alt+↓ enqueue-current: queue the composer text as a pending item
   // (chat.js:2464-2467 → `_enqueueCurrentInput`). Reuses the same enqueue path.
+  // Sending anything retires the suggestion, even a send queued behind a turn.
+  const clearSuggestion = nextSuggestion.clear
+  const onSendClearingSuggestion = useCallback(
+    (text: string) => {
+      clearSuggestion()
+      void onComposerSend(text)
+    },
+    [clearSuggestion, onComposerSend],
+  )
+
   const onEnqueueCurrent = useCallback(() => {
     const text = composerHandleRef.current?.getValue() ?? ''
     if (!text && attachments.attachments.length === 0) return
@@ -810,7 +823,8 @@ export function ChatPage() {
       </div>
       <PendingQueue queue={pending.queue} onRemove={pending.remove} onClearAll={pending.clearAll} />
       <Composer
-        onSend={onComposerSend}
+        onSend={onSendClearingSuggestion}
+        suggestion={nextSuggestion.suggestion}
         onValueChange={setComposerValue}
         onSlashKeyDown={onSlashKeyDown}
         composerRef={composerHandleRef}

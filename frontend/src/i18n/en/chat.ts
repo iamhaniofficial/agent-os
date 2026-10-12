@@ -20,6 +20,8 @@ export const chat = defineNamespace('chat', {
   attachFiles: 'Attach files',
   attachFileTitle: 'Attach a file',
   messagePlaceholder: 'Send a message...',
+  suggestionKey: 'Tab',
+  suggestionKeyTitle: 'Press Tab to use the suggested prompt',
   messageLabel: 'Message',
   stopTitle: 'Stop (Esc)',
   stop: 'Stop',

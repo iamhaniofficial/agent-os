@@ -880,7 +880,7 @@ model = "openai/gpt-4o-mini"
 ```
 
 Point it at something cheap when these tasks do not need your main model. Tasks
-currently in use are `document`, `vision` and `session_title`; a task with a
+currently in use are `document`, `vision`, `session_title` and `suggest_next`; a task with a
 capability requirement wants its own entry, since a text-only model cannot
 describe an image.
 
@@ -919,6 +919,28 @@ model = "openai/gpt-4o-mini"      # or AGENTOS_SESSION_TITLE_MODEL
 
 If the model is unreachable the first clause of the message is used instead,
 so a session still gets a readable name.
+
+### Suggested next prompt
+
+When a turn finishes, the chat input in the web console, the desktop app and
+`agentos chat` shows the message you are most likely to send next as grey
+placeholder text. `Tab` takes it into the input and `Enter` sends it; typing
+anything else ignores it. Clients ask for it with the `chat.suggestNext` RPC
+once they see the turn end, and the `suggest_next` task answers from the last
+user message and reply, preferring the router's cheapest text tier like
+session titles do. A turn that errored or was aborted gets no suggestion and
+costs no call, and the answer is cached per reply, so several clients open on
+one session share a single call. There is no fallback: if the model is
+unreachable or has nothing useful to offer, the normal placeholder stays.
+
+```toml
+[sessions]
+suggest_next = true                  # AGENTOS_SESSIONS_SUGGEST_NEXT=false to disable
+suggest_next_timeout_seconds = 15.0
+
+[auxiliary.tasks.suggest_next]
+model = "openai/gpt-4o-mini"         # or AGENTOS_SUGGEST_NEXT_MODEL
+```
 
 ## Sandbox and Permissions
 

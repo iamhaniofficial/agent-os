@@ -441,6 +441,33 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
         raise
 
 
+@_d.method("chat.suggestNext")
+async def _handle_chat_suggest_next(params: dict | None, ctx: RpcContext) -> dict:
+    """The user's likely next prompt, for the chat input's ghost text.
+
+    Clients call this after a turn ends. ``{"text": null}`` means "show
+    nothing": the feature is off, the turn did not finish with a reply, or
+    the model had nothing useful to say.
+    """
+    raw_params = params if isinstance(params, dict) else {}
+    sessions_cfg = getattr(getattr(ctx, "config", None), "sessions", None)
+    if sessions_cfg is not None and not getattr(sessions_cfg, "suggest_next", True):
+        return {"text": None}
+    if ctx.session_manager is None:
+        return {"text": None}
+    from agentos.gateway.session_suggester import TASK, suggester_for
+    from agentos.gateway.session_titler import fast_model_hint
+
+    session_key = _canonical_webchat_session_key(raw_params.get("sessionKey"))
+    timeout = float(getattr(sessions_cfg, "suggest_next_timeout_seconds", 15.0) or 15.0)
+    suggester = suggester_for(
+        ctx.session_manager,
+        timeout=timeout,
+        hint=fast_model_hint(getattr(ctx, "config", None), task=TASK),
+    )
+    return {"text": await suggester.suggest(session_key)}
+
+
 @_d.method("chat.abort")
 async def _handle_chat_abort(params: dict | None, ctx: RpcContext) -> dict:
     raw_params = params or {}

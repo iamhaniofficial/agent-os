@@ -69,16 +69,15 @@ def _value(obj: Any, key: str, default: Any = None) -> Any:
     return getattr(obj, key, default)
 
 
-def fast_model_hint(config: Any) -> ModelHint:
+def fast_model_hint(config: Any, *, task: str = TASK) -> ModelHint:
     """(provider, model) of the router's cheapest text tier, or ("", "").
 
     Offered to the auxiliary client as a hint, not a decision: an explicit
-    ``[auxiliary.tasks.session_title]`` or ``AGENTOS_SESSION_TITLE_*`` still
-    outranks it, so the hint is withheld when the scope is pinned by env.
+    ``[auxiliary.tasks.<task>]`` or ``AGENTOS_<TASK>_*`` still outranks it,
+    so the hint is withheld when the task's scope is pinned by env.
     """
-    if os.environ.get("AGENTOS_SESSION_TITLE_MODEL") or os.environ.get(
-        "AGENTOS_SESSION_TITLE_PROVIDER"
-    ):
+    env = f"AGENTOS_{task.upper()}"
+    if os.environ.get(f"{env}_MODEL") or os.environ.get(f"{env}_PROVIDER"):
         return "", ""
     router = _value(config, "agentos_router")
     tiers = _value(router, "tiers", {})

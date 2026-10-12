@@ -55,6 +55,12 @@ class TerminalOutputHandle:
     async def clear_screen(self) -> None:
         await self._source.clear_screen()
 
+    def set_suggestion(self, text: str | None) -> None:
+        """Ghost-text next prompt over the empty input; ``None`` hides it."""
+        setter = getattr(self._source, "set_next_prompt_suggestion", None)
+        if callable(setter):
+            setter(text)
+
 
 class TerminalSurface:
     """Adapter exposing `InteractiveSessionHandle` through `TuiSurface`."""

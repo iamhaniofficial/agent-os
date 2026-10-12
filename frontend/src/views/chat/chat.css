@@ -1299,6 +1299,20 @@
 .chat-composer__input::placeholder {
   color: var(--dim);
 }
+/* The key that takes the suggested next prompt, shown while it is the placeholder. */
+.chat-composer__suggestion-key {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: 1px 6px;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  line-height: 1.4;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  pointer-events: none;
+  user-select: none;
+}
 /* iOS forces a 16px input font to prevent auto-zoom (chat.js:2192-2200). */
 @media (max-width: 480px) {
   .chat-composer__input {

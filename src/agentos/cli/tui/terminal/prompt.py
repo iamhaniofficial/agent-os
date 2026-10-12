@@ -544,6 +544,9 @@ class InteractiveSessionHandle:
     def emit_eof(self) -> None:
         self._chat_app._emit_eof()
 
+    def set_next_prompt_suggestion(self, text: str | None) -> None:
+        self._chat_app.set_next_prompt_suggestion(text)
+
     def invalidate(self) -> None:
         try:
             self._chat_app.application.invalidate()
