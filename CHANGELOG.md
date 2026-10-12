@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Desktop and web console: code blocks in chat were washed out on the light
+  theme. The shared markdown renderer always loads highlight.js's
+  `github-dark` token colors, so on the light theme's white panel plain code
+  and strings fell to about 1.5:1 contrast. The light theme now swaps in
+  GitHub's light token palette, the desktop draws plain code in the theme
+  foreground, and the web console gives light-theme code blocks a near-white
+  panel instead of the dark-mode gray mix.
+
 ## [2026.10.11] - 2026-10-11
 
 ### Fixed
