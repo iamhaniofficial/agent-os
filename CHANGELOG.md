@@ -14,6 +14,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   GitHub's light token palette, the desktop draws plain code in the theme
   foreground, and the web console gives light-theme code blocks a near-white
   panel instead of the dark-mode gray mix.
+- Desktop: compact dollar figures (Markets liquidity, TVL, compact balances)
+  read "$131.0K" under Node 22 and "$131K" under Node 24, because the
+  compact currency formatters left `minimumFractionDigits` to the engine's
+  default. Both now pin it to 0, so round figures print without a trailing
+  `.0` everywhere and the desktop test suite passes on either Node.
 
 ## [2026.10.11] - 2026-10-11
 

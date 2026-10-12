@@ -92,6 +92,9 @@ const usdCompact = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
   notation: 'compact',
+  // Pinned: V8 in Node 22 defaults the minimum to 1 here ("$131.0K"),
+  // Node 24 to 0 ("$131K").
+  minimumFractionDigits: 0,
   maximumFractionDigits: 1,
 })
 
