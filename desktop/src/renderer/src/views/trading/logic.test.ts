@@ -141,6 +141,7 @@ describe('formatting', () => {
     expect(formatUsd(null)).toBe('—')
     expect(formatUsd(0.004123)).toBe('$0.004123')
     expect(formatUsd(1_250_000, { compact: true })).toBe('$1.3M')
+    expect(formatUsd(3_000_000, { compact: true })).toBe('$3M')
   })
   it('formats percentages', () => {
     expect(formatPct(3.21, { signed: true })).toBe('+3.21%')

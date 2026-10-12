@@ -464,7 +464,7 @@ describe('Markets · a symbol several tokens share', () => {
     expect(items[0]!.querySelector('.mac-menu__label')).toHaveTextContent(/^Artificial Inu$/)
     expect(items[0]!.querySelector('.mac-menu__detail')).toHaveTextContent('AI · 0x2e8c…1e18')
     expect(within(items[0]!).getByTestId('markets-match-liquidity')).toHaveTextContent(
-      'Liquidity$131.0K',
+      'Liquidity$131K',
     )
     expect(items[1]!.querySelector('.mac-menu__label')).toHaveTextContent(/^AI PIN$/)
     expect(items[1]!.querySelector('.mac-menu__detail')).toHaveTextContent('AI · 0x5555…5555')

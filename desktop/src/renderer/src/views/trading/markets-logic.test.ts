@@ -86,6 +86,9 @@ describe('markets-logic · words a row wears', () => {
     expect(formatUsdShort(4_732_293)).toBe('$4.7M')
     expect(formatUsdShort(842_113)).toBe('$842.1K')
     expect(formatUsdShort(12_345)).toBe('$12.3K')
+    // A round figure keeps no trailing zero on every Node: 22 used to print "$131.0K".
+    expect(formatUsdShort(131_000)).toBe('$131K')
+    expect(formatUsdShort(2_000_000)).toBe('$2M')
     expect(formatUsdShort(950)).toBe('$950.00')
     expect(formatUsdShort(null)).toBe('—')
   })
