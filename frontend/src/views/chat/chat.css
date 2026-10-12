@@ -529,6 +529,78 @@
   line-height: 1.55;
   white-space: pre;
 }
+/* github-dark (imported by markdown.ts) assumes a dark panel. On the light
+   theme the panel above mixes to a mid gray where those token colors fade out,
+   so light swaps in a near-white panel and GitHub's light token palette. */
+:root[data-theme='light'] .msg .code-block pre {
+  background: color-mix(in srgb, var(--background) 40%, #fff);
+}
+:root[data-theme='light'] .msg .code-block .hljs-doctag,
+:root[data-theme='light'] .msg .code-block .hljs-keyword,
+:root[data-theme='light'] .msg .code-block .hljs-meta .hljs-keyword,
+:root[data-theme='light'] .msg .code-block .hljs-template-tag,
+:root[data-theme='light'] .msg .code-block .hljs-template-variable,
+:root[data-theme='light'] .msg .code-block .hljs-type,
+:root[data-theme='light'] .msg .code-block .hljs-variable.language_ {
+  color: #d73a49;
+}
+:root[data-theme='light'] .msg .code-block .hljs-title,
+:root[data-theme='light'] .msg .code-block .hljs-title.class_,
+:root[data-theme='light'] .msg .code-block .hljs-title.class_.inherited__,
+:root[data-theme='light'] .msg .code-block .hljs-title.function_ {
+  color: #6f42c1;
+}
+:root[data-theme='light'] .msg .code-block .hljs-attr,
+:root[data-theme='light'] .msg .code-block .hljs-attribute,
+:root[data-theme='light'] .msg .code-block .hljs-literal,
+:root[data-theme='light'] .msg .code-block .hljs-meta,
+:root[data-theme='light'] .msg .code-block .hljs-number,
+:root[data-theme='light'] .msg .code-block .hljs-operator,
+:root[data-theme='light'] .msg .code-block .hljs-variable,
+:root[data-theme='light'] .msg .code-block .hljs-selector-attr,
+:root[data-theme='light'] .msg .code-block .hljs-selector-class,
+:root[data-theme='light'] .msg .code-block .hljs-selector-id {
+  color: #005cc5;
+}
+:root[data-theme='light'] .msg .code-block .hljs-regexp,
+:root[data-theme='light'] .msg .code-block .hljs-string,
+:root[data-theme='light'] .msg .code-block .hljs-meta .hljs-string {
+  color: #032f62;
+}
+:root[data-theme='light'] .msg .code-block .hljs-built_in,
+:root[data-theme='light'] .msg .code-block .hljs-symbol {
+  color: #e36209;
+}
+:root[data-theme='light'] .msg .code-block .hljs-comment,
+:root[data-theme='light'] .msg .code-block .hljs-code,
+:root[data-theme='light'] .msg .code-block .hljs-formula {
+  color: #6a737d;
+}
+:root[data-theme='light'] .msg .code-block .hljs-name,
+:root[data-theme='light'] .msg .code-block .hljs-quote,
+:root[data-theme='light'] .msg .code-block .hljs-selector-tag,
+:root[data-theme='light'] .msg .code-block .hljs-selector-pseudo {
+  color: #22863a;
+}
+:root[data-theme='light'] .msg .code-block .hljs-subst,
+:root[data-theme='light'] .msg .code-block .hljs-emphasis,
+:root[data-theme='light'] .msg .code-block .hljs-strong {
+  color: var(--foreground);
+}
+:root[data-theme='light'] .msg .code-block .hljs-section {
+  color: #005cc5;
+}
+:root[data-theme='light'] .msg .code-block .hljs-bullet {
+  color: #735c0f;
+}
+:root[data-theme='light'] .msg .code-block .hljs-addition {
+  color: #22863a;
+  background-color: #f0fff4;
+}
+:root[data-theme='light'] .msg .code-block .hljs-deletion {
+  color: #b31d28;
+  background-color: #ffeef0;
+}
 .msg .inline-code,
 .msg .math-raw {
   padding: 1px 4px;
