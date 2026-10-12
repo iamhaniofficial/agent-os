@@ -926,6 +926,20 @@
   .composer textarea::placeholder {
     color: var(--dim);
   }
+  /* The key that takes the suggested next prompt, shown while it is the placeholder. */
+  .composer-suggestion-key {
+    flex-shrink: 0;
+    align-self: center;
+    padding: 1px 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--dim);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    pointer-events: none;
+    user-select: none;
+  }
   .composer-send {
     display: inline-flex;
     flex-shrink: 0;

@@ -403,3 +403,55 @@ describe('Composer', () => {
     expect(trigger).toHaveFocus()
   })
 })
+
+describe('Composer · suggested next prompt', () => {
+  const tab = (init: Partial<KeyboardEventInit> = {}) =>
+    fireEvent.keyDown(textbox(), { key: 'Tab', ...init })
+
+  it('shows the suggestion as the placeholder while the input is empty', () => {
+    render(<Composer onSend={() => {}} busy={false} suggestion="Now add tests" />)
+    expect(textbox()).toHaveAttribute('placeholder', 'Now add tests')
+    expect(textbox()).toHaveAttribute('aria-keyshortcuts', 'Tab')
+    expect(screen.getByTestId('composer-suggestion-key')).toHaveTextContent('Tab')
+
+    fireEvent.change(textbox(), { target: { value: 'something else' } })
+    expect(screen.queryByTestId('composer-suggestion-key')).toBeNull()
+  })
+
+  it('keeps the normal placeholder without a suggestion', () => {
+    render(<Composer onSend={() => {}} busy={false} suggestion={null} />)
+    expect(textbox().getAttribute('placeholder')).not.toBe('')
+    expect(textbox()).not.toHaveAttribute('aria-keyshortcuts')
+    expect(screen.queryByTestId('composer-suggestion-key')).toBeNull()
+  })
+
+  it('Tab fills the suggestion, then Enter sends it', () => {
+    const onSend = vi.fn()
+    render(<Composer onSend={onSend} busy={false} suggestion="Now add tests" />)
+
+    expect(tab()).toBe(false) // preventDefault → keydown not "allowed"
+    expect(textbox().value).toBe('Now add tests')
+
+    fireEvent.keyDown(textbox(), { key: 'Enter' })
+    expect(onSend).toHaveBeenCalledWith('Now add tests')
+  })
+
+  it('leaves Tab alone when the input has text or there is no suggestion', () => {
+    const { rerender } = render(<Composer onSend={() => {}} busy={false} suggestion="Ship it" />)
+    fireEvent.change(textbox(), { target: { value: 'my own words' } })
+    expect(tab()).toBe(true)
+    expect(textbox().value).toBe('my own words')
+
+    rerender(<Composer onSend={() => {}} busy={false} suggestion={null} />)
+    fireEvent.change(textbox(), { target: { value: '' } })
+    expect(tab()).toBe(true)
+    expect(textbox().value).toBe('')
+  })
+
+  it('leaves Shift+Tab and modified Tab to the browser', () => {
+    render(<Composer onSend={() => {}} busy={false} suggestion="Ship it" />)
+    expect(tab({ shiftKey: true })).toBe(true)
+    expect(tab({ ctrlKey: true })).toBe(true)
+    expect(textbox().value).toBe('')
+  })
+})

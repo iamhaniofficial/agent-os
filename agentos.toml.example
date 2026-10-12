@@ -556,11 +556,22 @@ enabled = true
 # model = ""
 # timeout_seconds = 120.0
 
-# Per-task overrides. Tasks in use: "document" (analysing an attached file) and
-# "vision" (describing an image). A task with a capability requirement wants its
-# own entry — vision needs a model that can actually see an image.
+# Per-task overrides. Tasks in use: "document" (analysing an attached file),
+# "vision" (describing an image), "session_title" (naming a new session) and
+# "suggest_next" (the chat input's suggested next prompt). A task with a
+# capability requirement wants its own entry — vision needs a model that can
+# actually see an image.
 # [auxiliary.tasks.vision]
 # model = "openai/gpt-4o-mini"
+
+[sessions]
+# Name a new session from its first message (auxiliary task "session_title").
+# auto_title = true
+# auto_title_timeout_seconds = 30.0
+# After each turn, offer the likely next prompt as grey text in the chat input;
+# Tab takes it, Enter sends it (auxiliary task "suggest_next").
+# suggest_next = true
+# suggest_next_timeout_seconds = 15.0
 
 [sandbox]
 # Per-command ephemeral sandbox + security grading.

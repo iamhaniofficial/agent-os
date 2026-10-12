@@ -25,6 +25,7 @@ import { RoutePicker } from '@/views/chat/RoutePicker'
 import { SlashMenu, type SlashMenuHandle } from '@/views/chat/SlashMenu'
 import { Toolbar as RunModes } from '@/views/chat/Toolbar'
 import { useApprovalPending } from '@/views/chat/useApprovalPending'
+import { useNextSuggestion } from '@/views/chat/useNextSuggestion'
 import { usePendingQueue, type PendingComposerBridge } from '@/views/chat/usePendingQueue'
 import { useRoutePin } from '@/views/chat/useRoutePin'
 import { useSlashCommands } from '@/views/chat/useSlashCommands'
@@ -377,6 +378,8 @@ function ConnectedChat({
     onMarketsSwap,
   })
   const attachments = useAttachments()
+  // Ghost-text next prompt in the composer, asked for when a turn ends.
+  const nextSuggestion = useNextSuggestion(rpc, sessionKey, busy)
   useEffect(() => {
     if (desk) ledger.bind(containerRef.current)
     else ledger.unbind()
@@ -588,6 +591,16 @@ function ConnectedChat({
       navigate,
       sessionKey,
     ],
+  )
+
+  // Sending anything retires the suggestion, even a send queued behind a turn.
+  const clearSuggestion = nextSuggestion.clear
+  const onSendClearingSuggestion = useCallback(
+    (text: string) => {
+      clearSuggestion()
+      void onComposerSend(text)
+    },
+    [clearSuggestion, onComposerSend],
   )
 
   useEffect(() => {
@@ -951,7 +964,8 @@ function ConnectedChat({
             />
             <Composer
               enterToSend={enterToSend}
-              onSend={onComposerSend}
+              onSend={onSendClearingSuggestion}
+              suggestion={nextSuggestion.suggestion}
               onValueChange={setComposerValue}
               onSlashKeyDown={onSlashKeyDown}
               composerRef={composerHandleRef}

@@ -1593,6 +1593,11 @@ class SessionsConfig(BaseSettings):
     #: ``[auxiliary.tasks.session_title]`` or ``AGENTOS_SESSION_TITLE_MODEL``).
     auto_title: bool = True
     auto_title_timeout_seconds: float = Field(default=30.0, gt=0)
+    #: Offer a suggested next prompt as ghost text once a turn finishes
+    #: (``chat.suggestNext``; task ``suggest_next``, override the model with
+    #: ``[auxiliary.tasks.suggest_next]`` or ``AGENTOS_SUGGEST_NEXT_MODEL``).
+    suggest_next: bool = True
+    suggest_next_timeout_seconds: float = Field(default=15.0, gt=0)
 
 
 class MCPServerEntry(BaseSettings):

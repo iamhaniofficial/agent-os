@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- Suggested next prompt. When a turn finishes, the chat input in the web
+  console, the desktop app and `agentos chat` shows the message the user is
+  most likely to send next as grey placeholder text; `Tab` takes it into the
+  input and `Enter` sends it. Clients ask for it through the new
+  `chat.suggestNext` RPC, answered by the auxiliary model (task
+  `suggest_next`, preferring the router's cheapest text tier) from the last
+  exchange. Errored or aborted turns get none and cost no call, and answers
+  are cached per reply so clients sharing a session share one call. On by
+  default; `[sessions] suggest_next = false` turns it off.
+
 ### Fixed
 - Desktop and web console: code blocks in chat were washed out on the light
   theme. The shared markdown renderer always loads highlight.js's

@@ -12,6 +12,7 @@ import '@/i18n/en/chat'
 // the element it has to be bound to.
 const COMPOSER_SHORTCUTS = [
   { combo: 'enter', description: 'Send the message' },
+  { combo: 'tab', description: 'Take the suggested next prompt into an empty composer' },
   { combo: 'shift+enter', description: 'Insert a newline' },
   {
     combo: 'escape',
@@ -160,6 +161,11 @@ export interface ComposerProps {
   onPopPendingTail?: () => void
   /** Alt+↓ — enqueue the current composer text (chat.js:2464). */
   onEnqueueCurrent?: () => void
+  /**
+   * The suggested next prompt (`chat.suggestNext`). Shown as the placeholder
+   * while the composer is empty; Tab takes it into the input, Enter sends it.
+   */
+  suggestion?: string | null
 }
 
 export function Composer({
@@ -185,6 +191,7 @@ export function Composer({
   onRecoverPending,
   onPopPendingTail,
   onEnqueueCurrent,
+  suggestion = null,
 }: ComposerProps) {
   const [value, setValue] = useState('')
   const [toolbarOpen, setToolbarOpen] = useState(false)
@@ -364,6 +371,24 @@ export function Composer({
       // the open menu). When it consumes the key the composer does nothing else.
       if (onSlashKeyDown?.(e)) return
 
+      // Tab takes the suggested next prompt — only into an empty composer and
+      // only bare Tab, so Shift+Tab and Tab past a draft still move focus.
+      if (
+        e.key === 'Tab' &&
+        suggestion &&
+        !textareaRef.current?.value &&
+        !e.shiftKey &&
+        !e.altKey &&
+        !e.ctrlKey &&
+        !e.metaKey
+      ) {
+        e.preventDefault()
+        setProgrammatic(suggestion)
+        historyIdxRef.current = null
+        historyDraftRef.current = ''
+        return
+      }
+
       // ESC priority chain (chat.js:2530-2538 doc-level + 2449 textarea):
       //   1. streaming        → abort the turn (chat.js:2530-2533 `_onStop`; the
       //      stop path itself recovers pending, so the recover rung is skipped).
@@ -445,6 +470,7 @@ export function Composer({
     [
       busy,
       onAbort,
+      suggestion,
       cycleHistory,
       doSend,
       setProgrammatic,
@@ -470,6 +496,8 @@ export function Composer({
     [autoResize, onValueChange],
   )
 
+  // The suggestion stands in for the placeholder only over an empty composer.
+  const showSuggestion = Boolean(suggestion) && !value
   const { disabled: sendDisabled, label: sendLabel } = sendButtonState(
     value,
     busy,
@@ -575,7 +603,8 @@ export function Composer({
           value={value}
           onChange={onChange}
           onKeyDown={onKeyDown}
-          placeholder={t('chat.messagePlaceholder')}
+          placeholder={(showSuggestion && suggestion) || t('chat.messagePlaceholder')}
+          aria-keyshortcuts={showSuggestion ? 'Tab' : undefined}
           rows={1}
           aria-label={t('chat.messageLabel')}
           aria-autocomplete={slashListboxId ? 'list' : undefined}
@@ -583,6 +612,16 @@ export function Composer({
           aria-controls={slashActiveDescendant ? slashListboxId : undefined}
           aria-activedescendant={slashActiveDescendant}
         />
+        {showSuggestion ? (
+          <kbd
+            className="chat-composer__suggestion-key"
+            data-testid="composer-suggestion-key"
+            title={t('chat.suggestionKeyTitle')}
+            aria-hidden="true"
+          >
+            {t('chat.suggestionKey')}
+          </kbd>
+        ) : null}
         {routePicker}
         {busy ? (
           <button

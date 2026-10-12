@@ -24,6 +24,8 @@ export const shell = {
   'toolbar.settings': 'Settings',
 
   'composer.placeholder': 'Start with a goal',
+  'composer.suggestionKey': 'Tab',
+  'composer.suggestionKeyTitle': 'Press Tab to use the suggested prompt',
   'composer.attach': 'Attach files',
   'composer.route': 'Model route',
   'composer.runModes': 'Run modes',

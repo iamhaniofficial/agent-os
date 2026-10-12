@@ -140,6 +140,60 @@ class GatewayRuntimeDependencies:
     notify: Callable[[GatewayRuntimeNotice], None]
 
 
+class _NextPromptSuggestion:
+    """Fetches the suggested next prompt (``chat.suggestNext``) after a turn.
+
+    Runs in the background so the prompt comes back at once; the ghost text
+    appears when the answer lands. Any new input retires the suggestion and
+    makes an answer still on its way stale. An output handle without
+    ``set_suggestion``, a client without ``call``, or an RPC error (an older
+    gateway) all mean no suggestion.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self._generation = 0
+        self._task: asyncio.Task[None] | None = None
+
+    @staticmethod
+    def _setter(output: object | None) -> Callable[[str | None], None] | None:
+        setter = getattr(output, "set_suggestion", None)
+        return setter if callable(setter) else None
+
+    def retire(self, output: object | None) -> None:
+        self.cancel()
+        setter = self._setter(output)
+        if setter is not None:
+            setter(None)
+
+    def cancel(self) -> None:
+        self._generation += 1
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        self._task = None
+
+    def ask(self, session_key: str, output: object | None) -> None:
+        setter = self._setter(output)
+        call = getattr(self._client, "call", None)
+        if setter is None or not callable(call):
+            return
+        self.cancel()
+        generation = self._generation
+
+        async def _ask() -> None:
+            try:
+                result = await call("chat.suggestNext", {"sessionKey": session_key})
+            except Exception:  # noqa: BLE001 - no suggestion is the fallback
+                return
+            if generation != self._generation:
+                return
+            text = result.get("text") if isinstance(result, dict) else None
+            if isinstance(text, str) and text.strip():
+                setter(text)
+
+        self._task = asyncio.create_task(_ask())
+
+
 async def run_gateway_chat(
     *,
     model: str | None,
@@ -154,6 +208,7 @@ async def run_gateway_chat(
     await client.connect(default_gateway_url(), token=default_gateway_token())
 
     elevated_state: dict[str, str | None] = {"mode": None}
+    suggestion = _NextPromptSuggestion(client)
 
     try:
         if session_id:
@@ -206,6 +261,7 @@ async def run_gateway_chat(
             stripped = user_input.strip()
             if not stripped:
                 return True
+            suggestion.retire(deps.get_tui_output(session_context.scope))
 
             if stripped.startswith("/"):
                 try:
@@ -246,6 +302,7 @@ async def run_gateway_chat(
             session_context.state.transcript.add("assistant", result.text)
             session_context.state.usage.apply(result.usage)
             session_context.sync_from_state()
+            suggestion.ask(turn_session_key, deps.get_tui_output(session_context.scope))
             return True
 
         def _abort_active_turn() -> Awaitable[None]:
@@ -266,4 +323,5 @@ async def run_gateway_chat(
             abort_active_turn=_abort_active_turn,
         )
     finally:
+        suggestion.cancel()
         await client.close()
