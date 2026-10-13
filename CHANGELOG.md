@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [2026.10.13] - 2026-10-13
+
 ### Added
 - Suggested next prompt. When a turn finishes, the chat input in the web
   console, the desktop app and `agentos chat` shows the message the user is
