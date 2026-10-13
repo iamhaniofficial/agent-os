@@ -337,7 +337,8 @@ def test_incomplete_tool_stream_retries_only_once(monkeypatch: pytest.MonkeyPatc
     error = events[-1]
     assert isinstance(error, ErrorEvent)
     assert error.code == INCOMPLETE_TOOL_STREAM_CODE
-    assert "read_file" in error.message
+    # Tool names are model/MCP-supplied text: logged, never in the error text.
+    assert "read_file" not in error.message
     kind = classify_provider_error("anthropic", None, error.code, error.message)
     assert decide_recovery_action(kind) is ProviderRecoveryAction.SURFACE
 
@@ -420,3 +421,170 @@ def test_openai_complete_stream_without_done_marker_is_unchanged(
     assert len(server.requests) == 1
     assert [e.arguments for e in events if isinstance(e, ToolUseEndEvent)] == [{"path": "a"}]
     assert isinstance(events[-1], DoneEvent)
+
+
+# --- tool names never steer the engine's error-text fallbacks ---------------
+
+
+def _cut_named_tool(name: str, *, after_text: bool) -> bytes:
+    start = {
+        "type": "content_block_start",
+        "index": 1,
+        "content_block": {"type": "tool_use", "id": "toolu_x", "name": name, "input": {}},
+    }
+    prefix = _TEXT if after_text else ()
+    return _sse(_START, *prefix, start, _json_delta('{"thou'))
+
+
+@pytest.mark.parametrize("after_text", [True, False])
+def test_stream_guard_error_text_never_carries_tool_names(after_text: bool) -> None:
+    from agentos.provider.transport import guard_tool_stream
+
+    async def cut() -> AsyncIterator[Any]:
+        if after_text:
+            yield TextDeltaEvent(text="Let me think")
+        yield ToolUseStartEvent(tool_use_id="t1", tool_name="mcp_reasoning_sequentialthinking")
+        yield ToolUseDeltaEvent(tool_use_id="t1", json_fragment='{"thou')
+
+    async def run() -> list[Any]:
+        return [e async for e in guard_tool_stream(cut, provider="p", model="m")]
+
+    error = asyncio.run(run())[-1]
+
+    assert isinstance(error, ErrorEvent)
+    assert "thinking" not in error.message.lower()
+    assert "reasoning" not in error.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_cut_thinking_named_tool_does_not_trigger_the_thinking_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An MCP tool called ``sequentialthinking`` cut mid-stream after text must
+    not make the engine disable thinking and re-stream text already shown."""
+    from agentos.engine import Agent, AgentConfig
+
+    server = _Server(
+        [_cut_named_tool("sequentialthinking", after_text=True)] * 3, default=_END_TURN
+    )
+    server.install(monkeypatch)
+    agent = Agent(
+        provider=AnthropicProvider(api_key="k", model="claude-opus-5-5"),
+        config=AgentConfig(
+            thinking=True, max_provider_retries=2, retry_base_backoff_ms=0, retry_max_backoff_ms=0
+        ),
+    )
+    tools = [
+        ToolDefinition(
+            name="sequentialthinking",
+            description="Think step by step.",
+            input_schema=ToolInputSchema(properties={"thought": {"type": "string"}}),
+        )
+    ]
+    agent.tool_definitions = tools  # type: ignore[misc]
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(server.requests) == 1
+    texts = [e.text for e in events if getattr(e, "kind", "") == "text_delta"]
+    assert texts == ["Let me"]
+    assert not any(
+        getattr(e, "kind", "") == "warning" and "thinking" in (getattr(e, "code", "") or "")
+        for e in events
+    )
+
+
+# --- router judge: per-call loops must not leak sockets ---------------------
+
+
+def _judge_sse() -> bytes:
+    arguments = json.dumps({"route_class": "R1", "confidence": 0.9, "reason": "test"})
+    chunks = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "function": {"name": "emit_route", "arguments": arguments},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    # No ``[DONE]``: the body is read to its end, so the connection goes back
+    # to the pool open (keep-alive) instead of being closed by an early break.
+    return b"".join(f"data: {json.dumps(c)}\n\n".encode() for c in chunks)
+
+
+def test_router_judge_on_per_call_loops_leaks_no_sockets() -> None:
+    """The judge pattern: one provider, a fresh ``asyncio.run`` per turn, real
+    sockets. Every client must be closed on its own loop: no ResourceWarning."""
+    import gc
+    import threading
+    import warnings
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from types import SimpleNamespace
+
+    from agentos.agentos_router.llm_judge import LLMJudgeStrategy
+
+    body = _judge_sse()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:  # noqa: N802 - http.server API
+            length = int(self.headers.get("content-length") or 0)
+            self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: Any) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}/v1"
+    try:
+        router_cfg = SimpleNamespace(
+            tiers={},
+            default_tier="c1",
+            judge_model="local-judge",
+            judge_base_url=base_url,
+            judge_api_key="local",
+            judge_short_circuit_enabled=False,
+            routing_timeout_seconds=15.0,
+        )
+        llm_cfg = SimpleNamespace(provider="", api_key="", api_key_env="", base_url="")
+        strategy = LLMJudgeStrategy(
+            router_cfg=router_cfg,
+            llm_cfg=llm_cfg,
+            provider_factory=lambda _p, model, key, url: OpenAIProvider(
+                api_key=key or "local", model=model, base_url=url or base_url
+            ),
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            results = [
+                asyncio.run(strategy.classify("refactor the parser", ["c0", "c1", "c2", "c3"]))
+                for _ in range(3)
+            ]
+            del strategy
+            gc.collect()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [source for _tier, _conf, source, _extra in results] == ["llm_judge"] * 3
+    leaks = [w for w in caught if issubclass(w.category, ResourceWarning)]
+    assert leaks == [], [str(w.message) for w in leaks]

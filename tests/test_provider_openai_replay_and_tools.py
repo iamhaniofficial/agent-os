@@ -51,13 +51,15 @@ class _Recorder:
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
 
 
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
 def _install(monkeypatch: pytest.MonkeyPatch, recorder: _Recorder) -> None:
     transport = httpx.MockTransport(recorder.handler)
-    real_async_client = httpx.AsyncClient
 
     def patched(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
         kwargs["transport"] = transport
-        return real_async_client(*args, **kwargs)
+        return _REAL_ASYNC_CLIENT(*args, **kwargs)
 
     monkeypatch.setattr("agentos.provider.openai.httpx.AsyncClient", patched)
 
@@ -226,6 +228,81 @@ def test_openrouter_reasoning_details_round_trip_verbatim(
     assert "reasoning_content" not in replayed
 
 
+_CLAUDE_DETAILS = [
+    {
+        "type": "reasoning.text",
+        "text": "t",
+        "signature": "claude-sig",
+        "index": 0,
+        "format": "anthropic-claude-v1",
+    }
+]
+
+
+def _replayed_assistant(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    details: list[dict[str, Any]],
+    caps: ModelCapabilities | None = _OPENROUTER_CAPS,
+) -> dict[str, Any]:
+    recorder = _Recorder()
+    _install(monkeypatch, recorder)
+    assistant = Message(
+        role="assistant",
+        content=[ContentBlockToolUse(id="call_1", name="read_file", input={"path": "a"})],
+        reasoning_content="t",
+        reasoning_details=details,
+    )
+    result = Message(
+        role="user", content=[ContentBlockToolResult(tool_use_id="call_1", content="A")]
+    )
+    _collect(
+        _openrouter(model),
+        [Message(role="user", content="a"), assistant, result],
+        ChatConfig(model_capabilities=caps),
+        [_TOOL],
+    )
+    return recorder.payloads[0]["messages"][1]
+
+
+def test_reasoning_details_replay_to_the_same_family(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent = _replayed_assistant(monkeypatch, "anthropic/claude-sonnet-5.5", _CLAUDE_DETAILS)
+
+    assert sent["reasoning_details"] == _CLAUDE_DETAILS
+
+
+def test_reasoning_details_are_dropped_after_a_model_family_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A router or /model switch must not hand Claude's signed blocks to GPT."""
+    to_gpt = _replayed_assistant(monkeypatch, "openai/gpt-6-luna", _CLAUDE_DETAILS)
+    to_glm = _replayed_assistant(monkeypatch, "z-ai/glm-5.3", _CLAUDE_DETAILS)
+    glm_details = [{"type": "reasoning.text", "text": "t", "index": 0, "format": "unknown"}]
+    glm_to_claude = _replayed_assistant(monkeypatch, "anthropic/claude-opus-5.5", glm_details)
+    glm_to_glm = _replayed_assistant(monkeypatch, "z-ai/glm-5.3", glm_details)
+    mixed = _replayed_assistant(
+        monkeypatch,
+        "anthropic/claude-opus-5.5",
+        [*_CLAUDE_DETAILS, {"type": "reasoning.encrypted", "data": "X", "format": "openai-v1"}],
+    )
+
+    for sent in (to_gpt, to_glm, glm_to_claude, mixed):
+        assert "reasoning_details" not in sent
+        assert "claude-sig" not in json.dumps(sent)
+    assert glm_to_glm["reasoning_details"] == glm_details
+
+
+def test_reasoning_details_respect_the_reasoning_replay_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent = _replayed_assistant(
+        monkeypatch, "anthropic/claude-opus-5.5", _CLAUDE_DETAILS, caps=ModelCapabilities()
+    )
+
+    assert "reasoning_details" not in sent
+    assert "reasoning_content" not in sent
+
+
 def test_reasoning_details_are_not_sent_to_other_openai_compatible_upstreams(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -258,7 +335,14 @@ def test_consecutive_requests_share_a_byte_identical_prefix(
         Message(
             role="assistant",
             content=[ContentBlockToolUse(id="call_1", name="read_file", input={"path": "a"})],
-            reasoning_details=[{"type": "reasoning.encrypted", "data": "X", "index": 0}],
+            reasoning_details=[
+                {
+                    "type": "reasoning.encrypted",
+                    "data": "X",
+                    "index": 0,
+                    "format": "openai-responses-v1",
+                }
+            ],
         ),
         Message(role="user", content=[ContentBlockToolResult(tool_use_id="call_1", content="A")]),
     ]
