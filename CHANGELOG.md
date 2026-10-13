@@ -112,9 +112,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `provider_request_too_large` only if the provider then refuses it. The result is always one summary exchange followed by the
   current turn verbatim (images, per-block thinking and tool pairs kept);
   only when the current turn alone does not fit are its oldest complete tool
-  rounds folded in. The summarizer goes through the session's `LLMProvider`
-  (manual `/compact` included) instead of raw HTTP to an OpenAI-shaped
-  endpoint, falling back to a deterministic digest. A durable checkpoint is
+  rounds folded in. The in-turn summary is an auxiliary side task
+  (`compaction`: `[auxiliary.tasks.compaction]`, else the router's cheapest
+  text tier, else `[auxiliary]` / `[llm]`), with no thinking and bounded by
+  `[compaction] summary_timeout_seconds` (45 s); a timeout or failure falls
+  back to a deterministic digest and logs its error type. A compaction that
+  would take less than 10% off the request is not applied -- no durable
+  rewrite, one `compaction.declined` log line, the request goes out as is,
+  and the turn does not retry it at about the same size. Manual `/compact`
+  summarizes through the session's `LLMProvider` instead of raw HTTP. A durable checkpoint is
   recorded before any compaction rewrites stored rows; subagent and cron
   sessions (canonical `agent:<id>:subagent:<run>` keys included) skip it.
 

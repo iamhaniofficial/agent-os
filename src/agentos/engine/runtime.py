@@ -3019,6 +3019,7 @@ class TurnRunner:
                 )
                 or 0
             )
+            self._apply_compaction_summary_settings(agent)
 
             # 8. Build extra messages for attachments + turn_input rebind.
             # AttachmentStage owns the slice.
@@ -5472,6 +5473,23 @@ class TurnRunner:
 
     def _flush_receipt_allows_destructive_compaction(self, receipt: Any) -> bool:
         return flush_receipt_allows_destructive_compaction(receipt)
+
+    def _apply_compaction_summary_settings(self, agent: Any) -> None:
+        """Point the in-turn summarizer at the cheap side-task model."""
+        from agentos.gateway.session_titler import fast_model_hint
+
+        compaction_cfg = getattr(self._config, "compaction", None)
+        try:
+            timeout = float(getattr(compaction_cfg, "summary_timeout_seconds", 45.0) or 45.0)
+        except (TypeError, ValueError):
+            timeout = 45.0
+        agent.config.compaction_summary_timeout_seconds = timeout
+        try:
+            agent.config.compaction_summary_model_hint = fast_model_hint(
+                self._config, task="compaction"
+            )
+        except Exception:  # noqa: BLE001 - a hint is optional
+            agent.config.compaction_summary_model_hint = ("", "")
 
     def _preflight_compact_ratio(self) -> float:
         raw_ratio = getattr(self._config, "preflight_compact_ratio", None)

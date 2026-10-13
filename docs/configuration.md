@@ -929,7 +929,9 @@ model = "openai/gpt-4o-mini"
 ```
 
 Point it at something cheap when these tasks do not need your main model. Tasks
-currently in use are `document`, `vision`, `session_title` and `suggest_next`; a task with a
+currently in use are `document`, `vision`, `session_title`, `suggest_next` and
+`compaction` (the in-turn context summary; it defaults to the router's cheapest
+text tier and is bounded by `[compaction] summary_timeout_seconds`); a task with a
 capability requirement wants its own entry, since a text-only model cannot
 describe an image.
 
