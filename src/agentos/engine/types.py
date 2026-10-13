@@ -313,6 +313,10 @@ class AgentConfig:
     context_overflow_threshold: float = 0.85  # trigger at 85%
     max_overflow_retries: int = 2
     max_history_turns: int = 0  # 0 = unlimited; compaction handles oversized history
+    # Tool results / tool-call arguments over this many chars are shortened to
+    # head/tail + store handle when their turn ends ([compaction]
+    # history_tool_result_max_chars). 0 = 2% of the window, clamped 4k-12k.
+    history_tool_result_max_chars: int = 0
     # Retry policy for transient LLM errors (429, 500, 503)
     max_provider_retries: int = 3
     length_capped_continuations: int = 1

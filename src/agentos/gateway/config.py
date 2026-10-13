@@ -1562,6 +1562,11 @@ class CompactionLlmConfig(BaseSettings):
     model: str | None = None  # None = use session model
     timeout_seconds: float = 90.0
     enabled: bool = True
+    # When a turn ends, its tool results and tool-call argument fields longer
+    # than this are shortened to head/tail + the tool-result-store handle for
+    # every later turn (once; earlier turns are never rewritten again).
+    # 0 = 2% of the model's context window in chars, clamped to 4k-12k.
+    history_tool_result_max_chars: int = Field(default=0, ge=0)
 
 
 class AuxiliaryTaskConfig(BaseModel):

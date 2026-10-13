@@ -59,6 +59,7 @@ that take none, an opt-in drop on load) -- never a storage one.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable, Iterable, Sequence
@@ -586,6 +587,47 @@ def has_replay_marker(arguments: dict[str, Any]) -> bool:
         isinstance(value, str) and value.startswith(INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX)
         for value in arguments.values()
     )
+
+
+def history_argument_projection(
+    *,
+    tool_name: str,
+    tool_use_id: str,
+    field_name: str,
+    value: str,
+    handle: str | None,
+    preview_chars: int = 480,
+) -> str:
+    """Head/tail stand-in for a huge tool-call argument of a finished turn.
+
+    It starts with :data:`HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX`, so a
+    model that copies it into a new call is refused (scrubbed to a
+    placeholder), never dispatched.
+    """
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    head_chars = max(1, preview_chars // 2)
+    tail_chars = max(1, preview_chars - head_chars)
+    lines = [
+        HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX.rstrip("\n"),
+        f"tool: {tool_name}",
+        f"tool_use_id: {tool_use_id}",
+        f"field: {field_name}",
+        f"original_chars: {len(value)}",
+        f"sha256: {digest}",
+    ]
+    if handle:
+        lines.append(f"tool_result_handle: {handle}")
+    lines.extend(
+        [
+            "reason: argument of an earlier turn, shortened for history.",
+            "head:",
+            value[:head_chars],
+            "...",
+            "tail:",
+            value[-tail_chars:],
+        ]
+    )
+    return "\n".join(lines)
 
 
 def scrub_tool_use_arguments(block: ContentBlockToolUse) -> ContentBlockToolUse:

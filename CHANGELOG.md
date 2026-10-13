@@ -79,23 +79,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `reasoning_details`, and every tool call/result pair; the next turn replays
   it verbatim. Rows written before keep loading through the old
   reconstruction plus a one-time migration, and the flat display segments are
-  still written for the UI. Nothing rewrites a message after it was sent: an
-  oversized tool result is projected once, before its first request (the full
-  output stays in the tool-result store); the per-request aggregate
-  projection, historical re-projection, argument re-sanitizing and three
-  pairing-repair passes are gone (one pass at load, then only the new
-  messages); the timestamp, skills list and request context are trailing text
-  of the current user turn instead of being spliced in on every request, and
-  the skills list and request context are only repeated when they change.
-  Replayed reasoning is no longer stripped on load except for models whose
-  capabilities say they take none.
+  still written for the UI. Nothing rewrites a message after it was sent,
+  with one bounded exception: an oversized tool result is projected once,
+  before its first request (the full output stays in the tool-result store),
+  and when a turn ends its tool results and tool-call argument fields longer
+  than `[compaction] history_tool_result_max_chars` (default `0` = 2% of the
+  context window, clamped to 4k-12k chars) become head/tail plus the store
+  handle for every later turn -- one cache write for that turn's tail, then
+  byte-stable. The per-request aggregate projection, historical
+  re-projection, argument re-sanitizing and three pairing-repair passes are
+  gone (one pass at load, then only the new messages). The timestamp, skills
+  list and request context are trailing text of the current user turn
+  instead of being spliced in on every request; the request context is
+  diffed per `## <title>` section, so only a changed section (memory recall,
+  internal-event mode, plan mode, ...) is sent again, and session-frozen
+  parts (workspace files, project knowledge, router control) moved into the
+  cached system prompt. A follow-up queued while a turn runs is replayed
+  after that turn. Replayed reasoning is no longer stripped on load except
+  for models whose capabilities say they take none.
 - Engine: one `CompactionService` replaces the five compaction paths
   (in-turn preflight, provider-overflow retry, T3-upgrade, before-turn DB
   preflight, emergency request-scoped trim). It triggers on the live request
-  estimate against `context window x preflight_compact_ratio` (0.85) before
-  every provider call -- the first call of a turn included -- and never while
-  a tool round is open; a provider that still reports an overflow invokes the
-  same service. The result is always one summary exchange followed by the
+  estimate against `context window x preflight_compact_ratio` (0.85), or the
+  provider's own no-rewrite request budget when that is lower, before every
+  provider call -- the first call of a turn included -- and never while a
+  tool round is open; a provider that still reports an overflow invokes the
+  same service. When the current turn alone would not fit, preflight does not
+  summarize older history for nothing; the turn ends with
+  `provider_request_too_large` only if the provider then refuses it. The result is always one summary exchange followed by the
   current turn verbatim (images, per-block thinking and tool pairs kept);
   only when the current turn alone does not fit are its oldest complete tool
   rounds folded in. The summarizer goes through the session's `LLMProvider`

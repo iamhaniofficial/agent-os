@@ -84,13 +84,19 @@ the conversation append-only: once a message has been sent to the model it is
 replayed byte for byte on every later request, in the same turn and in later
 turns. In practice:
 
-- the system prompt and tool definitions come first and do not change between
-  requests;
-- the current time, the skills list and other per-turn context are added at
-  the end of your message for that turn and stay there (the skills list and
-  request context are only repeated when they change);
-- a very large tool result is shortened once, before the model first sees it
-  (the full output stays available to tools), and never re-shortened later;
+- the system prompt and tool definitions come first and stay the same between
+  requests (workspace files and project knowledge are part of that cached
+  system prompt); loading a deferred tool with `tool_search` appends its
+  definition, which costs one cache write for the tool list;
+- the current time, the skills list and other per-turn context (memory
+  recall, plan mode, ...) are added at the end of your message for that turn
+  and stay there; each part is only repeated when it changes;
+- a tool result too large for the request is shortened once, before the model
+  first sees it; when the turn ends, results and tool-call arguments longer
+  than `[compaction] history_tool_result_max_chars` (default: 2% of the
+  context window, 4k-12k characters) are kept as head/tail plus a handle to
+  the full output for later turns. That happens once per turn, so the next
+  request re-caches only the end of the previous turn;
 - compaction is the only thing that rewrites earlier context;
 - model/provider switches stay visible through diagnostics when they may
   affect cache continuity.

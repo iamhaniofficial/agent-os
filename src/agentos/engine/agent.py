@@ -67,6 +67,7 @@ from agentos.engine.transcript import (
     TranscriptRecord,
     append_context_blocks,
     encode_transcript_record,
+    history_argument_projection,
     latest_context_block_present,
     persistable_messages,
     request_context_delta,
@@ -3201,6 +3202,7 @@ class Agent:
             # persisted by TurnRunner as system errors, while their usage still
             # flows through the final DoneEvent below when provider usage exists.
             self._seal_transcript(turn_messages, sealed_len)
+            self._cap_turn_for_history(turn_messages)
             self._history = list(turn_messages)
             self._record_turn_transcript(self._history)
             self._write_context_stage("session:after", self._history)
@@ -3458,6 +3460,120 @@ class Agent:
                 if block.execution_status is not None
                 else None
             ),
+        )
+
+    def _history_tool_payload_cap(self) -> int:
+        """Max chars a tool result / argument keeps once its turn is over.
+
+        ``[compaction] history_tool_result_max_chars``; ``0`` (default) means
+        2% of the context window in chars, clamped to 4k-12k: a finished
+        turn's 120k-char file read is not worth replaying at full size on
+        every later request, and its full text stays in the tool-result store.
+        """
+        configured = self._positive_int(getattr(self.config, "history_tool_result_max_chars", 0))
+        if configured is not None:
+            return configured
+        window_chars = int(self.config.context_window_tokens) * 4
+        return max(4_000, min(12_000, int(window_chars * 0.02)))
+
+    def _cap_turn_for_history(self, messages: list[Message]) -> None:
+        """Bound this turn's tool payloads once, at the turn boundary.
+
+        During the turn every result was sent at its per-class budget. Before
+        the turn is persisted, results and tool-call argument fields over the
+        history cap become head/tail projections that name their tool-result
+        store handle. Earlier turns were capped when they ended and are never
+        touched again, so the next request re-sends this turn's tail once (one
+        cache write) and every later request repeats it byte for byte.
+        """
+        start = 2 if self._turn_reset else self._turn_base_len
+        if start >= len(messages):
+            return
+        cap = self._history_tool_payload_cap()
+        tool_names: dict[str, str] = {}
+        for index in range(start, len(messages)):
+            message = messages[index]
+            if not isinstance(message.content, list):
+                continue
+            blocks: list[Any] = []
+            changed = False
+            for block in message.content:
+                replacement = block
+                if isinstance(block, ContentBlockToolUse):
+                    tool_names[block.id] = block.name
+                    replacement = self._cap_tool_use_arguments(block, cap)
+                elif isinstance(block, ContentBlockToolResult):
+                    replacement = self._cap_tool_result(
+                        block, cap, tool_names.get(block.tool_use_id, "tool")
+                    )
+                changed = changed or replacement is not block
+                blocks.append(replacement)
+            if changed:
+                messages[index] = Message(
+                    role=message.role,
+                    content=blocks,
+                    reasoning_content=message.reasoning_content,
+                    reasoning_details=message.reasoning_details,
+                )
+                self._message_sizes.retain_only(messages)
+
+    def _cap_tool_result(
+        self,
+        block: ContentBlockToolResult,
+        cap: int,
+        tool_name: str,
+    ) -> ContentBlockToolResult:
+        content = block.content
+        if not isinstance(content, str) or len(content) <= cap:
+            return block
+        if _tool_result_content_has_artifact(content):
+            return block
+        projection = self._tool_result_projection_for_provider(
+            content,
+            tool_use_id=block.tool_use_id,
+            tool_name=tool_name,
+            reason="tool result from an earlier turn, shortened for history",
+            max_preview_chars=min(cap, 4_000),
+        )
+        if len(projection) >= len(content):
+            return block
+        return ContentBlockToolResult(
+            tool_use_id=block.tool_use_id,
+            content=projection,
+            is_error=block.is_error,
+            execution_status=(
+                mark_execution_status_truncated(block.execution_status)
+                if block.execution_status is not None
+                else None
+            ),
+        )
+
+    def _cap_tool_use_arguments(self, block: ContentBlockToolUse, cap: int) -> ContentBlockToolUse:
+        oversized = [
+            key for key, value in block.input.items() if isinstance(value, str) and len(value) > cap
+        ]
+        if not oversized:
+            return block
+        arguments = dict(block.input)
+        for key in oversized:
+            value = str(block.input[key])
+            stored = self._store_tool_result_snapshot(
+                value,
+                tool_use_id=f"{block.id}:{key}",
+                tool_name=block.name,
+            )
+            arguments[key] = history_argument_projection(
+                tool_name=block.name,
+                tool_use_id=block.id,
+                field_name=key,
+                value=value,
+                handle=stored.handle if stored is not None else None,
+            )
+        return ContentBlockToolUse(
+            id=block.id,
+            name=block.name,
+            input=arguments,
+            thought_signature=block.thought_signature,
         )
 
     def _drop_replayed_reasoning(self, thinking_enabled: bool) -> bool:

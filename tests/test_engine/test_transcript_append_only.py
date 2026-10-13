@@ -33,7 +33,12 @@ from agentos.engine.transcript import (
 )
 from agentos.engine.types import DoneEvent
 from agentos.execution_status import normalize_legacy_execution_status
-from agentos.gateway.config import AgentOSRouterConfig, AttachmentsConfig, GatewayConfig
+from agentos.gateway.config import (
+    AgentOSRouterConfig,
+    AgentTokenSavingConfig,
+    AttachmentsConfig,
+    GatewayConfig,
+)
 from agentos.provider import (
     ContentBlockRedactedThinking,
     ContentBlockText,
@@ -54,8 +59,9 @@ from agentos.tools.registry import ToolRegistry, ToolSpec
 from agentos.tools.types import CallerKind, ToolContext
 
 KEY = "agent:main:webchat:append-only"
-# Over the 160k-char LOCAL tool-result budget of a 200k-token window.
-BIG_OUTPUT = "LOOKUP-RESULT\n" + ("r" * 200_000)
+# A 120k-char result: under the 160k-char per-result budget of a 200k-token
+# window (sent in full during its turn), over the 12k history cap.
+BIG_OUTPUT = "LOOKUP-RESULT\n" + ("r" * 120_000)
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +182,9 @@ def _runner(provider: _ScriptedProvider, manager: SessionManager, tmp_path: Path
         config=GatewayConfig(
             attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
             agentos_router=AgentOSRouterConfig(enabled=False),
+            agent_token_saving=AgentTokenSavingConfig(
+                tool_result_projection_max_inline_chars=200_000
+            ),
         ),
     )
 
@@ -228,22 +237,32 @@ async def test_consecutive_requests_share_a_byte_identical_prefix_across_turns(
 
     first = await _turn(runner, manager, "find the first thing", tmp_path)
     second = await _turn(runner, manager, "and now the second", tmp_path)
+    third = await _turn(runner, manager, "and a third", tmp_path)
 
-    assert any(isinstance(event, DoneEvent) for event in first)
-    assert any(isinstance(event, DoneEvent) for event in second)
+    assert all(
+        any(isinstance(event, DoneEvent) for event in events) for events in (first, second, third)
+    )
     requests = provider.requests
-    assert len(requests) == 4
+    assert len(requests) == 6
 
     # System prompt and tools never change between requests.
     assert len({request["system"] for request in requests}) == 1
     assert all(request["tools"] == requests[0]["tools"] for request in requests)
-    # Every request starts with the previous request, byte for byte -- within
-    # a turn AND across the persist/reload between turns.
-    for earlier, later in zip(requests, requests[1:], strict=False):
-        assert _is_prefix(earlier["messages"], later["messages"])
-
-    # Across turns the prefix grows by exactly the previous final answer.
-    turn_one_final = json.loads(requests[2]["messages"][len(requests[1]["messages"])])
+    # Within a turn every request starts with the previous one, byte for byte.
+    for index in (0, 2, 4):
+        assert _is_prefix(requests[index]["messages"], requests[index + 1]["messages"])
+    # Turn 1 ended with an oversized tool result, capped once at the turn
+    # boundary: turn 2's first request differs from turn 1's last only there.
+    last_of_one, first_of_two = requests[1]["messages"], requests[2]["messages"]
+    differing = [
+        index for index, (a, b) in enumerate(zip(last_of_one, first_of_two, strict=False)) if a != b
+    ]
+    assert len(differing) == 1
+    assert "lookup-1" in last_of_one[differing[0]]
+    # Turn 2's results were small: turn 3 replays turn 2's last request byte for
+    # byte, turn 1's capped tail included.
+    assert _is_prefix(requests[3]["messages"], requests[4]["messages"])
+    turn_one_final = json.loads(first_of_two[len(last_of_one)])
     assert turn_one_final["role"] == "assistant"
     assert turn_one_final["content"][0]["text"] == "answer 2"
 
@@ -258,7 +277,7 @@ async def test_consecutive_requests_share_a_byte_identical_prefix_across_turns(
 
 
 @pytest.mark.asyncio
-async def test_oversized_tool_result_is_shrunk_at_append_and_never_again(
+async def test_big_tool_result_is_sent_in_full_then_capped_once_for_history(
     manager: SessionManager,
     tmp_path: Path,
 ) -> None:
@@ -266,8 +285,9 @@ async def test_oversized_tool_result_is_shrunk_at_append_and_never_again(
     runner = _runner(provider, manager, tmp_path)
     await manager.create(KEY)
 
-    await _turn(runner, manager, "find the first thing", tmp_path)
-    await _turn(runner, manager, "and now the second", tmp_path)
+    await _turn(runner, manager, "find the first thing", tmp_path)  # turn N
+    await _turn(runner, manager, "and now the second", tmp_path)  # turn N+1
+    await _turn(runner, manager, "and a third", tmp_path)  # turn N+2
 
     def _result(request: dict[str, Any], tool_use_id: str) -> str:
         for raw in request["messages"]:
@@ -278,13 +298,90 @@ async def test_oversized_tool_result_is_shrunk_at_append_and_never_again(
                         return str(block["content"])
         raise AssertionError(f"{tool_use_id} not in request")
 
-    first_send = _result(provider.requests[1], "lookup-1")
-    assert "[tool_result_projection]" in first_send
-    assert BIG_OUTPUT not in first_send
-    assert len(first_send) < len(BIG_OUTPUT)
-    # The same bytes on every later request, in this turn and the next one.
-    assert _result(provider.requests[2], "lookup-1") == first_send
-    assert _result(provider.requests[3], "lookup-1") == first_send
+    # Sent in full during its own turn.
+    assert _result(provider.requests[1], "lookup-1") == BIG_OUTPUT
+    # Capped in the persisted record: head/tail plus the store handle.
+    rows = await manager.get_transcript(KEY)
+    record = next(row.provider_messages for row in rows if row.provider_messages)
+    persisted = next(
+        block["content"]
+        for message in record["messages"]
+        if isinstance(message["content"], list)
+        for block in message["content"]
+        if block.get("tool_use_id") == "lookup-1"
+    )
+    assert len(persisted) < 13_000
+    assert "tool_result_handle:" in persisted
+    assert persisted.startswith("[tool_result_projection]")
+    # Turn N+1 and N+2 replay turn N byte for byte (one cache write, once).
+    capped = _result(provider.requests[2], "lookup-1")
+    assert capped == persisted
+    assert _result(provider.requests[4], "lookup-1") == capped
+    turn_n_len = len(provider.requests[1]["messages"]) + 1
+    assert (
+        provider.requests[4]["messages"][:turn_n_len]
+        == (provider.requests[2]["messages"][:turn_n_len])
+    )
+
+
+@pytest.mark.asyncio
+async def test_huge_tool_call_argument_is_capped_for_history() -> None:
+    from agentos.engine import Agent, AgentConfig
+
+    huge = "<html>" + ("x" * 50_000) + "</html>"
+
+    class _WriteProvider:
+        provider_name = "fake"
+
+        def __init__(self) -> None:
+            self.calls: list[list[Message]] = []
+
+        def chat(self, messages, tools=None, config=None):
+            self.calls.append(list(messages))
+            return self._stream(len(self.calls))
+
+        async def _stream(self, call_number: int):
+            if call_number == 1:
+                yield ProviderToolUseStart(tool_use_id="w1", tool_name="write_file")
+                yield ProviderToolUseEnd(
+                    tool_use_id="w1",
+                    tool_name="write_file",
+                    arguments={"path": "index.html", "content": huge},
+                )
+                yield ProviderDone(stop_reason="tool_use")
+                return
+            yield ProviderText(text="written")
+            yield ProviderDone(stop_reason="end_turn")
+
+    async def _tool(call: Any) -> Any:
+        from agentos.engine import ToolResult
+
+        return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="ok")
+
+    provider = _WriteProvider()
+    agent = Agent(provider=provider, config=AgentConfig(max_iterations=3), tool_handler=_tool)
+    _ = [event async for event in agent.run_turn("write the page")]
+
+    sent_args = next(
+        block.input
+        for message in provider.calls[1]
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockToolUse)
+    )
+    assert sent_args["content"] == huge  # full during its own turn
+    record = agent.transcript_record()
+    assert record is not None
+    kept = next(
+        block["input"]
+        for message in record["messages"]
+        if isinstance(message["content"], list)
+        for block in message["content"]
+        if block.get("type") == "tool_use"
+    )
+    assert kept["path"] == "index.html"
+    assert kept["content"].startswith("[historical_tool_argument_omitted]")
+    assert len(kept["content"]) < 2_000
 
 
 @pytest.mark.asyncio

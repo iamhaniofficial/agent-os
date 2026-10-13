@@ -3017,6 +3017,14 @@ class TurnRunner:
             ch_out = ch_outcome.require_output()
             agent.config.request_context_prompt = ch_out.final_request_context_prompt
             agent.config.context_overflow_threshold = self._preflight_compact_ratio()
+            agent.config.history_tool_result_max_chars = int(
+                getattr(
+                    getattr(self._config, "compaction", None),
+                    "history_tool_result_max_chars",
+                    0,
+                )
+                or 0
+            )
 
             # 8. Build extra messages for attachments + turn_input rebind.
             # AttachmentStage owns the slice.

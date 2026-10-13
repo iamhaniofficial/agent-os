@@ -485,6 +485,16 @@ failover circuit-breaker state (`closed`, `half_open`, or `open (42s)`); see
 Provider-specific setup examples, including OpenCAP and Surplus Intelligence,
 live in [`providers-and-models.md`](providers-and-models.md).
 
+Context history: when a turn ends, its tool results and tool-call arguments
+longer than `compaction.history_tool_result_max_chars` are kept for later
+turns as head/tail plus a tool-result-store handle (during the turn the model
+sees them in full). `0`, the default, means 2% of the model's context window,
+clamped to 4,000-12,000 characters:
+
+```sh
+agentos config set compaction.history_tool_result_max_chars 20000
+```
+
 Search:
 
 ```sh
