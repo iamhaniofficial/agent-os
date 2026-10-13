@@ -636,9 +636,10 @@ For Ollama models that do not reliably support native tool calls, set
 `tools.enabled = false` in the config file to run in plain-text mode. Keep it
 enabled for tool-capable cloud models such as `glm-5.2:cloud`; the Ollama
 provider preserves native tool-call history between turns. Ollama is sent the
-agent's context window as `num_ctx` (its own default is a few thousand tokens
+agent's context window as `num_ctx`, capped at 32768 because Ollama reserves
+memory for the whole window up front (its own default is a few thousand tokens
 and silently drops the start of a long prompt); set `AGENTOS_OLLAMA_NUM_CTX`
-to override it, e.g. to fit a smaller GPU.
+to override it, larger for a big GPU or smaller to fit a small one.
 
 Prompt caching is controlled by `[prompt_cache]`: `mode` (`auto`, `on`,
 `off`) and `ttl`. With `ttl = "1h"` Anthropic keeps the cached system prompt

@@ -19,9 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Prompt caching: `[prompt_cache] ttl = "1h"` (env `AGENTOS_CACHE_TTL`) keeps
   Anthropic's cached system prompt and tool list for an hour instead of five
   minutes. Default unchanged (`5m`). (#3648)
-- Ollama: the agent's context window is sent as `options.num_ctx` (Ollama's
-  default of a few thousand tokens silently dropped the start of long
-  prompts; `AGENTOS_OLLAMA_NUM_CTX` overrides it), and `think` is sent when
+- Ollama: the agent's context window is sent as `options.num_ctx`, capped at
+  32k because Ollama allocates the whole window up front (Ollama's default of
+  a few thousand tokens silently dropped the start of long prompts;
+  `AGENTOS_OLLAMA_NUM_CTX` overrides it, larger or smaller), and `think` is sent when
   thinking is on for a model that supports it (Qwen 3, DeepSeek R1 / V3.1,
   gpt-oss with a level, Magistral). (#3648)
 - Tool contract: tools can opt into `strict` (Anthropic `strict`, OpenAI
@@ -115,7 +116,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   sent back, so Claude, GPT, Gemini and GLM via OpenRouter lost their
   reasoning (and signatures) across tool calls. They are now merged per block
   (`DoneEvent.reasoning_details`) and re-sent verbatim on the assistant
-  message. (#3648)
+  message, only when the next request goes to the model family that produced
+  them (a router or `/model` switch drops them rather than handing one
+  vendor's signed reasoning to another). (#3648)
 - A model stream that went silent after it had started hung until the
   per-iteration timeout (30 min by default). It now ends after 120 s without
   data (`AGENTOS_LLM_STREAM_IDLE_TIMEOUT_SECONDS`, `0` disables) with a

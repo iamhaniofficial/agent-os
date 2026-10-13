@@ -678,6 +678,55 @@ def _openrouter_non_system_prefix_item_hashes(
     return hashes
 
 
+#: ``reasoning_details[].format`` prefix -> model family that produced it.
+_REASONING_FORMAT_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("anthropic", "anthropic"),
+    ("openai", "openai"),
+    ("azure-openai", "openai"),
+    ("google", "google"),
+    ("xai", "xai"),
+)
+#: OpenRouter model-id vendor prefix -> model family.
+_OPENROUTER_VENDOR_FAMILIES: dict[str, str] = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "google": "google",
+    "x-ai": "xai",
+}
+
+
+def _reasoning_detail_family(detail: Mapping[str, Any]) -> str:
+    fmt = str(detail.get("format") or "").strip().lower()
+    for prefix, family in _REASONING_FORMAT_FAMILIES:
+        if fmt.startswith(prefix):
+            return family
+    return "unknown"
+
+
+def _openrouter_model_family(model: str | None) -> str:
+    vendor = (model or "").strip().lower().lstrip("~").split("/", 1)[0]
+    return _OPENROUTER_VENDOR_FAMILIES.get(vendor, "unknown")
+
+
+def _replayable_reasoning_details(
+    details: list[dict[str, Any]], model: str | None
+) -> list[dict[str, Any]] | None:
+    """``details`` when every block was produced by ``model``'s family, else None.
+
+    A message does not record which model produced it, and a router or
+    ``/model`` switch can put a different family on the next request. Claude
+    signatures, OpenAI / Gemini encrypted reasoning are only valid for the
+    family that issued them, so the blocks are replayed all-or-nothing: the
+    sequence may not be reordered or partially edited. Details whose
+    ``format`` names no known family (plain-text reasoning from GLM, DeepSeek,
+    ...) are only replayed to a model that is also outside the known families.
+    """
+    family = _openrouter_model_family(model)
+    if all(_reasoning_detail_family(detail) == family for detail in details):
+        return details
+    return None
+
+
 def _attach_reasoning_content(
     msg: Message,
     payload: dict[str, Any],
@@ -685,14 +734,23 @@ def _attach_reasoning_content(
     include_reasoning_content: bool = True,
     require_assistant_reasoning_content: bool = False,
     provider_kind: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
-    if provider_kind == "openrouter" and msg.role == "assistant" and msg.reasoning_details:
+    if (
+        provider_kind == "openrouter"
+        and include_reasoning_content
+        and msg.role == "assistant"
+        and msg.reasoning_details
+    ):
         # OpenRouter's replay form: the response's ``reasoning_details``
         # exactly as received (order and content unmodified). It carries the
         # signatures / encrypted blobs that let Claude, GPT, Gemini and GLM keep
-        # their reasoning across tool calls, and supersedes plain text.
-        payload["reasoning_details"] = msg.reasoning_details
-        return payload
+        # their reasoning across tool calls, and supersedes plain text. Only
+        # replayed to the family that produced it (see the helper).
+        replayable = _replayable_reasoning_details(msg.reasoning_details, model)
+        if replayable is not None:
+            payload["reasoning_details"] = replayable
+            return payload
     if include_reasoning_content and msg.role == "assistant" and msg.reasoning_content:
         payload["reasoning_content"] = msg.reasoning_content
     elif (
@@ -739,6 +797,7 @@ def _build_openai_messages(
     include_reasoning_content: bool = True,
     require_assistant_reasoning_content: bool = False,
     provider_kind: str | None = None,
+    model: str | None = None,
 ) -> list[dict[str, Any]]:
     """Convert a agentos Message into one or more OpenAI-format message dicts.
 
@@ -757,6 +816,7 @@ def _build_openai_messages(
                 include_reasoning_content=include_reasoning_content,
                 require_assistant_reasoning_content=require_assistant_reasoning_content,
                 provider_kind=provider_kind,
+                model=model,
             )
         ]
 
@@ -818,6 +878,7 @@ def _build_openai_messages(
                 include_reasoning_content=include_reasoning_content,
                 require_assistant_reasoning_content=require_assistant_reasoning_content,
                 provider_kind=provider_kind,
+                model=model,
             )
         ]
 
@@ -831,6 +892,7 @@ def _build_openai_messages(
                 include_reasoning_content=include_reasoning_content,
                 require_assistant_reasoning_content=require_assistant_reasoning_content,
                 provider_kind=provider_kind,
+                model=model,
             )
         ]
     content_text = " ".join(p["text"] for p in parts if p["type"] == "text")
@@ -841,6 +903,7 @@ def _build_openai_messages(
             include_reasoning_content=include_reasoning_content,
             require_assistant_reasoning_content=require_assistant_reasoning_content,
             provider_kind=provider_kind,
+            model=model,
         )
     ]
 
@@ -973,6 +1036,7 @@ class OpenAIProvider:
                         _is_direct_deepseek_v4_request(self._provider_kind, self._model)
                     ),
                     provider_kind=self._provider_kind,
+                    model=self._model,
                 )
             )
 

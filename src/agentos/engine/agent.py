@@ -1422,6 +1422,7 @@ class Agent:
             ),
             provider_request_max_chars=self._provider_request_proof_max_chars(),
             tool_choice=None,
+            context_window_tokens=self.config.context_window_tokens,
         )
         _thinking_fallback_done = False
 

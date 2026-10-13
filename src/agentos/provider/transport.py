@@ -297,6 +297,23 @@ class PooledHttpClient:
             _close_soon(client, loop)
 
 
+async def aclose_provider(provider: Any) -> None:
+    """Close ``provider``'s pooled client if it has one; never raises.
+
+    For callers that build a provider for a short-lived event loop (one
+    ``asyncio.run`` per call): a client left open there keeps its sockets until
+    garbage collection, after the loop that owns them is closed, which leaks
+    them with a ``ResourceWarning``.
+    """
+    close = getattr(provider, "aclose", None)
+    if close is None:
+        return
+    try:
+        await close()
+    except Exception:  # noqa: BLE001 - cleanup must never fail the caller
+        log.debug("provider.transport.aclose_failed", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Tool-call stream guard
 # ---------------------------------------------------------------------------
@@ -419,11 +436,14 @@ async def guard_tool_stream(
             open_tools=open_tools,
             emitted_output=emitted_output,
         )
-        names = ", ".join(name for name in open_tools if name) or "unknown"
+        # Tool names stay in the log above, never in the error text: the
+        # engine scans error messages for words such as "thinking" to decide
+        # on fallbacks, and a tool name (``sequentialthinking``) is model- or
+        # MCP-supplied text that must not steer that.
         if emitted_output:
             yield ErrorEvent(
                 message=(
-                    f"The provider stream ended inside a tool call ({names}) after "
+                    "The provider stream ended inside a tool call after "
                     "partial output was already streamed"
                 ),
                 code=STREAM_INTERRUPTED_AFTER_OUTPUT_CODE,
@@ -431,8 +451,7 @@ async def guard_tool_stream(
         else:
             yield ErrorEvent(
                 message=(
-                    f"The provider stream ended inside a tool call ({names}), "
-                    f"{attempt + 1} attempt(s)"
+                    f"The provider stream ended inside a tool call ({attempt + 1} attempt(s))"
                 ),
                 code=INCOMPLETE_TOOL_STREAM_CODE,
             )

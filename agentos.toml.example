@@ -198,6 +198,10 @@ base_url = "https://openrouter.ai/api/v1"
 # Env override: AGENTOS_CACHE_MODE=auto|on|off (legacy AGENTOS_CACHE_ENABLED is deprecated).
 # [prompt_cache]
 # mode = "auto"
+# ttl: how long Anthropic keeps the cached system prompt and tools, "5m"
+# (default) or "1h". A 1h cache write costs 2x the input price instead of
+# 1.25x; worth it when a session pauses longer than 5 minutes. Env: AGENTOS_CACHE_TTL.
+# ttl = "5m"
 
 # Prompt-ingress safety controls.
 # wrap_untrusted_workspace: wrap untrusted workspace files with safety bounding markers.

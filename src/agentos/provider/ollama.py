@@ -44,6 +44,9 @@ log = structlog.get_logger(__name__)
 _OLLAMA_DEFAULT_BASE = "http://localhost:11434"
 #: Operator override for ``options.num_ctx`` (wins over the caller's window).
 _OLLAMA_NUM_CTX_ENV = "AGENTOS_OLLAMA_NUM_CTX"
+#: Largest ``num_ctx`` derived from the caller's window. 32k holds the agent's
+#: system prompt, tool schemas and a working history; more needs the env var.
+_OLLAMA_NUM_CTX_CEILING = 32_768
 _OLLAMA_ERROR_BODY_LIMIT = 2000
 # Connect budget for a daemon on the same machine. See _stream_timeout.
 _OLLAMA_CONNECT_TIMEOUT_S = 5.0
@@ -244,8 +247,12 @@ def _ollama_num_ctx(cfg: ChatConfig) -> int | None:
 
     Ollama's default context is a few thousand tokens and it silently drops
     the start of a longer prompt (the system prompt first). The caller's
-    context window is sent when it gave one; ``AGENTOS_OLLAMA_NUM_CTX``
-    overrides it (e.g. to fit a smaller GPU).
+    context window is sent when it gave one, capped at
+    :data:`_OLLAMA_NUM_CTX_CEILING`: an unknown local model falls back to the
+    engine's 200k default window, and Ollama allocates the KV cache for the
+    whole ``num_ctx`` up front, which on a small GPU means an out-of-memory
+    load or a CPU offload many times slower. ``AGENTOS_OLLAMA_NUM_CTX``
+    overrides both (larger or smaller).
     """
     raw = os.environ.get(_OLLAMA_NUM_CTX_ENV, "").strip()
     if raw:
@@ -256,7 +263,9 @@ def _ollama_num_ctx(cfg: ChatConfig) -> int | None:
         else:
             if value > 0:
                 return value
-    return cfg.context_window_tokens if cfg.context_window_tokens > 0 else None
+    if cfg.context_window_tokens <= 0:
+        return None
+    return min(cfg.context_window_tokens, _OLLAMA_NUM_CTX_CEILING)
 
 
 #: Ollama model families with a native ``think`` switch (Ollama docs,
