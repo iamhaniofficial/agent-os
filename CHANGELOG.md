@@ -18,6 +18,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   default; `[sessions] suggest_next = false` turns it off.
 
 ### Fixed
+- Providers: a 429 that said `Retry-After: 2` failed over to another model at
+  once -- losing the prompt cache and changing the cost -- and three of them
+  marked the primary provider down for a minute. The providers threw the
+  response headers away with the error, so nothing downstream knew the wait
+  was two seconds. Anthropic, OpenAI-compatible (OpenRouter, DeepSeek, ...),
+  OpenAI Responses and Ollama errors now carry the hint (`Retry-After` as
+  seconds or an HTTP-date, `retry-after-ms`, or the OpenAI / Anthropic
+  rate-limit reset headers, clamped to 0-300 s). A rate limit or overload
+  whose wait is at most 30 s is slept out on the same model, counting against
+  the provider retries, and fails over only once those are spent; it no longer
+  counts toward the circuit breaker. Longer or missing hints behave as before.
+  (#3646)
+- Anthropic provider: Claude 4.6 and newer (Opus 4.7/4.8, Opus 5 / 5.5,
+  Sonnet 5 / 5.5, Fable, Mythos) were sent `thinking: {type: enabled,
+  budget_tokens}`, which those models reject with HTTP 400; only the two
+  4.6 ids got adaptive thinking. The provider now picks the thinking mode
+  from a per-family capability table: adaptive thinking plus
+  `output_config.effort` (mapped from the thinking level) for 4.6+,
+  `budget_tokens` only for Haiku 4.5 / Sonnet 4.5 / Opus 4.5 and older, and
+  no `temperature` for the models that reject sampling parameters. The
+  known-model list gains the current Claude 5 ids (#3640).
+- Tools: a builtin tool's `ToolError("file not found: …")` reached the model
+  as "The tool failed with an internal error", so it could not correct
+  itself. Plain `ToolError` messages now reach the model after secret
+  redaction and a 2000-character cap; `SafeToolError` is unchanged and
+  unknown exception classes still get the generic line (#3642).
+- Engine: the selector fallback wrapper held back every tool-use, thinking
+  and heartbeat event until the first text delta, so a tool-only or
+  reasoning-heavy response did not stream at all and idle watchdogs could
+  fire on a healthy call. Events are now forwarded as soon as the provider
+  shows any sign of life; transparent failover still happens only for an
+  error that arrives before any content (#3643).
+- Engine: the context-overflow estimate ran after the response had been
+  streamed and, when compaction could not help, re-issued the provider
+  call, duplicating the text and tool calls already emitted. The estimate
+  and preflight compaction now run before each provider call, only over
+  messages the model has already seen, and a streamed response is never
+  replayed (#3644).
 - Providers: stop reasons are normalized. Each provider reported why it
   stopped in its own words and the turn loop only knew OpenAI's `length`, so
   an Anthropic `max_tokens` never triggered the output-limit continuation, a
@@ -190,18 +228,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [2026.10.4] - 2026-10-04
 
 ### Fixed
-- Providers: a 429 that said `Retry-After: 2` failed over to another model at
-  once -- losing the prompt cache and changing the cost -- and three of them
-  marked the primary provider down for a minute. The providers threw the
-  response headers away with the error, so nothing downstream knew the wait
-  was two seconds. Anthropic, OpenAI-compatible (OpenRouter, DeepSeek, ...),
-  OpenAI Responses and Ollama errors now carry the hint (`Retry-After` as
-  seconds or an HTTP-date, `retry-after-ms`, or the OpenAI / Anthropic
-  rate-limit reset headers, clamped to 0-300 s). A rate limit or overload
-  whose wait is at most 30 s is slept out on the same model, counting against
-  the provider retries, and fails over only once those are spent; it no longer
-  counts toward the circuit breaker. Longer or missing hints behave as before.
-  (#3646)
 - Chat (desktop and web console): the first message to a session could fail
   with "Send failed: session_key conflict", and sending it again worked.
   New chat stamps a `new_chat` intent for the first send of its fresh key, but
