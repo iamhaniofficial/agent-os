@@ -398,6 +398,13 @@ class _EmergencyCompactionOverride:
     compaction_id: str
 
 
+def _refusal_category_from_details(stop_details: object) -> str | None:
+    if not isinstance(stop_details, dict):
+        return None
+    category = stop_details.get("category")
+    return category if isinstance(category, str) and category else None
+
+
 def _non_negative_int(value: object) -> int:
     if value is None:
         return 0
@@ -5250,6 +5257,12 @@ class TurnRunner:
                 ),
                 runtime_context_chars=(
                     done_event.runtime_context_chars if done_event is not None else 0
+                ),
+                stop_reason=done_event.stop_reason if done_event is not None else None,
+                refusal_category=(
+                    _refusal_category_from_details(done_event.stop_details)
+                    if done_event is not None and done_event.stop_reason == "refusal"
+                    else None
                 ),
             )
             write_decision_entry(entry)

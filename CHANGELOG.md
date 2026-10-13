@@ -37,6 +37,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   30 seconds) and removes them through the same `env.*` RPCs. **Add
   variable** stores a custom one in `~/.agentos/.env`.
 
+### Fixed
+- Providers: stop reasons are normalized. Each provider reported why it
+  stopped in its own words and the turn loop only knew OpenAI's `length`, so
+  an Anthropic `max_tokens` never triggered the output-limit continuation, a
+  safety `refusal` looked like a normal reply (or, with no text, an empty
+  response that was retried and failed over to another provider), and a
+  `pause_turn` ended the turn early. Every provider now maps onto one set
+  (`end_turn`, `max_tokens`, `tool_use`, `stop_sequence`, `refusal`,
+  `pause_turn`, `unknown`) and keeps the wire value as `raw_stop_reason`.
+  A refusal (Anthropic `refusal`, OpenAI `content_filter`) ends the turn
+  with the text written so far, no retry and no failover, and a
+  `provider_refusal` warning naming the safety category; a paused turn is
+  resumed up to 3 times. The decision log (schema 15) records `stop_reason`
+  and `refusal_category` (#3641).
+
 ## [2026.10.4] - 2026-10-04
 
 ### Fixed

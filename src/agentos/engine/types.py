@@ -165,6 +165,11 @@ class DoneEvent:
     session_totals: SessionTotalsSnapshot | None = None
     routing_applied: bool = True
     rollout_phase: str = "full"
+    # Normalized stop reason of the turn's last provider call
+    # (``agentos.provider.types.StopReason`` value) and any structured detail
+    # the provider attached, e.g. a refusal category.
+    stop_reason: str | None = None
+    stop_details: dict[str, Any] | None = None
 
     @property
     def upstream_cost_usd(self) -> float:

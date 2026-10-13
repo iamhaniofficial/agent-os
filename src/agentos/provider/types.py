@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Literal
 
 from agentos.execution_status import ExecutionStatus
@@ -59,12 +60,78 @@ class ToolUseEndEvent:
     thought_signature: str | None = None
 
 
+class StopReason(StrEnum):
+    """Provider-neutral reason a model stopped generating.
+
+    Every provider maps its own wire vocabulary (Anthropic ``stop_reason``,
+    OpenAI ``finish_reason``, Ollama ``done_reason``, Responses ``status``)
+    onto these values so the engine compares against one set. The wire value
+    is kept on :attr:`DoneEvent.raw_stop_reason` for logs.
+    """
+
+    END_TURN = "end_turn"
+    MAX_TOKENS = "max_tokens"
+    TOOL_USE = "tool_use"
+    STOP_SEQUENCE = "stop_sequence"
+    REFUSAL = "refusal"
+    PAUSE_TURN = "pause_turn"
+    UNKNOWN = "unknown"
+
+
+# Wire values from every provider family. The vocabularies do not collide, so
+# one table serves all of them; lookups are case-insensitive.
+_STOP_REASON_ALIASES: dict[str, StopReason] = {
+    # Anthropic Messages API
+    "end_turn": StopReason.END_TURN,
+    "max_tokens": StopReason.MAX_TOKENS,
+    "tool_use": StopReason.TOOL_USE,
+    "stop_sequence": StopReason.STOP_SEQUENCE,
+    "refusal": StopReason.REFUSAL,
+    "pause_turn": StopReason.PAUSE_TURN,
+    # OpenAI-compatible chat completions and Ollama ``done_reason``
+    "stop": StopReason.END_TURN,
+    "length": StopReason.MAX_TOKENS,
+    "tool_calls": StopReason.TOOL_USE,
+    "function_call": StopReason.TOOL_USE,
+    "content_filter": StopReason.REFUSAL,
+    # OpenAI Responses API (``status`` / ``incomplete_details.reason``)
+    "completed": StopReason.END_TURN,
+    "max_output_tokens": StopReason.MAX_TOKENS,
+    # Our own canonical value, so normalizing is idempotent
+    "unknown": StopReason.UNKNOWN,
+}
+
+
+def normalize_stop_reason(raw: str | None, *, has_tool_calls: bool = False) -> StopReason:
+    """Map a provider's wire stop reason onto :class:`StopReason`.
+
+    ``has_tool_calls`` upgrades a plain end of turn to ``tool_use`` for
+    providers that report ``stop`` even when they emitted tool calls. An
+    unrecognized value becomes ``unknown``; callers keep the raw string.
+    """
+
+    if isinstance(raw, StopReason):
+        normalized = raw
+    elif not raw:
+        normalized = StopReason.END_TURN
+    else:
+        normalized = _STOP_REASON_ALIASES.get(str(raw).strip().lower(), StopReason.UNKNOWN)
+    if has_tool_calls and normalized is StopReason.END_TURN:
+        return StopReason.TOOL_USE
+    return normalized
+
+
 @dataclass
 class DoneEvent:
-    """Stream finished successfully."""
+    """Stream finished successfully.
+
+    ``stop_reason`` is always a normalized :class:`StopReason`; a raw wire value
+    passed in (``"length"``, ``"stop"``...) is normalized on construction and
+    remembered in ``raw_stop_reason``.
+    """
 
     kind: Literal["done"] = field(default="done", init=False)
-    stop_reason: str = "end_turn"
+    stop_reason: StopReason = StopReason.END_TURN
     input_tokens: int = 0
     output_tokens: int = 0
     reasoning_content: str | None = None
@@ -77,6 +144,18 @@ class DoneEvent:
     # tests does not silently shift earlier args.
     cache_write_tokens: int = 0
     cost_source: str = "none"
+    # The provider's own stop value before normalization, for logs.
+    raw_stop_reason: str | None = None
+    # Structured detail the provider attached to the stop, e.g. Anthropic's
+    # refusal ``{"type": "refusal", "category": ..., "explanation": ...}``.
+    stop_details: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        given = self.stop_reason
+        normalized = normalize_stop_reason(given)
+        if self.raw_stop_reason is None and given and str(given) != normalized.value:
+            self.raw_stop_reason = str(given)
+        self.stop_reason = normalized
 
     @property
     def upstream_cost_usd(self) -> float:

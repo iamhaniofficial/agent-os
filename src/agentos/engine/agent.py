@@ -91,7 +91,7 @@ from agentos.provider.failures import (
     classify_provider_error,
     is_transport_timeout,
 )
-from agentos.provider.types import ContentBlockImage
+from agentos.provider.types import ContentBlockImage, StopReason, normalize_stop_reason
 from agentos.result_budget import (
     ToolResultBudgetClass,
     compact_tool_result_content,
@@ -157,6 +157,15 @@ _PROVIDER_OUTPUT_CONTINUE_PROMPT = (
     "been written. If a tool call was interrupted or incomplete, regenerate a complete "
     "tool call from scratch."
 )
+_PROVIDER_PAUSE_TURN_RESUME_PROMPT = (
+    "The previous provider response was paused before the turn finished. Continue from "
+    "the exact point where it paused. Do not repeat text that has already been written."
+)
+# A provider may pause a long-running turn (Anthropic ``pause_turn``). The engine
+# resumes it at most this many times per loop iteration, then treats the paused
+# response as the end of the turn.
+_MAX_PAUSE_TURN_RESUMES = 3
+_PROVIDER_REFUSAL_REPLY = "The model declined to respond to this request."
 
 
 def _cost_source_for_usage(cost_usd: float, billed_cost: float) -> str:
@@ -397,6 +406,7 @@ def _append_length_capped_continuation(
     *,
     response_text: str,
     tool_calls: list[ToolCall],
+    prompt: str = _PROVIDER_OUTPUT_CONTINUE_PROMPT,
 ) -> str:
     visible_text = strip_synthetic_tool_call_suffix(
         response_text,
@@ -406,8 +416,27 @@ def _append_length_capped_continuation(
         turn_messages.append(
             Message(role="assistant", content=[ContentBlockText(text=visible_text)])
         )
-    turn_messages.append(Message(role="user", content=_PROVIDER_OUTPUT_CONTINUE_PROMPT))
+    turn_messages.append(Message(role="user", content=prompt))
     return visible_text
+
+
+def _refusal_category(stop_details: dict[str, Any] | None) -> str | None:
+    if not isinstance(stop_details, dict):
+        return None
+    category = stop_details.get("category")
+    if isinstance(category, str) and category.strip():
+        return category.strip()
+    return None
+
+
+def _refusal_warning_message(stop_details: dict[str, Any] | None) -> str:
+    category = _refusal_category(stop_details)
+    if category:
+        return (
+            f"The model declined this request (safety category: {category}). "
+            "The turn ended without a retry."
+        )
+    return "The model declined this request. The turn ended without a retry."
 
 
 class _ProviderAttemptKind(StrEnum):
@@ -417,6 +446,11 @@ class _ProviderAttemptKind(StrEnum):
     INCOMPLETE_TOOLS = "incomplete_tools"
     STREAM_INCOMPLETE = "stream_incomplete"
     LENGTH_CAPPED = "length_capped"
+    # The provider declined (safety classifier / content filter). Final: never
+    # retried and never failed over, the turn ends with what was produced.
+    REFUSAL = "refusal"
+    # The provider paused a long-running turn and expects it to be resumed.
+    PAUSE_TURN = "pause_turn"
 
 
 class _IterationStreamTimeoutError(TimeoutError):
@@ -564,9 +598,22 @@ def _classify_provider_attempt(
             stop_reason=stop_reason,
             user_visible_emitted=user_visible_emitted,
         )
-    if (stop_reason or "").lower() == "length":
+    normalized_stop = normalize_stop_reason(stop_reason)
+    if normalized_stop is StopReason.REFUSAL:
+        return _ProviderAttemptClassification(
+            _ProviderAttemptKind.REFUSAL,
+            stop_reason=stop_reason,
+            user_visible_emitted=user_visible_emitted,
+        )
+    if normalized_stop is StopReason.MAX_TOKENS:
         return _ProviderAttemptClassification(
             _ProviderAttemptKind.LENGTH_CAPPED,
+            stop_reason=stop_reason,
+            user_visible_emitted=user_visible_emitted,
+        )
+    if normalized_stop is StopReason.PAUSE_TURN and not tool_calls:
+        return _ProviderAttemptClassification(
+            _ProviderAttemptKind.PAUSE_TURN,
             stop_reason=stop_reason,
             user_visible_emitted=user_visible_emitted,
         )
@@ -1907,6 +1954,11 @@ class Agent:
         last_actual_model = ""
         terminal_error: ErrorEvent | None = None
         final_text_parts: list[str] = []
+        # Normalized stop reason (and refusal details) of the last provider
+        # call that completed, surfaced on the turn's DoneEvent for the
+        # decision log.
+        turn_stop_reason: str | None = None
+        turn_stop_details: dict[str, Any] | None = None
         final_reasoning_parts: list[str] = []
         artifact_delivery_final_response_pending = False
         artifact_delivery_degraded_final_response = False
@@ -2153,6 +2205,7 @@ class Agent:
                 )
                 _attempt_retries_used = _retry_policy.used_attempts()
                 _invalid_response_fallback_done = False
+                _pause_turn_resumes = 0
                 while _retry_attempt <= _fallback.max_retries:
                     provider_error = None
                     assistant_text_parts = []
@@ -2469,6 +2522,8 @@ class Agent:
                     if provider_done_for_log is not None:
                         response_payload["usage"] = {
                             "stop_reason": provider_done_for_log.stop_reason,
+                            "raw_stop_reason": provider_done_for_log.raw_stop_reason,
+                            "stop_details": provider_done_for_log.stop_details,
                             "input_tokens": provider_done_for_log.input_tokens,
                             "output_tokens": provider_done_for_log.output_tokens,
                             "reasoning_tokens": provider_done_for_log.reasoning_tokens,
@@ -2532,7 +2587,137 @@ class Agent:
                         reasoning_tokens=iter_reasoning_tokens,
                         user_visible_emitted=attempt_user_visible_emitted,
                     )
-                    if not _got_error and attempt_classification.kind != _ProviderAttemptKind.OK:
+                    if (
+                        not _got_error
+                        and attempt_classification.kind == _ProviderAttemptKind.PAUSE_TURN
+                    ):
+                        if _pause_turn_resumes < _MAX_PAUSE_TURN_RESUMES:
+                            # Keep what the paused response produced, then ask
+                            # the provider to carry on. The assistant text goes
+                            # into history and into the final reply, exactly as
+                            # for a length-capped continuation. A follow-up user
+                            # nudge (rather than a trailing assistant message) is
+                            # used because current Claude models reject an
+                            # assistant-last request as an unsupported prefill.
+                            _pause_turn_resumes += 1
+                            visible_text = _append_length_capped_continuation(
+                                turn_messages,
+                                response_text=response_text,
+                                tool_calls=tool_calls,
+                                prompt=_PROVIDER_PAUSE_TURN_RESUME_PROMPT,
+                            )
+                            if visible_text:
+                                final_text_parts.append(visible_text)
+                            logger.info(
+                                "provider.pause_turn_resume",
+                                session_key=self._session_key,
+                                model=last_actual_model or self.config.model_id or "",
+                                provider=type(self.provider).__name__,
+                                iteration=iterations,
+                                call_attempt=_call_attempt,
+                                resume=_pause_turn_resumes,
+                                budget=_MAX_PAUSE_TURN_RESUMES,
+                                visible_chars=len(visible_text),
+                            )
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="resume_paused_turn",
+                                reason="pause_turn",
+                                code="pause_turn",
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                                resume=_pause_turn_resumes,
+                                budget=_MAX_PAUSE_TURN_RESUMES,
+                            )
+                            _call_attempt += 1
+                            continue
+                        # Resume budget spent: the paused response is the end of
+                        # the turn. Re-classify it as a normal end_turn so the
+                        # usual empty/visible checks apply.
+                        logger.warning(
+                            "provider.pause_turn_resume_exhausted",
+                            session_key=self._session_key,
+                            iteration=iterations,
+                            call_attempt=_call_attempt,
+                            budget=_MAX_PAUSE_TURN_RESUMES,
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="end_paused_turn",
+                            reason="pause_turn_resume_exhausted",
+                            code="pause_turn",
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            budget=_MAX_PAUSE_TURN_RESUMES,
+                        )
+                        if provider_done_for_log is not None:
+                            provider_done_for_log.stop_reason = StopReason.END_TURN
+                        stop_reason = StopReason.END_TURN
+                        attempt_classification = _classify_provider_attempt(
+                            text=response_text,
+                            tool_calls=tool_calls,
+                            pending_tools=pending_tools,
+                            got_done_event=_got_done_event,
+                            stop_reason=stop_reason,
+                            reasoning_content=iter_reasoning_content,
+                            reasoning_tokens=iter_reasoning_tokens,
+                            user_visible_emitted=attempt_user_visible_emitted,
+                        )
+                    if (
+                        not _got_error
+                        and attempt_classification.kind == _ProviderAttemptKind.REFUSAL
+                    ):
+                        # A safety decline is final: no retry, no failover to
+                        # another provider (that would be shopping for a model
+                        # that says yes). Keep whatever text the model wrote
+                        # before it declined; tool calls from a declined
+                        # response are never executed.
+                        refusal_details = (
+                            provider_done_for_log.stop_details
+                            if provider_done_for_log is not None
+                            else None
+                        )
+                        refusal_category = _refusal_category(refusal_details)
+                        dropped_tool_calls = len(tool_calls)
+                        tool_calls = []
+                        if not response_text.strip():
+                            response_text = _PROVIDER_REFUSAL_REPLY
+                            assistant_text_parts.append(response_text)
+                            attempt_user_visible_emitted = True
+                            yield TextDeltaEvent(text=response_text)
+                        logger.warning(
+                            "provider.refusal",
+                            session_key=self._session_key,
+                            model=last_actual_model or self.config.model_id or "",
+                            provider=type(self.provider).__name__,
+                            iteration=iterations,
+                            call_attempt=_call_attempt,
+                            category=refusal_category,
+                            raw_stop_reason=(
+                                provider_done_for_log.raw_stop_reason
+                                if provider_done_for_log is not None
+                                else None
+                            ),
+                            dropped_tool_calls=dropped_tool_calls,
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="finish_refused_turn",
+                            reason="refusal",
+                            code="provider_refusal",
+                            category=refusal_category,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            dropped_tool_calls=dropped_tool_calls,
+                        )
+                        yield WarningEvent(
+                            code="provider_refusal",
+                            message=_refusal_warning_message(refusal_details),
+                        )
+                    if not _got_error and attempt_classification.kind not in {
+                        _ProviderAttemptKind.OK,
+                        _ProviderAttemptKind.REFUSAL,
+                    }:
                         logger.warning(
                             "provider.invalid_response",
                             session_key=self._session_key,
@@ -2786,7 +2971,7 @@ class Agent:
                     if (
                         not _got_error
                         and attempt_classification.kind == _ProviderAttemptKind.OK
-                        and (stop_reason or "").lower() == "length"
+                        and normalize_stop_reason(stop_reason) is StopReason.MAX_TOKENS
                     ):
                         yield WarningEvent(
                             code="provider_output_truncated",
@@ -2847,7 +3032,9 @@ class Agent:
                                 "Returning the best partial result from completed work."
                             )
                             assistant_text_parts.append(response_text)
-                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            provider_done_for_log = ProviderDoneEvent(
+                                stop_reason=StopReason.END_TURN
+                            )
                             _got_done_event = True
                             _got_error = False
                             max_iterations_finalization_pending = False
@@ -3044,6 +3231,9 @@ class Agent:
                     if provider_done_for_log is not None
                     else None
                 )
+                if final_stop_reason is not None:
+                    turn_stop_reason = str(final_stop_reason)
+                    turn_stop_details = getattr(provider_done_for_log, "stop_details", None)
                 final_classification = _classify_provider_attempt(
                     text=response_text,
                     tool_calls=tool_calls,
@@ -3054,7 +3244,10 @@ class Agent:
                     reasoning_tokens=iter_reasoning_tokens,
                     user_visible_emitted=attempt_user_visible_emitted,
                 )
-                if final_classification.kind != _ProviderAttemptKind.OK:
+                if final_classification.kind not in {
+                    _ProviderAttemptKind.OK,
+                    _ProviderAttemptKind.REFUSAL,
+                }:
                     logger.warning(
                         "provider.invalid_response_unhandled",
                         session_key=self._session_key,
@@ -3817,6 +4010,8 @@ class Agent:
                     "\n".join(final_reasoning_parts) if final_reasoning_parts else None
                 ),
                 session_totals=session_totals,
+                stop_reason=turn_stop_reason,
+                stop_details=turn_stop_details,
             )
         # Reset for next turn
         self._state = AgentState.IDLE
