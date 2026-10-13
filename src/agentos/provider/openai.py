@@ -714,11 +714,11 @@ class _AnthropicCacheGateway:
       conversation (OpenRouter).
     - ``"rolling_block"``: an explicit ``cache_control`` on the last content
       part of the last user / tool message, moved forward every request, the
-      same rolling marker the Anthropic provider places. Used where the
-      gateway already caches the system prompt and tools on its own (OpenCAP:
-      live captures show ~90% hits on them with no hints), so only the
-      conversation tail needs a marker and the gateway's own markers plus
-      ours stay within Anthropic's limit of four.
+      same rolling marker the Anthropic provider places. For a gateway that
+      caches the system prompt and tools on its own, so only the conversation
+      tail needs a marker and the gateway's markers plus ours stay within
+      Anthropic's limit of four. No row uses it today; add one only for a
+      gateway measured to forward the marker.
     """
 
     name: str
@@ -750,14 +750,7 @@ _ANTHROPIC_CACHE_GATEWAYS: tuple[_AnthropicCacheGateway, ...] = (
         model_substrings=(),
         style="top_level",
     ),
-    _AnthropicCacheGateway(
-        name="opencap",
-        provider_kinds=frozenset({"opencap"}),
-        hosts=frozenset({"gw.capminal.ai"}),
-        model_prefixes=(),
-        model_substrings=("claude",),
-        style="rolling_block",
-    ),
+    # No OpenCAP row: measured 2026-10-13, it ignores per-message cache_control markers.
 )
 
 
