@@ -500,6 +500,8 @@ async def _gate_out_of_workspace_write(
 
 @tool(
     name="read_file",
+    concurrency="parallel",
+    read_only=True,
     description=(
         "Read UTF-8 text file contents with line numbers. Supports offset and limit. "
         "For CSV/TSV/Excel workbook data, use read_spreadsheet."
@@ -544,6 +546,8 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
 
 @tool(
     name="read_spreadsheet",
+    concurrency="parallel",
+    read_only=True,
     description=(
         "Read CSV, TSV, or Excel .xlsx files as structured text tables. "
         "When reading .xlsx, all sheets are returned by default; pass sheet as "
@@ -1101,6 +1105,8 @@ async def edit_file(path: str, old_text: str, new_text: str, approval_id: str | 
 
 @tool(
     name="list_dir",
+    concurrency="parallel",
+    read_only=True,
     description="List directory contents with type and size.",
     params={
         "path": {"type": "string", "description": "Directory path to list."},
@@ -1158,6 +1164,8 @@ async def list_dir(path: str) -> str:
 
 @tool(
     name="glob_search",
+    concurrency="parallel",
+    read_only=True,
     description="Find files matching a glob pattern.",
     params={
         "pattern": {"type": "string", "description": "Glob pattern (e.g. '**/*.py')."},
@@ -1232,6 +1240,8 @@ def _include_matches(fp: Path, base: Path, include: str) -> bool:
 
 @tool(
     name="grep_search",
+    concurrency="parallel",
+    read_only=True,
     description="Search file contents for a regex pattern.",
     params={
         "pattern": {"type": "string", "description": "Regex pattern to search for."},

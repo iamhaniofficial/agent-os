@@ -17,6 +17,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   are cached per reply so clients sharing a session share one call. On by
   default; `[sessions] suggest_next = false` turns it off.
 
+### Changed
+- Tool calls: each result now reaches the chat as soon as its tool finishes
+  instead of after the whole batch, so a fast `read_file` is shown while a slow
+  `web_fetch` beside it is still running. When several calls in one turn stop
+  for operator approval, every approval is waited on at the same time and each
+  call is retried the moment its own approval is resolved; a denied call
+  returns its denial without holding up the others. What needs approval is
+  unchanged. The model still receives the results in the order it asked for
+  them. Which tools may run side by side is now declared on each tool
+  (`concurrency` = `parallel` / `keyed` / `exclusive`, plus `read_only` and
+  `requires_approval`) instead of a hard-coded list of names in the engine; a
+  tool that declares nothing, MCP tools included, still runs alone. Up to 8
+  parallel calls run at once (was 6).
+
 ### Fixed
 - Providers: a 429 that said `Retry-After: 2` failed over to another model at
   once -- losing the prompt cache and changing the cost -- and three of them

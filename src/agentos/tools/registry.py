@@ -16,6 +16,8 @@ from agentos.tools.types import (
     CallerKind,
     InteractionMode,
     RegisteredTool,
+    ToolConcurrency,
+    ToolConcurrencyKey,
     ToolContext,
     ToolHandler,
     ToolSpec,
@@ -342,6 +344,10 @@ def tool(
     execution_timeout_padding: float = 0.0,
     result_budget_class: str | None = None,
     registry: ToolRegistry | None = None,
+    concurrency: ToolConcurrency = "exclusive",
+    concurrency_key: ToolConcurrencyKey | None = None,
+    read_only: bool = False,
+    requires_approval: bool = False,
 ) -> Any:
     """Decorator to register an async function as a tool.
 
@@ -362,6 +368,10 @@ def tool(
             execution_timeout_argument=execution_timeout_argument,
             execution_timeout_padding=execution_timeout_padding,
             result_budget_class=result_budget_class,
+            concurrency=concurrency,
+            concurrency_key=concurrency_key,
+            read_only=read_only,
+            requires_approval=requires_approval,
         )
         target = registry if registry is not None else _default_registry
         target.register(spec, fn)

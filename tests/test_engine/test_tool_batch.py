@@ -1,0 +1,634 @@
+"""ToolBatchExecutor: declared concurrency, streamed results, concurrent approvals.
+
+Concurrency is proven with events and in-flight counters rather than
+wall-clock thresholds wherever possible, so these stay deterministic on a
+loaded CI runner. No network, no provider.
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable
+from pathlib import Path
+from typing import Any
+
+import agentos.engine.runtime as runtime_module
+from agentos.engine import Agent, AgentConfig, ToolResult
+from agentos.engine.tool_batch import (
+    ToolBatchExecutor,
+    _OrderedGate,
+    registry_spec_lookup,
+    resolve_tool_concurrency,
+)
+from agentos.engine.types import RunHeartbeatEvent, ToolCall, ToolResultEvent, WarningEvent
+from agentos.provider import ChatConfig, Message, ToolDefinition, ToolInputSchema
+from agentos.provider import DoneEvent as ProviderDone
+from agentos.provider import TextDeltaEvent as ProviderTextDelta
+from agentos.provider import ToolUseEndEvent as ProviderToolUseEnd
+from agentos.provider import ToolUseStartEvent as ProviderToolUseStart
+from agentos.tools.registry import ToolRegistry, tool
+from agentos.tools.types import ToolSpec
+
+_BUILTIN_DIR = Path(__file__).resolve().parents[2] / "src" / "agentos" / "tools" / "builtin"
+
+# The names that used to live in runtime._SAFE_TOOL_NAMES.
+_FORMER_ALLOWLIST = frozenset(
+    {
+        "agents_list",
+        "git_diff",
+        "git_log",
+        "git_status",
+        "glob_search",
+        "grep_search",
+        "image",
+        "list_dir",
+        "memory_get",
+        "memory_search",
+        "pdf",
+        "projects_list",
+        "read_file",
+        "read_spreadsheet",
+        "session_search",
+        "session_status",
+        "sessions_history",
+        "sessions_list",
+        "skill_list",
+        "skill_search_community",
+        "skill_view",
+        "tts",
+        "web_fetch",
+        "web_search",
+    }
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _spec(name: str, **kwargs: Any) -> ToolSpec:
+    return ToolSpec(name=name, description=name, parameters={}, **kwargs)
+
+
+def _call(index: int, name: str, **arguments: Any) -> ToolCall:
+    return ToolCall(tool_use_id=f"t{index}", tool_name=name, arguments=dict(arguments))
+
+
+def _ok(call: ToolCall, content: str = "ok") -> ToolResult:
+    return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content=content)
+
+
+async def _identity_project(result: ToolResult, *, tool_call: ToolCall | None = None) -> ToolResult:
+    return result
+
+
+def _executor(
+    execute: Callable[[ToolCall], Awaitable[ToolResult]],
+    specs: dict[str, ToolSpec],
+    *,
+    batch_seconds: float = 10.0,
+    tool_seconds: float = 5.0,
+    **kwargs: Any,
+) -> ToolBatchExecutor:
+    loop = asyncio.get_running_loop()
+    return ToolBatchExecutor(
+        execute=execute,
+        project=_identity_project,
+        timeout_for=lambda _call: tool_seconds,
+        spec_for=specs.get,
+        deadline=loop.time() + batch_seconds,
+        iteration_timeout=batch_seconds,
+        **kwargs,
+    )
+
+
+async def _drain(executor: ToolBatchExecutor, calls: list[ToolCall]) -> list[Any]:
+    return [event async for event in executor.run(calls)]
+
+
+def _result_ids(events: list[Any]) -> list[str]:
+    return [event.tool_use_id for event in events if isinstance(event, ToolResultEvent)]
+
+
+class _Tracker:
+    """Records which calls are in flight at the same time."""
+
+    def __init__(self) -> None:
+        self.in_flight: set[str] = set()
+        self.max_in_flight = 0
+        self.overlaps: list[frozenset[str]] = []
+
+    def enter(self, call: ToolCall) -> None:
+        self.in_flight.add(call.tool_use_id)
+        self.max_in_flight = max(self.max_in_flight, len(self.in_flight))
+        self.overlaps.append(frozenset(self.in_flight))
+
+    def leave(self, call: ToolCall) -> None:
+        self.in_flight.discard(call.tool_use_id)
+
+    def ever_together(self, a: str, b: str) -> bool:
+        return any(a in seen and b in seen for seen in self.overlaps)
+
+
+# ---------------------------------------------------------------------------
+# Policy resolution
+# ---------------------------------------------------------------------------
+
+
+def test_tool_without_declared_concurrency_is_exclusive() -> None:
+    assert resolve_tool_concurrency(_spec("legacy"), {}).mode == "exclusive"
+    assert resolve_tool_concurrency(None, {}).mode == "exclusive"
+
+
+def test_tool_decorator_defaults_keep_unknown_tools_exclusive() -> None:
+    registry = ToolRegistry()
+
+    @tool(name="plain_tool", description="plain", registry=registry)
+    async def plain_tool() -> str:
+        return "ok"
+
+    registered = registry.get("plain_tool")
+    assert registered is not None
+    assert registered.spec.concurrency == "exclusive"
+    assert registered.spec.read_only is False
+    assert registered.spec.requires_approval is False
+    assert registered.spec.concurrency_key is None
+
+
+def test_keyed_policy_uses_key_function_and_falls_back_to_exclusive() -> None:
+    spec = _spec(
+        "send",
+        concurrency="keyed",
+        concurrency_key=lambda args, _session: args.get("to"),
+    )
+    assert resolve_tool_concurrency(spec, {"to": "a"}).key == "a"
+    assert resolve_tool_concurrency(spec, {"to": "a"}).mode == "keyed"
+    assert resolve_tool_concurrency(spec, {}).mode == "exclusive"
+
+    def _broken(_args: Any, _session: str | None) -> Any:
+        raise RuntimeError("boom")
+
+    broken = _spec("broken", concurrency="keyed", concurrency_key=_broken)
+    assert resolve_tool_concurrency(broken, {}).mode == "exclusive"
+    # keyed without a key function serialises on the tool name
+    assert resolve_tool_concurrency(_spec("k", concurrency="keyed"), {}).key == ("tool", "k")
+
+
+def test_registry_lookup_prefers_agent_registry_then_default() -> None:
+    registry = ToolRegistry()
+    registry.register(_spec("read_file"), lambda: None)  # type: ignore[arg-type]
+    lookup = registry_spec_lookup(registry)
+    own = lookup("read_file")
+    assert own is not None and own.concurrency == "exclusive"
+    builtin = registry_spec_lookup(None)("read_file")
+    assert builtin is not None and builtin.concurrency == "parallel"
+    assert registry_spec_lookup(registry)("no_such_tool") is None
+
+
+def test_safe_tool_allowlist_is_gone() -> None:
+    assert not hasattr(runtime_module, "_SAFE_TOOL_NAMES")
+    assert not hasattr(runtime_module, "_get_tool_concurrency_policy")
+
+
+def _declared_concurrency_by_tool() -> dict[str, str]:
+    declared: dict[str, str] = {}
+    for path in sorted(_BUILTIN_DIR.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "tool"
+            ):
+                continue
+            keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+            name = keywords.get("name")
+            if not isinstance(name, ast.Constant) or not isinstance(name.value, str):
+                continue
+            mode = keywords.get("concurrency")
+            declared[name.value] = mode.value if isinstance(mode, ast.Constant) else "exclusive"
+    return declared
+
+
+def test_former_allowlist_members_are_registered_parallel() -> None:
+    # Some of these register through factories (skills, memory, session
+    # search), so read the registration sites rather than a live registry.
+    declared = _declared_concurrency_by_tool()
+    missing = sorted(_FORMER_ALLOWLIST - set(declared))
+    assert missing == []
+    assert {name: declared[name] for name in _FORMER_ALLOWLIST} == dict.fromkeys(
+        _FORMER_ALLOWLIST, "parallel"
+    )
+    assert declared["sessions_send"] == "keyed"
+    assert declared["sessions_spawn"] == "keyed"
+    for name in ("exec_command", "write_file", "edit_file", "apply_patch", "http_request"):
+        assert declared[name] == "exclusive", name
+
+
+def test_session_tools_key_by_target_and_parent() -> None:
+    lookup = registry_spec_lookup(None)
+    send = resolve_tool_concurrency(lookup("sessions_send"), {"session_key": " agent:x "})
+    assert send.mode == "keyed" and send.key == ("sessions_send", "agent:x")
+    assert resolve_tool_concurrency(lookup("sessions_send"), {}).mode == "exclusive"
+    spawn = resolve_tool_concurrency(lookup("sessions_spawn"), {}, session_key="agent:main:p")
+    assert spawn.mode == "keyed" and spawn.key == ("sessions_spawn", "agent:main:p")
+
+
+# ---------------------------------------------------------------------------
+# Scheduling
+# ---------------------------------------------------------------------------
+
+
+async def test_results_stream_as_they_finish_and_pair_in_original_order() -> None:
+    specs = {
+        "slow": _spec("slow", concurrency="parallel"),
+        "fast": _spec("fast", concurrency="parallel"),
+    }
+    release_slow = asyncio.Event()
+    slow_finished = False
+
+    async def execute(call: ToolCall) -> ToolResult:
+        nonlocal slow_finished
+        if call.tool_name == "slow":
+            await release_slow.wait()
+            slow_finished = True
+        return _ok(call, call.tool_name)
+
+    executor = _executor(execute, specs)
+    calls = [_call(0, "slow"), _call(1, "fast")]
+    seen: list[str] = []
+    slow_done_when_fast_seen: bool | None = None
+    async for event in executor.run(calls):
+        if isinstance(event, ToolResultEvent):
+            seen.append(event.tool_use_id)
+            if event.tool_use_id == "t1":
+                slow_done_when_fast_seen = slow_finished
+                release_slow.set()
+
+    # The fast result reached the consumer while the slow tool was still running.
+    assert seen == ["t1", "t0"]
+    assert slow_done_when_fast_seen is False
+    # The transcript still pairs in the order the model asked.
+    assert [block.tool_use_id for block in executor.result_blocks()] == ["t0", "t1"]
+    assert [block.content for block in executor.result_blocks()] == ["slow", "fast"]
+
+
+async def test_keyed_serialises_same_key_and_parallelises_different_keys() -> None:
+    specs = {
+        "send": _spec(
+            "send",
+            concurrency="keyed",
+            concurrency_key=lambda args, _session: ("send", args["to"]),
+        )
+    }
+    tracker = _Tracker()
+    both_b_and_a = asyncio.Event()
+
+    async def execute(call: ToolCall) -> ToolResult:
+        tracker.enter(call)
+        if {"t0", "t2"} <= tracker.in_flight:
+            both_b_and_a.set()
+        try:
+            await asyncio.wait_for(both_b_and_a.wait(), timeout=0.3)
+        except TimeoutError:
+            pass
+        await asyncio.sleep(0.01)
+        tracker.leave(call)
+        return _ok(call)
+
+    calls = [_call(0, "send", to="a"), _call(1, "send", to="a"), _call(2, "send", to="b")]
+    events = await _drain(_executor(execute, specs), calls)
+
+    assert sorted(_result_ids(events)) == ["t0", "t1", "t2"]
+    assert tracker.ever_together("t0", "t2"), "different keys did not overlap"
+    assert not tracker.ever_together("t0", "t1"), "same key overlapped"
+
+
+async def test_exclusive_runs_alone_and_keeps_its_place() -> None:
+    specs = {
+        "read": _spec("read", concurrency="parallel"),
+        "write": _spec("write"),  # declares nothing -> exclusive
+    }
+    tracker = _Tracker()
+    order: list[str] = []
+
+    async def execute(call: ToolCall) -> ToolResult:
+        tracker.enter(call)
+        order.append(call.tool_use_id)
+        await asyncio.sleep(0.02)
+        tracker.leave(call)
+        return _ok(call)
+
+    calls = [_call(0, "read"), _call(1, "read"), _call(2, "write"), _call(3, "read")]
+    await _drain(_executor(execute, specs), calls)
+
+    assert tracker.ever_together("t0", "t1")
+    for other in ("t0", "t1", "t3"):
+        assert not tracker.ever_together("t2", other), f"exclusive overlapped {other}"
+    # earlier calls start before the exclusive one, later calls after it
+    assert order.index("t2") > max(order.index("t0"), order.index("t1"))
+    assert order.index("t3") > order.index("t2")
+
+
+async def test_tools_without_new_fields_run_serially() -> None:
+    specs = {"a": _spec("a"), "b": _spec("b")}
+    tracker = _Tracker()
+
+    async def execute(call: ToolCall) -> ToolResult:
+        tracker.enter(call)
+        await asyncio.sleep(0.02)
+        tracker.leave(call)
+        return _ok(call)
+
+    events = await _drain(_executor(execute, specs), [_call(0, "a"), _call(1, "b")])
+    assert tracker.max_in_flight == 1
+    assert _result_ids(events) == ["t0", "t1"]
+
+
+async def test_parallel_is_bounded_by_max_concurrency() -> None:
+    specs = {"r": _spec("r", concurrency="parallel")}
+    tracker = _Tracker()
+
+    async def execute(call: ToolCall) -> ToolResult:
+        tracker.enter(call)
+        await asyncio.sleep(0.02)
+        tracker.leave(call)
+        return _ok(call)
+
+    calls = [_call(i, "r") for i in range(7)]
+    await _drain(_executor(execute, specs, max_concurrency=3), calls)
+    assert tracker.max_in_flight == 3
+
+
+# ---------------------------------------------------------------------------
+# Pairing under failure
+# ---------------------------------------------------------------------------
+
+
+async def test_pairing_survives_exception_timeout_and_batch_deadline() -> None:
+    specs = {name: _spec(name, concurrency="parallel") for name in ("boom", "hang", "ok")}
+
+    async def execute(call: ToolCall) -> ToolResult:
+        if call.tool_name == "boom":
+            raise RuntimeError("kaput")
+        if call.tool_name == "hang":
+            await asyncio.sleep(30)
+        return _ok(call)
+
+    executor = _executor(execute, specs, tool_seconds=0.05)
+    calls = [_call(0, "hang"), _call(1, "boom"), _call(2, "ok")]
+    events = await _drain(executor, calls)
+
+    assert sorted(_result_ids(events)) == ["t0", "t1", "t2"]
+    outcomes = executor.outcomes
+    assert [o.result.tool_use_id for o in outcomes] == ["t0", "t1", "t2"]
+    assert outcomes[0].result.is_error and "timed out" in outcomes[0].result.content
+    assert outcomes[1].result.is_error and "kaput" in outcomes[1].result.content
+    assert not outcomes[2].result.is_error
+
+
+async def test_batch_deadline_times_out_running_and_queued_calls() -> None:
+    specs = {"hang": _spec("hang")}  # exclusive: t1 is still queued at the deadline
+    cancelled: list[str] = []
+
+    async def execute(call: ToolCall) -> ToolResult:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.append(call.tool_use_id)
+            raise
+        return _ok(call)
+
+    executor = _executor(execute, specs, batch_seconds=0.05, tool_seconds=30)
+    events = await _drain(executor, [_call(0, "hang"), _call(1, "hang")])
+
+    assert _result_ids(events) == ["t0", "t1"]
+    assert cancelled == ["t0"]
+    for outcome in executor.outcomes:
+        assert outcome.result.is_error
+        # The per-tool timeout is capped by the batch deadline, so whichever
+        # fires first reports it; either way the call times out.
+        assert "timed out after" in outcome.result.content
+    assert executor.outcomes[1].result.content.endswith("timed out after 0.05s")
+
+
+async def test_heartbeat_while_tools_run() -> None:
+    specs = {"slow": _spec("slow")}
+
+    async def execute(call: ToolCall) -> ToolResult:
+        await asyncio.sleep(0.08)
+        return _ok(call)
+
+    events = await _drain(_executor(execute, specs, heartbeat_interval=0.02), [_call(0, "slow")])
+    kinds = [type(event) for event in events]
+    assert RunHeartbeatEvent in kinds
+    assert kinds.index(RunHeartbeatEvent) < kinds.index(ToolResultEvent)
+
+
+async def test_pending_warnings_follow_the_result_that_raised_them() -> None:
+    warnings: list[WarningEvent] = []
+    specs = {"w": _spec("w")}
+
+    async def execute(call: ToolCall) -> ToolResult:
+        warnings.append(WarningEvent(code="c", message="m"))
+        return _ok(call)
+
+    events = await _drain(_executor(execute, specs, pending_warnings=warnings), [_call(0, "w")])
+    assert [type(event) for event in events] == [ToolResultEvent, WarningEvent]
+    assert warnings == []
+
+
+async def test_gate_releases_slot_of_task_cancelled_before_start() -> None:
+    gate = _OrderedGate()
+    first = gate.reserve(exclusive=True)
+    second = gate.reserve(exclusive=True)
+    assert first.future.done() and not second.future.done()
+    gate.release(first)
+    assert second.future.done()
+    third = gate.reserve(exclusive=False)
+    gate.release(second)  # never awaited: still frees the gate
+    assert third.future.done()
+    gate.release(third)
+    gate.release(third)  # idempotent
+
+
+# ---------------------------------------------------------------------------
+# Approvals
+# ---------------------------------------------------------------------------
+
+
+def _pending(content: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return None
+    if isinstance(payload, dict) and payload.get("status") == "approval_required":
+        return payload
+    return None
+
+
+async def test_approvals_are_awaited_concurrently_and_retried_as_granted() -> None:
+    specs = {"exec": _spec("exec", requires_approval=True)}
+    decisions: dict[str, asyncio.Future[bool]] = {}
+    waiting: set[str] = set()
+    max_waiting = 0
+    both_waiting = asyncio.Event()
+
+    async def wait_for_approval(payload: dict[str, Any], *, timeout: float) -> None:
+        nonlocal max_waiting
+        approval_id = payload["approval_id"]
+        waiting.add(approval_id)
+        max_waiting = max(max_waiting, len(waiting))
+        if len(waiting) == 2:
+            both_waiting.set()
+        await decisions[approval_id]
+        waiting.discard(approval_id)
+
+    async def execute(call: ToolCall) -> ToolResult:
+        approval_id = call.arguments.get("approval_id")
+        if approval_id is None:
+            approval_id = f"ap-{call.tool_use_id}"
+            decisions[approval_id] = asyncio.get_running_loop().create_future()
+            return _ok(
+                call, json.dumps({"status": "approval_required", "approval_id": approval_id})
+            )
+        if decisions[approval_id].result():
+            return _ok(call, f"ran {call.tool_use_id}")
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content=json.dumps({"status": "approval_denied", "approval_id": approval_id}),
+            is_error=True,
+        )
+
+    executor = _executor(
+        execute,
+        specs,
+        pending_approval=_pending,
+        wait_for_approval=wait_for_approval,
+    )
+    calls = [_call(0, "exec"), _call(1, "exec")]
+    results: list[ToolResultEvent] = []
+
+    async def _consume() -> None:
+        async for event in executor.run(calls):
+            if isinstance(event, ToolResultEvent):
+                results.append(event)
+
+    consumer = asyncio.create_task(_consume())
+    await asyncio.wait_for(both_waiting.wait(), timeout=2.0)
+    assert max_waiting == 2  # both approvals outstanding at once
+
+    # The second approval is granted first; its retry must not wait for the first.
+    decisions["ap-t1"].set_result(True)
+    for _ in range(50):
+        if any(r.result == "ran t1" for r in results):
+            break
+        await asyncio.sleep(0.01)
+    assert any(r.result == "ran t1" for r in results)
+    assert not consumer.done()
+
+    decisions["ap-t0"].set_result(False)  # denied: yields a denied result, blocks nothing
+    await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert [r.tool_use_id for r in results] == ["t0", "t1", "t1", "t0"]
+    outcomes = executor.outcomes
+    assert [o.result.tool_use_id for o in outcomes] == ["t0", "t1"]
+    assert "approval_denied" in outcomes[0].result.content
+    assert outcomes[1].result.content == "ran t1"
+    assert outcomes[1].call.arguments == {"approval_id": "ap-t1"}
+
+
+# ---------------------------------------------------------------------------
+# Through the agent loop
+# ---------------------------------------------------------------------------
+
+
+class _FixedToolCallProvider:
+    provider_name = "fake"
+
+    def __init__(self, tool_names: list[str]) -> None:
+        self._tool_names = tool_names
+        self.calls: list[list[Message]] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append(list(messages))
+        return self._stream(len(self.calls))
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number > 1:
+            yield ProviderTextDelta(text="done")
+            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+            return
+        for i, name in enumerate(self._tool_names):
+            yield ProviderToolUseStart(tool_use_id=f"tool-{i}", tool_name=name)
+            yield ProviderToolUseEnd(tool_use_id=f"tool-{i}", tool_name=name, arguments={})
+        yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+async def test_agent_streams_first_result_before_batch_finishes() -> None:
+    """Measurement: the fast tool's result reaches the consumer mid-batch."""
+
+    registry = ToolRegistry()
+    for name in ("slow_read", "fast_read"):
+        registry.register(_spec(name, concurrency="parallel", read_only=True), lambda: None)  # type: ignore[arg-type]
+
+    release_slow = asyncio.Event()
+    slow_running_when_fast_seen: bool | None = None
+    slow_running = False
+
+    async def handler(call: ToolCall) -> ToolResult:
+        nonlocal slow_running
+        if call.tool_name == "slow_read":
+            slow_running = True
+            await release_slow.wait()
+            slow_running = False
+        return _ok(call, call.tool_name)
+
+    provider = _FixedToolCallProvider(["slow_read", "fast_read"])
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=2),
+        tool_definitions=[
+            ToolDefinition(name=n, description=n, input_schema=ToolInputSchema())
+            for n in ("slow_read", "fast_read")
+        ],
+        tool_handler=handler,
+        tool_registry=registry,
+    )
+
+    order: list[str] = []
+    async for event in agent.run_turn("go"):
+        if isinstance(event, ToolResultEvent):
+            order.append(event.tool_name)
+            if event.tool_name == "fast_read":
+                slow_running_when_fast_seen = slow_running
+                release_slow.set()
+
+    assert order == ["fast_read", "slow_read"]
+    assert slow_running_when_fast_seen is True
+    # The provider sees one tool_result per tool_use, in the order requested.
+    second_request = provider.calls[1]
+    result_ids = [
+        block.tool_use_id
+        for msg in second_request
+        if isinstance(msg.content, list)
+        for block in msg.content
+        if getattr(block, "type", None) == "tool_result"
+    ]
+    assert result_ids == ["tool-0", "tool-1"]
+
+
+def test_default_max_tool_concurrency_is_eight() -> None:
+    assert AgentConfig().max_safe_tool_concurrency == 8
