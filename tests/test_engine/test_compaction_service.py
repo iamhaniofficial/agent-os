@@ -19,7 +19,6 @@ from agentos.engine.compaction_service import (
     CompactionService,
     ends_mid_tool_round,
     is_ephemeral_session,
-    render_messages_for_summary,
     should_compact,
     summarize_messages,
 )
@@ -39,7 +38,7 @@ from agentos.provider.types import ContentBlockImage
 
 
 def _tokens(messages: Sequence[Message]) -> int:
-    return sum(len(render_messages_for_summary([message])) for message in messages) // 4
+    return sum(len(message.model_dump_json()) for message in messages) // 4
 
 
 def _round(tool_id: str, result: str) -> list[Message]:
@@ -175,8 +174,8 @@ async def test_shape_is_one_summary_exchange_plus_the_current_turn_verbatim() ->
     result = await CompactionService(provider=None, summarizer=_summarizer).compact(
         messages,
         turn_input_index=2,
-        estimated_tokens=50_000,
-        window_tokens=10_000,
+        estimated_tokens=_tokens(messages),
+        window_tokens=1_000,
         message_tokens=_tokens,
         input_entry={"role": "user", "content": "look at this"},
     )
@@ -215,8 +214,8 @@ async def test_previous_summary_is_folded_into_the_next_one() -> None:
     result = await CompactionService(provider=None, summarizer=_summarizer).compact(
         messages,
         turn_input_index=4,
-        estimated_tokens=50_000,
-        window_tokens=10_000,
+        estimated_tokens=_tokens(messages),
+        window_tokens=1_000,
         message_tokens=_tokens,
     )
 
@@ -244,7 +243,7 @@ async def test_oversized_current_turn_folds_oldest_complete_rounds_only() -> Non
     result = await CompactionService(provider=None, summarizer=_summarizer).compact(
         [*messages, *current],
         turn_input_index=2,
-        estimated_tokens=40_000,
+        estimated_tokens=_tokens([*messages, *current]),
         window_tokens=10_000,
         message_tokens=_tokens,
     )
@@ -343,8 +342,8 @@ async def test_summarizer_streams_through_the_provider_abstraction() -> None:
     result = await CompactionService(provider=provider).compact(
         [*history, Message(role="user", content="status?")],
         turn_input_index=2,
-        estimated_tokens=50_000,
-        window_tokens=1_000,
+        estimated_tokens=_tokens(history) + 10,
+        window_tokens=30,
         message_tokens=_tokens,
     )
 
@@ -388,7 +387,7 @@ async def test_summarizer_exception_is_a_failed_compaction_not_a_crash() -> None
     result = await CompactionService(provider=None, summarizer=_boom).compact(
         messages,
         turn_input_index=2,
-        estimated_tokens=50_000,
+        estimated_tokens=_tokens(messages),
         window_tokens=1_000,
         message_tokens=_tokens,
     )
@@ -411,16 +410,17 @@ async def test_compaction_lifecycle_events_keep_their_names(
     async def _summarizer(messages: list[Message], previous: str | None) -> tuple[str, str]:
         return "s", "llm"
 
+    lifecycle_messages = [
+        Message(role="user", content="old " + "x" * 8000),
+        Message(role="assistant", content="answer"),
+        Message(role="user", content="now"),
+    ]
     await CompactionService(
         provider=None, summarizer=_summarizer, session_key="agent:main:main"
     ).compact(
-        [
-            Message(role="user", content="old " + "x" * 8000),
-            Message(role="assistant", content="answer"),
-            Message(role="user", content="now"),
-        ],
+        lifecycle_messages,
         turn_input_index=2,
-        estimated_tokens=50_000,
+        estimated_tokens=_tokens(lifecycle_messages),
         window_tokens=1_000,
         message_tokens=_tokens,
     )
@@ -433,3 +433,54 @@ async def test_compaction_lifecycle_events_keep_their_names(
         "compaction.summary_verified",
     ]
     assert len({payload["compaction_id"] for _, payload in events}) == 1
+
+
+@pytest.mark.asyncio
+async def test_preflight_refuses_when_the_current_turn_alone_is_too_large() -> None:
+    """Never summarize (and durably rewrite) history for a turn that still fails."""
+    calls: list[Any] = []
+
+    async def _summarizer(messages: list[Message], previous: str | None) -> tuple[str, str]:
+        calls.append(messages)
+        return "s", "llm"
+
+    messages = [
+        Message(role="user", content="old " + "x" * 8000),
+        Message(role="assistant", content="answer"),
+        Message(role="user", content="huge paste " + "p" * 8000),
+    ]
+    result = await CompactionService(provider=None, summarizer=_summarizer).compact(
+        messages,
+        turn_input_index=2,
+        estimated_tokens=_tokens(messages),
+        window_tokens=1_000,
+        message_tokens=_tokens,
+    )
+
+    assert result.status == "skipped"
+    assert result.reason == "current_turn_too_large"
+    assert result.messages is messages
+    assert calls == []
+
+
+@pytest.mark.parametrize("window", [128_000, 200_000])
+def test_trigger_agrees_with_the_provider_request_budget(window: int) -> None:
+    """The engine compacts under the line above which providers rewrite the
+    payload on every request (``provider_request_max_chars`` - headroom)."""
+    from agentos.engine import Agent, AgentConfig
+    from agentos.engine.compaction_service import trigger_limit_tokens
+    from agentos.provider.request_proof import effective_proof_budget
+
+    agent = Agent(
+        provider=_SummarizingProvider(),
+        config=AgentConfig(context_window_tokens=window, max_tokens=16_384),
+    )
+    proof_chars = agent._provider_request_proof_max_chars()
+    provider_line = effective_proof_budget(proof_chars) // 4
+    limit = trigger_limit_tokens(window, 0.85, agent._compaction_budget_tokens())
+
+    assert limit == provider_line
+    assert limit < window * 0.85
+    # ~74k on a 128k window, ~135k on 200k (16k output reserve).
+    expected = {128_000: 73_777, 200_000: 134_977}[window]
+    assert abs(limit - expected) <= 2

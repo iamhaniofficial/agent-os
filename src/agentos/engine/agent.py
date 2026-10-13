@@ -118,6 +118,7 @@ from agentos.provider.failures import (
     honoured_retry_after,
     is_transport_timeout,
 )
+from agentos.provider.request_proof import effective_proof_budget
 from agentos.provider.types import ContentBlockImage, StopReason, normalize_stop_reason
 from agentos.result_budget import (
     ToolResultBudgetClass,
@@ -743,6 +744,15 @@ class Agent:
             return ErrorEvent(
                 message="Context compaction produced no replacement summary.",
                 code="compaction_refused_empty_summary",
+            )
+        if reason == "current_turn_too_large":
+            return ErrorEvent(
+                message=(
+                    "This turn alone is too large for the model's context window, so "
+                    "summarizing earlier history cannot make it fit. Retry with a "
+                    "narrower request or a larger-context model."
+                ),
+                code="provider_request_too_large",
             )
         if reason == "compaction_failed":
             return ErrorEvent(
@@ -3664,6 +3674,20 @@ class Agent:
             session_key=self._session_key,
         )
 
+    def _compaction_budget_tokens(self) -> int | None:
+        """The provider's own no-rewrite request budget, in tokens.
+
+        Providers project/compact any payload over their effective proof
+        budget (``provider_request_max_chars`` minus headroom) on every
+        request. Compacting under that line keeps the provider payload
+        untouched -- and its prompt cache warm -- instead of letting it be
+        rewritten request after request in the band between the two.
+        """
+        proof_chars = self._provider_request_proof_max_chars()
+        if proof_chars <= 0:
+            return None
+        return max(1, effective_proof_budget(proof_chars) // 4)
+
     def _compaction_input_entry(self) -> dict[str, Any] | None:
         content = self._transcript_input_entry_content
         if self._transcript_input_entry_id is None or content is None:
@@ -3713,10 +3737,18 @@ class Agent:
             message_tokens=self._message_tokens,
             force=force,
             input_entry=self._compaction_input_entry(),
+            budget_tokens=self._compaction_budget_tokens(),
         )
         if result.status == "failed":
             self._last_compaction_refusal_reason = result.reason or "compaction_failed"
             return None
+        if result.reason == "current_turn_too_large":
+            # Nothing was summarized or rewritten. Before a call the request
+            # goes out as is (the estimate is a heuristic); after a provider
+            # overflow it is a terminal, user-facing error.
+            self._last_compaction_refusal_reason = "current_turn_too_large"
+            if force:
+                return None
         if not result.compacted:
             return CompactionOutcome(messages=messages, turn_input_index=input_index)
 

@@ -127,11 +127,34 @@ class CompactionResult:
 # ---------------------------------------------------------------------------
 
 
-def should_compact(estimated_tokens: int, window_tokens: int, ratio: float) -> bool:
-    """The single trigger: the live request estimate is over ``window * ratio``."""
+def trigger_limit_tokens(
+    window_tokens: int,
+    ratio: float,
+    budget_tokens: int | None = None,
+) -> float:
+    """The request size compaction keeps under: ``window * ratio``, or the
+    provider's own request budget when that is tighter.
+
+    The providers rewrite (compact) any payload over their effective proof
+    budget on every request; triggering compaction below that budget keeps
+    the requests the providers see untouched, so their prompt cache holds.
+    """
+    limit = float(window_tokens) * ratio
+    if budget_tokens is not None and budget_tokens > 0:
+        limit = min(limit, float(budget_tokens))
+    return limit
+
+
+def should_compact(
+    estimated_tokens: int,
+    window_tokens: int,
+    ratio: float,
+    budget_tokens: int | None = None,
+) -> bool:
+    """The single trigger: the live request estimate is over the limit."""
     if window_tokens <= 0:
         return False
-    return estimated_tokens > window_tokens * ratio
+    return estimated_tokens > trigger_limit_tokens(window_tokens, ratio, budget_tokens)
 
 
 def is_ephemeral_session(session_key: str | None) -> bool:
@@ -416,8 +439,13 @@ class CompactionService:
     def ratio(self) -> float:
         return self._ratio
 
-    def should_compact(self, estimated_tokens: int, window_tokens: int) -> bool:
-        return should_compact(estimated_tokens, window_tokens, self._ratio)
+    def should_compact(
+        self,
+        estimated_tokens: int,
+        window_tokens: int,
+        budget_tokens: int | None = None,
+    ) -> bool:
+        return should_compact(estimated_tokens, window_tokens, self._ratio, budget_tokens)
 
     async def _summarize(
         self,
@@ -463,6 +491,7 @@ class CompactionService:
         message_tokens: Callable[[Sequence[Message]], int],
         force: bool = False,
         input_entry: dict[str, Any] | None = None,
+        budget_tokens: int | None = None,
     ) -> CompactionResult:
         """Compact *messages* when over the trigger (or when *force* is set).
 
@@ -479,7 +508,7 @@ class CompactionService:
             tokens_before=estimated_tokens,
             tokens_after=estimated_tokens,
         )
-        if not force and not self.should_compact(estimated_tokens, window_tokens):
+        if not force and not self.should_compact(estimated_tokens, window_tokens, budget_tokens):
             unchanged.reason = "under_threshold"
             return unchanged
         compaction_id = new_compaction_id()
@@ -500,7 +529,8 @@ class CompactionService:
             prefix = prefix[2:]
 
         overhead = max(0, estimated_tokens - message_tokens(messages))
-        budget = max(1, int(window_tokens * self._ratio) - overhead - SUMMARY_MAX_TOKENS)
+        limit = trigger_limit_tokens(window_tokens, self._ratio, budget_tokens)
+        budget = max(1, int(limit) - overhead - SUMMARY_MAX_TOKENS)
         input_end, rounds = _current_turn_rounds(current)
         keep_from = 0
         folded_rounds = 0
@@ -526,6 +556,22 @@ class CompactionService:
             unchanged.reason = "nothing_to_compact"
             unchanged.compaction_id = compaction_id
             self._notify("skipped", compaction_id, reason="nothing_to_compact")
+            return unchanged
+        if not force and overhead + message_tokens(kept_current) > limit:
+            # Preflight: the kept current turn alone is over the limit, so
+            # summarizing (and durably rewriting) older history would cost
+            # that context and still not let this request through. (A forced
+            # call -- the provider already refused -- carries the provider's
+            # numbers instead of a live estimate and always tries.)
+            unchanged.reason = "current_turn_too_large"
+            unchanged.compaction_id = compaction_id
+            self._notify(
+                "skipped",
+                compaction_id,
+                reason="current_turn_too_large",
+                tokens_before=estimated_tokens,
+                context_window_tokens=window_tokens,
+            )
             return unchanged
 
         self._notify(

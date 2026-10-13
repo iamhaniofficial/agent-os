@@ -1058,7 +1058,7 @@ async def test_inline_overflow_still_triggers_for_large_live_provider_request(
     provider = _HighUsageToolLoopProvider(tool_rounds=0, input_tokens_per_call=1)
     large_tool = ToolDefinition(
         name="large_context_tool",
-        description="large live request surface " + ("z" * 6000),
+        description="large live request surface " + ("z" * 2000),
         input_schema=ToolInputSchema(),
     )
     summarize_calls: list[dict[str, Any]] = []
@@ -1066,31 +1066,28 @@ async def test_inline_overflow_still_triggers_for_large_live_provider_request(
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            context_window_tokens=3000,
+            context_window_tokens=12_000,
             context_overflow_threshold=0.5,
-            system_prompt="live request system context " + ("s" * 2000),
+            system_prompt="live request system context " + ("s" * 1000),
         ),
         tool_definitions=[large_tool],
     )
-    agent.set_history(
-        [
-            Message(role="user", content="earlier question"),
-            Message(role="assistant", content="earlier answer"),
-        ]
-    )
+    earlier = [
+        Message(role="user", content="earlier question " + "q" * 3000),
+        Message(role="assistant", content="earlier answer " + "a" * 3000),
+    ]
+    agent.set_history(list(earlier))
     _patch_summarizer(monkeypatch, calls=summarize_calls)
 
     events = [event async for event in agent.run_turn("hello")]
 
     assert any(isinstance(event, DoneEvent) for event in events)
     assert len(provider.calls) == 1
-    # The check runs before the call, over the history the request carries;
-    # this turn's input is not folded into the compaction.
+    # The check runs before the call over the whole live request: the history
+    # alone is under the limit, the system prompt and tools push it over.
+    # This turn's input is not folded in.
     assert len(summarize_calls) == 1
-    assert [message.content for message in summarize_calls[0]["messages"]] == [
-        "earlier question",
-        "earlier answer",
-    ]
+    assert summarize_calls[0]["messages"] == earlier
     sent = provider.calls[0]
     assert sent[0].content == "[Context summary]\nshort summary"
     assert str(sent[-1].content).startswith("hello")
@@ -1253,7 +1250,11 @@ async def test_overflow_compaction_keeps_unseen_tool_results_verbatim(
         ),
         tool_handler=_big_tool,
     )
-    agent.set_history([Message(role="user", content="q"), Message(role="assistant", content="a")])
+    history = [
+        Message(role="user", content="q" * 1200),
+        Message(role="assistant", content="a" * 1200),
+    ]
+    agent.set_history(list(history))
 
     events = [event async for event in agent.run_turn("read the file")]
 
@@ -1261,7 +1262,7 @@ async def test_overflow_compaction_keeps_unseen_tool_results_verbatim(
     assert len(summarize_calls) == 1
     # Compaction summarizes everything before the current turn; the current
     # turn (its input and the new tool round) is kept verbatim.
-    assert [message.content for message in summarize_calls[0]["messages"]] == ["q", "a"]
+    assert summarize_calls[0]["messages"] == history
     second = provider.calls[1]
     assert str(second[2].content).startswith("read the file")
     tool_results = [
@@ -1277,8 +1278,28 @@ async def test_overflow_compaction_keeps_unseen_tool_results_verbatim(
     assert any(isinstance(event, DoneEvent) for event in events)
 
 
+@pytest.mark.asyncio
+async def test_preflight_never_summarizes_history_for_a_turn_too_large_on_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentos.engine.types import CompactionEvent
+
+    summarize_calls: list[dict[str, Any]] = []
+    _patch_summarizer(monkeypatch, calls=summarize_calls)
+    provider = _TextThenToolProvider(tool_rounds=0)
+    agent = _overflowing_agent(provider, max_overflow_retries=2)
+
+    events = [event async for event in agent.run_turn("p" * 20_000)]
+
+    assert summarize_calls == []
+    assert not any(isinstance(event, CompactionEvent) for event in events)
+    # The request goes out untouched; the provider has the final word.
+    assert provider.calls[0][: len(_LARGE_HISTORY)] == _LARGE_HISTORY
+    assert agent.transcript_record()["mode"] == "append"
+
+
 async def _big_tool(call: Any) -> ToolResult:
-    return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="r" * 6000)
+    return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="r" * 1500)
 
 
 @pytest.mark.asyncio

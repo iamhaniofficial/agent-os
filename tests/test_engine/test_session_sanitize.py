@@ -1075,7 +1075,7 @@ async def test_compaction_keeps_the_current_turn_with_its_context_blocks() -> No
         turn_input_index=2,
         estimated_tokens=10_000,
         window_tokens=1_000,
-        message_tokens=lambda items: sum(len(str(m.content)) for m in items) // 4,
+        message_tokens=lambda items: 9_900 if len(items) > 1 else 50,
     )
 
     assert result.compacted
