@@ -162,6 +162,9 @@ class DoneEvent:
     # ``index``. Store them on :attr:`Message.reasoning_details`; the
     # OpenAI-compatible provider re-sends them verbatim to OpenRouter.
     reasoning_details: list[dict[str, Any]] | None = None
+    # False when the provider's usage carried no cache-read figure at all
+    # (unknown, not zero hits); the cache-break monitor skips such responses.
+    cache_usage_reported: bool = True
 
     def __post_init__(self) -> None:
         given = self.stop_reason

@@ -2592,6 +2592,8 @@ class Agent:
                             self._session_key,
                             cache_prompt_snapshot,
                             provider_done_for_log.cached_tokens,
+                            usage_reported=bool(provider_done_for_log.input_tokens)
+                            and getattr(provider_done_for_log, "cache_usage_reported", True),
                         )
                         if cache_report.break_detected:
                             logger.warning(
