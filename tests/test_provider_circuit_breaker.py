@@ -120,6 +120,68 @@ def test_unclassified_failure_counts() -> None:
     assert breaker.record_failure("openrouter") is BreakerState.OPEN
 
 
+def test_rate_limit_with_a_short_retry_after_does_not_trip() -> None:
+    """A hinted 429 is backpressure; three of them must not park the provider (#3646)."""
+    clock = FakeClock()
+    breaker = _breaker(clock, threshold=3)
+    kind = ProviderFailureKind.RATE_LIMITED
+
+    assert trips_breaker(kind, 2.0) is False
+    for _ in range(5):
+        state = breaker.record_failure("openrouter", kind, "429", retry_after_seconds=2.0)
+
+    assert state is BreakerState.CLOSED
+    assert breaker.status("openrouter").consecutive_failures == 0
+    assert breaker.allow("openrouter") is True
+
+
+def test_rate_limit_without_a_hint_still_trips() -> None:
+    clock = FakeClock()
+    breaker = _breaker(clock, threshold=3)
+    kind = ProviderFailureKind.RATE_LIMITED
+
+    for _ in range(3):
+        state = breaker.record_failure("openrouter", kind, "429")
+
+    assert state is BreakerState.OPEN
+
+
+def test_rate_limit_with_a_long_retry_after_still_trips() -> None:
+    clock = FakeClock()
+    breaker = _breaker(clock, threshold=1)
+    kind = ProviderFailureKind.RATE_LIMITED
+
+    assert trips_breaker(kind, 120.0) is True
+    assert breaker.record_failure("openrouter", kind, "429", retry_after_seconds=120.0) is (
+        BreakerState.OPEN
+    )
+    # The cap is the caller's: a 120 s hint under a 300 s cap is exempt.
+    assert trips_breaker(kind, 120.0, retry_after_cap_seconds=300.0) is False
+    # And a zero cap turns the exemption off.
+    assert trips_breaker(kind, 1.0, retry_after_cap_seconds=0.0) is True
+
+
+def test_retry_after_only_exempts_rate_limits() -> None:
+    """A 503 that names a wait is still an outage signal."""
+    assert trips_breaker(ProviderFailureKind.PROVIDER_OVERLOADED, 2.0) is True
+    assert trips_breaker(ProviderFailureKind.TRANSPORT_TRANSIENT, 2.0) is True
+
+
+def test_hinted_rate_limit_releases_a_half_open_probe() -> None:
+    clock = FakeClock()
+    breaker = _breaker(clock, threshold=1, cooldown=10.0)
+    _fail(breaker, "openrouter", 1)
+    clock.advance(10.0)
+    assert breaker.allow("openrouter") is True  # this caller is the probe
+
+    breaker.record_failure(
+        "openrouter", ProviderFailureKind.RATE_LIMITED, "429", retry_after_seconds=1.0
+    )
+
+    assert breaker.state("openrouter") is BreakerState.HALF_OPEN
+    assert breaker.allow("openrouter") is True  # slot handed back
+
+
 def test_breaker_state_is_per_provider() -> None:
     clock = FakeClock()
     breaker = _breaker(clock, threshold=1)

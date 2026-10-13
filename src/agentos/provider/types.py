@@ -90,7 +90,13 @@ class ErrorEvent:
 
     kind: Literal["error"] = field(default="error", init=False)
     message: str = ""
+    #: The HTTP status as a string (``"429"``) for a non-200 response, else an
+    #: upstream error token (``"timeout"``, ``"overloaded_error"``, ...).
     code: str = ""
+    #: Seconds the provider asked us to wait before retrying, read from
+    #: ``Retry-After`` (or a vendor rate-limit reset header) and clamped to
+    #: ``[0, 300]``. ``None`` when the response carried no usable hint.
+    retry_after_seconds: float | None = None
 
 
 @dataclass

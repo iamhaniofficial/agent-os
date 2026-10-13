@@ -269,6 +269,29 @@ curl localhost:8787/api/system/status   # circuitBreaker / circuitBreakers
 
 Breaker state lives in the running gateway only; restarting clears it.
 
+### Rate limits that say when to come back
+
+A 429 (or an overload) whose response names a wait is backpressure, not an
+outage. AgentOS reads that wait from `Retry-After` (delta-seconds or an
+HTTP-date), `retry-after-ms`, or, when neither is sent, the reset header of
+whichever limit is spent (OpenAI's `x-ratelimit-reset-requests` /
+`x-ratelimit-reset-tokens`, Anthropic's `anthropic-ratelimit-*-reset`). Waits
+are clamped to 0–300 s.
+
+- When the wait is at most 30 s, the turn sleeps exactly that long (plus up to
+  10 % jitter, capped at 1 s) and retries the **same** model, so the prompt
+  cache and the price stay as they were. Each wait counts against the agent's
+  provider retries (`--max-provider-retries`, default `3`); once they are spent
+  the turn fails over to the next model in the chain.
+- A longer wait fails over straight away, as before.
+- A rate limit with a short wait does not count toward the circuit breaker.
+  One without a wait, or with a longer one, still does, and so does an
+  overload / 5xx whatever it says.
+- A rate limit with no wait at all keeps the exponential backoff.
+
+The 30 s cap is `AgentConfig.rate_limit_retry_after_cap_seconds` for embedded
+callers; `0` turns the behaviour off. It has no `agentos.toml` key.
+
 ## Provider Troubleshooting
 
 Start with:

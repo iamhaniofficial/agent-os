@@ -26,7 +26,7 @@ from agentos.engine.cache_break_monitor import (
     notify_compaction,
     record_prompt_state,
 )
-from agentos.engine.fallback import FallbackPolicy, backoff_sleep
+from agentos.engine.fallback import FallbackPolicy, backoff_sleep, retry_after_delay
 from agentos.engine.history import limit_turns, repair_tool_pairing
 from agentos.engine.progress_watchdog import (
     ProgressObservation,
@@ -89,6 +89,7 @@ from agentos.provider import (
 from agentos.provider.failures import (
     ProviderFailureKind,
     classify_provider_error,
+    honoured_retry_after,
     is_transport_timeout,
 )
 from agentos.provider.types import ContentBlockImage
@@ -1921,6 +1922,15 @@ class Agent:
             base_backoff_ms=self.config.retry_base_backoff_ms,
             max_backoff_ms=self.config.retry_max_backoff_ms,
         )
+        _retry_after_cap_s = float(self.config.rate_limit_retry_after_cap_seconds)
+        # The selector-fallback wrapper decides whether a hinted 429 fails over
+        # straight away; it has to use the same cap this loop waits under.
+        _adopt_retry_after_cap = getattr(self.provider, "set_retry_after_cap_seconds", None)
+        if callable(_adopt_retry_after_cap):
+            try:
+                _adopt_retry_after_cap(_retry_after_cap_s)
+            except Exception:  # noqa: BLE001 - optional provider hook
+                logger.debug("provider.retry_after_cap_hook_failed", exc_info=True)
 
         # Timeout budgets: optional total turn budget, idle LLM stream budget,
         # and per-tool execution budget.
@@ -2153,6 +2163,7 @@ class Agent:
                 )
                 _attempt_retries_used = _retry_policy.used_attempts()
                 _invalid_response_fallback_done = False
+                _retry_after_fallback_done = False
                 while _retry_attempt <= _fallback.max_retries:
                     provider_error = None
                     assistant_text_parts = []
@@ -2986,6 +2997,60 @@ class Agent:
                             )
                             _call_attempt += 1
                             continue
+                        _retry_after_s = honoured_retry_after(
+                            failure_kind,
+                            provider_error.retry_after_seconds,
+                            _retry_after_cap_s,
+                        )
+                        if _retry_after_s is not None:
+                            # The provider named a short wait. Honour it on the
+                            # same model (keeps the prompt cache and the price)
+                            # rather than a blind backoff or a failover.
+                            if _fallback.should_retry(kind, _retry_attempt):
+                                delay = retry_after_delay(_retry_after_s)
+                                _log.warning(
+                                    "provider.retry_after_wait",
+                                    attempt=_retry_attempt + 1,
+                                    kind=failure_kind.value,
+                                    retry_after_s=round(_retry_after_s, 3),
+                                    delay_s=round(delay, 2),
+                                )
+                                yield WarningEvent(
+                                    code="provider_retry_after_wait",
+                                    message=(
+                                        "The provider asked to retry in "
+                                        f"{_retry_after_s:g}s; waiting, then retrying "
+                                        "the same model."
+                                    ),
+                                )
+                                await asyncio.sleep(delay)
+                                _retry_attempt += 1
+                                _call_attempt += 1
+                                continue
+                            # Retries spent: now fail over, once, as an unhinted
+                            # rate limit would have done on the first error.
+                            if (
+                                not _retry_after_fallback_done
+                                and self._switch_to_invalid_response_fallback(
+                                    provider_error.message
+                                )
+                            ):
+                                _retry_after_fallback_done = True
+                                _log.warning(
+                                    "provider.retry_after_fallback",
+                                    attempt=_retry_attempt,
+                                    kind=failure_kind.value,
+                                    retry_after_s=round(_retry_after_s, 3),
+                                )
+                                yield WarningEvent(
+                                    code="provider_retry_after_fallback",
+                                    message=(
+                                        "The provider is still asking to wait; "
+                                        "switching to the fallback model."
+                                    ),
+                                )
+                                _call_attempt += 1
+                                continue
                         _is_timeout = is_transport_timeout(
                             raw_code=provider_error.code,
                             message=provider_error.message,

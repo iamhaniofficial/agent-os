@@ -151,6 +151,8 @@ from agentos.provider import (
     decide_recovery_action,
 )
 from agentos.provider.circuit_breaker import trips_breaker
+from agentos.provider.failures import honoured_retry_after
+from agentos.provider.retry_after import DEFAULT_RETRY_AFTER_CAP_SECONDS
 from agentos.result_budget import persisted_result_max_chars
 from agentos.router_control import (
     RouterControlHoldStore,
@@ -1147,11 +1149,47 @@ class _SelectorFallbackProvider:
     Also feeds the selector's circuit breaker: provider-health failures are
     counted so a sustained outage opens the breaker, and the first forwarded
     content event (or a clean ``done``) closes it again.
+
+    A rate limit / overload that carries a short ``Retry-After`` hint (at most
+    ``retry_after_cap_seconds``) is *not* failed over here: the error is passed
+    through untouched so the agent loop can wait out the hint and retry the
+    same model, keeping its prompt cache. The agent asks this wrapper to fail
+    over (``fallback_after_invalid_response``) only once its retries are spent.
     """
 
-    def __init__(self, provider: Any, selector: Any) -> None:
+    def __init__(
+        self,
+        provider: Any,
+        selector: Any,
+        *,
+        retry_after_cap_seconds: float = DEFAULT_RETRY_AFTER_CAP_SECONDS,
+    ) -> None:
         self._provider = provider
         self._selector = selector
+        self._retry_after_cap_seconds = float(retry_after_cap_seconds)
+
+    def set_retry_after_cap_seconds(self, seconds: float) -> None:
+        """Adopt the agent's ``rate_limit_retry_after_cap_seconds``."""
+        self._retry_after_cap_seconds = float(seconds)
+
+    def _honoured_retry_after(
+        self, kind: ProviderFailureKind, event: ProviderErrorEvent
+    ) -> float | None:
+        return honoured_retry_after(
+            kind,
+            getattr(event, "retry_after_seconds", None),
+            self._retry_after_cap_seconds,
+        )
+
+    def _note_failure(self, kind: ProviderFailureKind, event: ProviderErrorEvent) -> bool:
+        """Record ``event`` against the breaker; True when it counted as a trip."""
+        retry_after = getattr(event, "retry_after_seconds", None)
+        self._record_failure(kind, event.message, retry_after)
+        return trips_breaker(
+            kind,
+            retry_after,
+            retry_after_cap_seconds=self._retry_after_cap_seconds,
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
@@ -1160,12 +1198,35 @@ class _SelectorFallbackProvider:
     def provider_name(self) -> str:
         return getattr(self._provider, "provider_name", "")
 
-    def _record_failure(self, kind: ProviderFailureKind, reason: str) -> None:
+    def _record_failure(
+        self,
+        kind: ProviderFailureKind,
+        reason: str,
+        retry_after_seconds: float | None = None,
+    ) -> None:
         recorder = getattr(self._selector, "record_provider_failure", None)
         if recorder is None:
             return
         try:
-            recorder(kind, reason)
+            if retry_after_seconds is None:
+                recorder(kind, reason)
+                return
+            try:
+                recorder(
+                    kind,
+                    reason,
+                    retry_after_seconds=retry_after_seconds,
+                    retry_after_cap_seconds=self._retry_after_cap_seconds,
+                )
+            except TypeError:
+                # A selector stand-in that predates the hint (tests, plugins):
+                # apply the exemption here and record the old way.
+                if trips_breaker(
+                    kind,
+                    retry_after_seconds,
+                    retry_after_cap_seconds=self._retry_after_cap_seconds,
+                ):
+                    recorder(kind, reason)
         except Exception:  # pragma: no cover - breaker must never break a turn
             log.debug("selector_fallback.breaker_failure_record_failed", exc_info=True)
 
@@ -1225,8 +1286,14 @@ class _SelectorFallbackProvider:
                 if not recorded_failure:
                     # One vote per stream: a provider that emits several error
                     # events for one request is still a single failed turn.
-                    recorded_failure = trips_breaker(kind)
-                    self._record_failure(kind, event.message)
+                    recorded_failure = self._note_failure(kind, event)
+                if self._honoured_retry_after(kind, event) is not None:
+                    # Short Retry-After: hand it to the agent loop, which waits
+                    # it out and retries this same model.
+                    for buffered_event in drain_pre_accept_buffer():
+                        yield buffered_event
+                    yield event
+                    continue
                 if _kind_uses_selector_fallback(kind):
                     failed_model = _selector_model_name(self._provider, self._selector)
                     try:
@@ -1316,10 +1383,10 @@ class _SelectorFallbackProvider:
                 # earlier one's kind.
                 kind = _classify_provider_event(self.provider_name, event)
                 if not recorded_failure:
-                    recorded_failure = trips_breaker(kind)
-                    self._record_failure(kind, event.message)
+                    recorded_failure = self._note_failure(kind, event)
                 if (
                     not emitted_content
+                    and self._honoured_retry_after(kind, event) is None
                     and _kind_uses_selector_fallback(kind)
                     and _selector_has_fallback(self._selector)
                 ):

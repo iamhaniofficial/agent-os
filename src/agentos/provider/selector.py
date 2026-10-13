@@ -16,6 +16,7 @@ from .openai import OpenAIProvider
 from .openai_responses import OpenAIResponsesProvider
 from .protocol import LLMProvider, ProviderPlugin, resolve_failover_chain
 from .registry import UnknownProviderError, get_provider_spec
+from .retry_after import DEFAULT_RETRY_AFTER_CAP_SECONDS
 
 
 @dataclass
@@ -214,9 +215,22 @@ class ModelSelector:
         self,
         kind: ProviderFailureKind | None = None,
         reason: str = "",
+        *,
+        retry_after_seconds: float | None = None,
+        retry_after_cap_seconds: float = DEFAULT_RETRY_AFTER_CAP_SECONDS,
     ) -> BreakerState:
-        """Count a failure against the currently-active chain link."""
-        return self._breaker.record_failure(self.active_provider_id, kind=kind, reason=reason)
+        """Count a failure against the currently-active chain link.
+
+        A rate limit with a short ``retry_after_seconds`` hint is exempt; see
+        :func:`~agentos.provider.circuit_breaker.trips_breaker`.
+        """
+        return self._breaker.record_failure(
+            self.active_provider_id,
+            kind=kind,
+            reason=reason,
+            retry_after_seconds=retry_after_seconds,
+            retry_after_cap_seconds=retry_after_cap_seconds,
+        )
 
     def record_provider_success(self) -> None:
         """Clear the currently-active chain link's failure history."""
