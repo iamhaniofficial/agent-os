@@ -1135,9 +1135,18 @@ def _selector_has_fallback(selector: Any) -> bool:
 class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors.
 
+    Streaming rule: every event is forwarded as soon as the stream has produced
+    one that proves the provider accepted the request — a non-empty text or
+    thinking delta, a tool-use event, or a provider heartbeat. Only a provider
+    error that arrives before any *content* event (text, thinking, tool use)
+    triggers the transparent failover to the selector's next provider; once
+    content has been forwarded, later errors pass through and the agent loop's
+    own retry policy handles them. Heartbeats are forwarded immediately but are
+    not content, so an error after heartbeats alone may still fail over.
+
     Also feeds the selector's circuit breaker: provider-health failures are
-    counted so a sustained outage opens the breaker, and the first byte of
-    real content closes it again.
+    counted so a sustained outage opens the breaker, and the first forwarded
+    content event (or a clean ``done``) closes it again.
     """
 
     def __init__(self, provider: Any, selector: Any) -> None:
@@ -1190,19 +1199,23 @@ class _SelectorFallbackProvider:
         tools: Any = None,
         config: Any = None,
     ) -> AsyncIterator[Any]:
-        emitted_user_visible_content = False
+        emitted_content = False
+        accepted = False
         saw_provider_error = False
         recorded_success = False
         recorded_failure = False
-        pre_text_buffer: list[Any] = []
+        # Only events that prove nothing (empty deltas, unknown kinds) seen before
+        # the provider has shown any sign of life are held back, so a failover
+        # does not leak a dead attempt's noise into the fallback's stream.
+        pre_accept_buffer: list[Any] = []
 
-        def drain_pre_text_buffer() -> list[Any]:
-            drained = list(pre_text_buffer)
-            pre_text_buffer.clear()
+        def drain_pre_accept_buffer() -> list[Any]:
+            drained = list(pre_accept_buffer)
+            pre_accept_buffer.clear()
             return drained
 
         async for event in self._provider.chat(messages, tools=tools, config=config):
-            if emitted_user_visible_content:
+            if emitted_content:
                 yield event
                 continue
 
@@ -1221,7 +1234,7 @@ class _SelectorFallbackProvider:
                             RuntimeError(event.message)
                         )
                     except Exception:
-                        for buffered_event in drain_pre_text_buffer():
+                        for buffered_event in drain_pre_accept_buffer():
                             yield buffered_event
                         yield event
                         return
@@ -1236,15 +1249,16 @@ class _SelectorFallbackProvider:
                     async for fallback_event in self._fallback_chat(messages, tools, config):
                         yield fallback_event
                     return
-                for buffered_event in drain_pre_text_buffer():
+                for buffered_event in drain_pre_accept_buffer():
                     yield buffered_event
                 yield event
                 continue
 
-            if _is_non_empty_provider_text_delta(event):
-                for buffered_event in drain_pre_text_buffer():
+            if _is_provider_content_event(event):
+                for buffered_event in drain_pre_accept_buffer():
                     yield buffered_event
-                emitted_user_visible_content = True
+                accepted = True
+                emitted_content = True
                 if not recorded_success:
                     recorded_success = True
                     self._record_success()
@@ -1252,19 +1266,32 @@ class _SelectorFallbackProvider:
                 continue
 
             if getattr(event, "kind", "") == "done":
-                for buffered_event in drain_pre_text_buffer():
+                for buffered_event in drain_pre_accept_buffer():
                     yield buffered_event
                 # A clean stream proves the provider is healthy — including a
-                # tool-use-only turn that never emits user-visible text.
+                # turn that never emits any content at all.
                 if not saw_provider_error and not recorded_success:
                     recorded_success = True
                     self._record_success()
                 yield event
                 continue
 
-            pre_text_buffer.append(event)
+            if isinstance(event, ProviderHeartbeatEvent):
+                # Liveness, not content: forward at once so idle watchdogs see
+                # it, but keep the transparent failover available.
+                for buffered_event in drain_pre_accept_buffer():
+                    yield buffered_event
+                accepted = True
+                yield event
+                continue
 
-        for buffered_event in drain_pre_text_buffer():
+            if accepted:
+                yield event
+                continue
+
+            pre_accept_buffer.append(event)
+
+        for buffered_event in drain_pre_accept_buffer():
             yield buffered_event
 
     async def _fallback_chat(
@@ -1273,18 +1300,29 @@ class _SelectorFallbackProvider:
         tools: Any,
         config: Any,
     ) -> AsyncIterator[Any]:
-        """Stream the post-failover provider, recording its own breaker outcome."""
+        """Stream the post-failover provider, recording its own breaker outcome.
+
+        Same rule as :meth:`_chat`: events are forwarded as they arrive, and a
+        further failover only happens while no content has been forwarded yet.
+        """
+        emitted_content = False
         saw_provider_error = False
         recorded_success = False
         recorded_failure = False
         async for event in self._provider.chat(messages, tools=tools, config=config):
             if isinstance(event, ProviderErrorEvent):
                 saw_provider_error = True
+                # Classify every error: a later error must not be judged by an
+                # earlier one's kind.
+                kind = _classify_provider_event(self.provider_name, event)
                 if not recorded_failure:
-                    kind = _classify_provider_event(self.provider_name, event)
                     recorded_failure = trips_breaker(kind)
                     self._record_failure(kind, event.message)
-                if _kind_uses_selector_fallback(kind) and _selector_has_fallback(self._selector):
+                if (
+                    not emitted_content
+                    and _kind_uses_selector_fallback(kind)
+                    and _selector_has_fallback(self._selector)
+                ):
                     failed_model = _selector_model_name(self._provider, self._selector)
                     try:
                         self._provider = self._selector.next_fallback_after_failure(
@@ -1303,9 +1341,15 @@ class _SelectorFallbackProvider:
                         return
                     except Exception:
                         pass
-            elif not recorded_success and (
-                _is_non_empty_provider_text_delta(event)
-                or (getattr(event, "kind", "") == "done" and not saw_provider_error)
+            elif _is_provider_content_event(event):
+                emitted_content = True
+                if not recorded_success:
+                    recorded_success = True
+                    self._record_success()
+            elif (
+                not recorded_success
+                and getattr(event, "kind", "") == "done"
+                and not saw_provider_error
             ):
                 recorded_success = True
                 self._record_success()
@@ -1315,9 +1359,21 @@ class _SelectorFallbackProvider:
         return list(await self._provider.list_models())
 
 
-def _is_non_empty_provider_text_delta(event: Any) -> bool:
-    """Return True only once a provider event carries user-visible text."""
-    return getattr(event, "kind", "") == "text_delta" and bool(getattr(event, "text", ""))
+_PROVIDER_TOOL_USE_EVENT_KINDS: Final = frozenset(
+    {"tool_use_start", "tool_use_delta", "tool_use_end"}
+)
+
+
+def _is_provider_content_event(event: Any) -> bool:
+    """Return True for an event that commits the stream to this provider.
+
+    Non-empty text or thinking deltas and any tool-use event count; heartbeats,
+    errors, ``done`` and empty deltas do not.
+    """
+    kind = getattr(event, "kind", "")
+    if kind in ("text_delta", "thinking_delta"):
+        return bool(getattr(event, "text", ""))
+    return kind in _PROVIDER_TOOL_USE_EVENT_KINDS
 
 
 @dataclass
