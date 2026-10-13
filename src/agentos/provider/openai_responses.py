@@ -19,6 +19,7 @@ from agentos.secrets import clean_header_secret
 
 from .openai import _http_error_body_text, _resolve_llm_proxy
 from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .retry_after import retry_after_from_response
 from .types import (
     ChatConfig,
     ContentBlockText,
@@ -267,7 +268,11 @@ class OpenAIResponsesProvider:
             message = f"OpenAI Responses API error {response.status_code}"
             if detail:
                 message = f"{message}: {detail}"
-            yield ErrorEvent(message=message, code=str(response.status_code))
+            yield ErrorEvent(
+                message=message,
+                code=str(response.status_code),
+                retry_after_seconds=retry_after_from_response(response),
+            )
             return
 
         try:

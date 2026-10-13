@@ -30,6 +30,7 @@ from .request_proof import (
     ProviderRequestBudgetExceededError,
     prove_provider_payload_from_env,
 )
+from .retry_after import retry_after_from_response
 from .text_tool_protocol import parse_text_tool_calls
 from .types import (
     ChatConfig,
@@ -1076,6 +1077,7 @@ class OpenAIProvider:
                         yield ErrorEvent(
                             message=message,
                             code=str(response.status_code),
+                            retry_after_seconds=retry_after_from_response(response),
                         )
                         return
 
@@ -1352,6 +1354,7 @@ class OpenAIProvider:
                     response.text,
                 ),
                 code=str(response.status_code),
+                retry_after_seconds=retry_after_from_response(response),
             )
             return
 

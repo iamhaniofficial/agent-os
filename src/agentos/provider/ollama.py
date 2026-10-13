@@ -11,6 +11,7 @@ import httpx
 from agentos.env import trust_env as _trust_env
 
 from .reasoning import ThinkTagStreamSplitter
+from .retry_after import retry_after_from_response
 from .types import (
     ChatConfig,
     DoneEvent,
@@ -364,6 +365,7 @@ class OllamaProvider:
                                 self._base_url,
                             ),
                             code=str(response.status_code),
+                            retry_after_seconds=retry_after_from_response(response),
                         )
                         return
 

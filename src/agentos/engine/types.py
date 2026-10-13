@@ -312,6 +312,11 @@ class AgentConfig:
     length_capped_continuations: int = 1
     retry_base_backoff_ms: int = 1000
     retry_max_backoff_ms: int = 30_000
+    # A 429/overload whose Retry-After hint is at most this many seconds is
+    # waited out on the same provider (counting against max_provider_retries)
+    # instead of failing over, and does not trip the provider's circuit
+    # breaker. 0 disables honouring the hint.
+    rate_limit_retry_after_cap_seconds: float = 30.0
     # Prompt caching breakpoints (list of {"text": ..., "cache": "true"})
     cache_breakpoints: list[dict[str, str]] | None = None
     cache_mode: Literal["off", "auto", "on"] = "off"

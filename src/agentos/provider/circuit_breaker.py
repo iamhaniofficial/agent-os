@@ -22,6 +22,7 @@ from enum import StrEnum
 from typing import Any
 
 from .failures import ProviderFailureKind
+from .retry_after import DEFAULT_RETRY_AFTER_CAP_SECONDS
 
 DEFAULT_FAILURE_THRESHOLD = 3
 DEFAULT_COOLDOWN_SECONDS = 60.0
@@ -54,9 +55,30 @@ TRIPPING_FAILURE_KINDS: frozenset[ProviderFailureKind] = frozenset(
 )
 
 
-def trips_breaker(kind: ProviderFailureKind | None) -> bool:
-    """True when ``kind`` counts toward opening a provider's breaker."""
-    return kind is not None and kind in TRIPPING_FAILURE_KINDS
+def trips_breaker(
+    kind: ProviderFailureKind | None,
+    retry_after_seconds: float | None = None,
+    *,
+    retry_after_cap_seconds: float = DEFAULT_RETRY_AFTER_CAP_SECONDS,
+) -> bool:
+    """True when ``kind`` counts toward opening a provider's breaker.
+
+    A rate limit that came with a short ``Retry-After`` (at most
+    ``retry_after_cap_seconds``) is backpressure, not an outage: the provider
+    said exactly when it will take the request, and the engine waits that long
+    and retries it. Counting it would park a healthy provider for a minute
+    after three brief 429s.
+    """
+    if kind is None or kind not in TRIPPING_FAILURE_KINDS:
+        return False
+    if (
+        kind is ProviderFailureKind.RATE_LIMITED
+        and retry_after_seconds is not None
+        and retry_after_cap_seconds > 0
+        and 0 <= retry_after_seconds <= retry_after_cap_seconds
+    ):
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -239,16 +261,25 @@ class ProviderCircuitBreaker:
         provider: str,
         kind: ProviderFailureKind | None = None,
         reason: str = "",
+        *,
+        retry_after_seconds: float | None = None,
+        retry_after_cap_seconds: float = DEFAULT_RETRY_AFTER_CAP_SECONDS,
     ) -> BreakerState:
         """Count a failure against ``provider`` and return the resulting state.
 
         Failures whose ``kind`` is not in :data:`TRIPPING_FAILURE_KINDS` are
-        ignored — they say something about the request, not the provider.
-        Passing ``kind=None`` means "unclassified provider fault" and counts.
+        ignored — they say something about the request, not the provider — and
+        so is a rate limit carrying a short ``retry_after_seconds`` hint (see
+        :func:`trips_breaker`). Passing ``kind=None`` means "unclassified
+        provider fault" and counts.
         """
         if not self._settings.enabled or not provider:
             return BreakerState.CLOSED
-        if kind is not None and not trips_breaker(kind):
+        if kind is not None and not trips_breaker(
+            kind,
+            retry_after_seconds,
+            retry_after_cap_seconds=retry_after_cap_seconds,
+        ):
             with self._lock:
                 entry = self._entries.get(provider)
                 if entry is None:

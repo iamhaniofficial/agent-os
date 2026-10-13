@@ -40,6 +40,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [2026.10.4] - 2026-10-04
 
 ### Fixed
+- Providers: a 429 that said `Retry-After: 2` failed over to another model at
+  once -- losing the prompt cache and changing the cost -- and three of them
+  marked the primary provider down for a minute. The providers threw the
+  response headers away with the error, so nothing downstream knew the wait
+  was two seconds. Anthropic, OpenAI-compatible (OpenRouter, DeepSeek, ...),
+  OpenAI Responses and Ollama errors now carry the hint (`Retry-After` as
+  seconds or an HTTP-date, `retry-after-ms`, or the OpenAI / Anthropic
+  rate-limit reset headers, clamped to 0-300 s). A rate limit or overload
+  whose wait is at most 30 s is slept out on the same model, counting against
+  the provider retries, and fails over only once those are spent; it no longer
+  counts toward the circuit breaker. Longer or missing hints behave as before.
+  (#3646)
 - Chat (desktop and web console): the first message to a session could fail
   with "Send failed: session_key conflict", and sending it again worked.
   New chat stamps a `new_chat` intent for the first send of its fresh key, but

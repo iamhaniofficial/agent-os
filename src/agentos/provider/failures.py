@@ -290,6 +290,36 @@ def decide_recovery_action(kind: ProviderFailureKind) -> ProviderRecoveryAction:
     return ProviderRecoveryAction.SURFACE
 
 
+#: Failure kinds where a provider's ``Retry-After`` hint means "wait, then ask
+#: me again" rather than "go elsewhere".
+RETRY_AFTER_KINDS: frozenset[ProviderFailureKind] = frozenset(
+    {
+        ProviderFailureKind.RATE_LIMITED,
+        ProviderFailureKind.PROVIDER_OVERLOADED,
+    }
+)
+
+
+def honoured_retry_after(
+    kind: ProviderFailureKind | None,
+    retry_after_seconds: float | None,
+    cap_seconds: float,
+) -> float | None:
+    """Return the wait to honour before retrying the same provider, or ``None``.
+
+    A hint is honoured only for a rate-limit / overload failure and only when
+    it is at most ``cap_seconds``; a longer wait is cheaper spent on another
+    model. ``cap_seconds <= 0`` turns the behaviour off.
+    """
+    if kind is None or kind not in RETRY_AFTER_KINDS:
+        return None
+    if retry_after_seconds is None or cap_seconds <= 0:
+        return None
+    if retry_after_seconds < 0 or retry_after_seconds > cap_seconds:
+        return None
+    return float(retry_after_seconds)
+
+
 def is_transport_timeout(raw_code: str = "", message: str = "") -> bool:
     """Return True when the error is specifically a request timeout.
 

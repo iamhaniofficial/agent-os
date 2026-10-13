@@ -17,6 +17,7 @@ from .request_proof import (
     ProviderRequestBudgetExceededError,
     prove_provider_payload_from_env,
 )
+from .retry_after import retry_after_from_response
 from .types import (
     ChatConfig,
     DoneEvent,
@@ -487,6 +488,7 @@ class AnthropicProvider:
                         yield ErrorEvent(
                             message=f"HTTP {response.status_code}: {detail}",
                             code=str(response.status_code),
+                            retry_after_seconds=retry_after_from_response(response),
                         )
                         return
 
