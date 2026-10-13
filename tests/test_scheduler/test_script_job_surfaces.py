@@ -264,9 +264,9 @@ async def test_tool_accepts_a_script_job_without_a_tool_policy(agentos_home, fak
 async def test_script_job_refusals_reach_the_model_intact(agentos_home, fake_scheduler):
     """The refusal has to survive the envelope, not just the raise.
 
-    A plain ``ToolError`` is sanitised to "failed with an internal error", which
-    is what sent one session into seven identical retries: the model was never
-    told which field was wrong.
+    A refusal sanitised to "failed with an internal error" is what sent one
+    session into seven identical retries: the model was never told which field
+    was wrong. Plain ``ToolError`` messages now reach the model too (#3642).
     """
     cases = [
         (
