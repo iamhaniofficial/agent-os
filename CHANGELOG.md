@@ -70,9 +70,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `requires_approval`) instead of a hard-coded list of names in the engine; a
   tool that declares nothing, MCP tools included, still runs alone. Up to 8
   parallel calls run at once (was 6).
-
-
-### Changed
 - Engine: the conversation is now an append-only transcript, so consecutive
   provider requests share a byte-identical prefix and prompt caches keep
   hitting. Every assistant row stores the exact provider-facing messages of
