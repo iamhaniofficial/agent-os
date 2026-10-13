@@ -133,3 +133,15 @@ def backoff_sleep(
         structlog.get_logger().info("backoff_sleep", delay_s=round(delay_s, 2), attempt=attempt)
 
     return float(delay_s)
+
+
+def retry_after_delay(retry_after_seconds: float) -> float:
+    """Seconds to sleep for a provider ``Retry-After`` hint, plus a small jitter.
+
+    The hint is honoured exactly; the jitter (up to 10% of the hint, between
+    0.1 s and 1 s) only keeps concurrent turns that got the same hint from
+    landing on the provider in the same instant.
+    """
+    base = max(0.0, float(retry_after_seconds))
+    jitter_cap = min(1.0, max(0.1, base * 0.1))
+    return base + random.uniform(0.0, jitter_cap)  # noqa: S311

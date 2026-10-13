@@ -30,6 +30,7 @@ from .request_proof import (
     ProviderRequestBudgetExceededError,
     prove_provider_payload_from_env,
 )
+from .retry_after import retry_after_from_response
 from .text_tool_protocol import parse_text_tool_calls
 from .types import (
     ChatConfig,
@@ -46,6 +47,7 @@ from .types import (
     ToolUseDeltaEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
+    normalize_stop_reason,
 )
 
 _OPENAI_API_BASE = "https://api.openai.com"
@@ -993,7 +995,7 @@ class OpenAIProvider:
         billed_cost = 0.0
         cost_source = "none"
         actual_model = self._model
-        stop_reason = "stop"
+        stop_reason: str | None = None
         emitted_stream_event = False
 
         if os.environ.get("AGENTOS_TRACE_ROUTING"):
@@ -1076,6 +1078,7 @@ class OpenAIProvider:
                         yield ErrorEvent(
                             message=message,
                             code=str(response.status_code),
+                            retry_after_seconds=retry_after_from_response(response),
                         )
                         return
 
@@ -1252,10 +1255,13 @@ class OpenAIProvider:
                     # tool_calls. Only synthesize calls when no structured calls
                     # arrived, tools were offered, and the parsed tool name is
                     # explicitly allowed by this turn.
+                    synthesized_tool_call = False
                     if not pending_calls and tools and assistant_text_parts:
                         full_text = "".join(assistant_text_parts)
                         for event in _synthesize_text_tool_events(full_text, tools):
                             emitted_stream_event = True
+                            if isinstance(event, ToolUseEndEvent):
+                                synthesized_tool_call = True
                             yield event
 
                     # Assemble reasoning from structured fields
@@ -1268,7 +1274,11 @@ class OpenAIProvider:
                         reasoning_text = _extract_think_tags(full_text)
 
                     yield DoneEvent(
-                        stop_reason=stop_reason,
+                        stop_reason=normalize_stop_reason(
+                            stop_reason,
+                            has_tool_calls=bool(pending_calls) or synthesized_tool_call,
+                        ),
+                        raw_stop_reason=stop_reason,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         reasoning_content=reasoning_text or None,
@@ -1352,6 +1362,7 @@ class OpenAIProvider:
                     response.text,
                 ),
                 code=str(response.status_code),
+                retry_after_seconds=retry_after_from_response(response),
             )
             return
 
@@ -1371,7 +1382,7 @@ class OpenAIProvider:
             raw_billed_cost,
         ) = _usage_fields(data.get("usage"))
         billed_cost, cost_source = _provider_billed_cost(self._provider_kind, raw_billed_cost)
-        stop_reason = "stop"
+        stop_reason: str | None = None
         assistant_text_parts: list[str] = []
         reasoning_parts: list[str] = []
         emitted_structured_tool = False
@@ -1424,6 +1435,8 @@ class OpenAIProvider:
 
         if not emitted_structured_tool and tools and assistant_text_parts:
             for event in _synthesize_text_tool_events("".join(assistant_text_parts), tools):
+                if isinstance(event, ToolUseEndEvent):
+                    emitted_structured_tool = True
                 yield event
 
         reasoning_text = "".join(reasoning_parts)
@@ -1435,7 +1448,8 @@ class OpenAIProvider:
             reasoning_text = _extract_think_tags("".join(assistant_text_parts))
 
         yield DoneEvent(
-            stop_reason=stop_reason,
+            stop_reason=normalize_stop_reason(stop_reason, has_tool_calls=emitted_structured_tool),
+            raw_stop_reason=stop_reason,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             reasoning_content=reasoning_text or None,

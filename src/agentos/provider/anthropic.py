@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import AsyncIterator
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import httpx
 import structlog
@@ -17,12 +19,14 @@ from .request_proof import (
     ProviderRequestBudgetExceededError,
     prove_provider_payload_from_env,
 )
+from .retry_after import retry_after_from_response
 from .types import (
     ChatConfig,
     DoneEvent,
     ErrorEvent,
     Message,
     ModelInfo,
+    StopReason,
     StreamEvent,
     TextDeltaEvent,
     ThinkingDeltaEvent,
@@ -30,6 +34,7 @@ from .types import (
     ToolUseDeltaEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
+    normalize_stop_reason,
 )
 
 log = structlog.get_logger(__name__)
@@ -46,28 +51,84 @@ def _uses_authorization_bearer(base_url: str) -> bool:
 
 _KNOWN_MODELS: list[dict[str, Any]] = [
     {
+        "model_id": "claude-opus-5-5",
+        "display_name": "Claude Opus 5.5",
+        "context_window": 1000000,
+        "max_output_tokens": 128000,
+        "input_cost_per_1k": 0.004,
+        "output_cost_per_1k": 0.02,
+    },
+    {
+        "model_id": "claude-sonnet-5-5",
+        "display_name": "Claude Sonnet 5.5",
+        "context_window": 1000000,
+        "max_output_tokens": 128000,
+        "input_cost_per_1k": 0.002,
+        "output_cost_per_1k": 0.01,
+    },
+    {
+        "model_id": "claude-fable-5-1",
+        "display_name": "Claude Fable 5.1",
+        "context_window": 1000000,
+        "max_output_tokens": 128000,
+        "input_cost_per_1k": 0.01,
+        "output_cost_per_1k": 0.05,
+    },
+    {
+        "model_id": "claude-opus-5",
+        "display_name": "Claude Opus 5",
+        "context_window": 1000000,
+        "max_output_tokens": 128000,
+        "input_cost_per_1k": 0.005,
+        "output_cost_per_1k": 0.025,
+    },
+    {
+        "model_id": "claude-sonnet-5",
+        "display_name": "Claude Sonnet 5",
+        "context_window": 1000000,
+        "max_output_tokens": 128000,
+        "input_cost_per_1k": 0.002,
+        "output_cost_per_1k": 0.01,
+    },
+    {
+        "model_id": "claude-opus-4-8",
+        "display_name": "Claude Opus 4.8",
+        "context_window": 1000000,
+        "max_output_tokens": 128000,
+        "input_cost_per_1k": 0.005,
+        "output_cost_per_1k": 0.025,
+    },
+    {
         "model_id": "claude-opus-4-6",
         "display_name": "Claude Opus 4.6",
-        "context_window": 200000,
-        "max_output_tokens": 32000,
-        "input_cost_per_1k": 0.015,
-        "output_cost_per_1k": 0.075,
+        "context_window": 1000000,
+        "max_output_tokens": 128000,
+        "input_cost_per_1k": 0.005,
+        "output_cost_per_1k": 0.025,
     },
     {
         "model_id": "claude-sonnet-4-6",
         "display_name": "Claude Sonnet 4.6",
-        "context_window": 200000,
-        "max_output_tokens": 16000,
+        "context_window": 1000000,
+        "max_output_tokens": 128000,
         "input_cost_per_1k": 0.003,
         "output_cost_per_1k": 0.015,
+    },
+    {
+        "model_id": "claude-haiku-4-5",
+        "display_name": "Claude Haiku 4.5",
+        "context_window": 200000,
+        "max_output_tokens": 64000,
+        "input_cost_per_1k": 0.001,
+        "output_cost_per_1k": 0.005,
     },
     {
         "model_id": "claude-haiku-4-5-20251001",
         "display_name": "Claude Haiku 4.5",
         "context_window": 200000,
-        "max_output_tokens": 8192,
-        "input_cost_per_1k": 0.00025,
-        "output_cost_per_1k": 0.00125,
+        "max_output_tokens": 64000,
+        "input_cost_per_1k": 0.001,
+        "output_cost_per_1k": 0.005,
     },
 ]
 
@@ -252,9 +313,128 @@ def _build_system_payload(cfg: ChatConfig) -> str | list[dict[str, Any]] | None:
     return blocks or cfg.system
 
 
-def _uses_adaptive_thinking(model: str) -> bool:
-    model_lower = model.lower()
-    return "claude-sonnet-4-6" in model_lower or "claude-opus-4-6" in model_lower
+ThinkingMode = Literal["adaptive", "budget", "none"]
+
+
+@dataclass(frozen=True)
+class ClaudeCapabilities:
+    """What a Messages API model accepts for thinking, effort and sampling."""
+
+    thinking_mode: ThinkingMode
+    accepts_effort: bool
+    accepts_xhigh_effort: bool
+    accepts_sampling: bool
+
+
+_ADAPTIVE_NEWEST = ClaudeCapabilities(
+    thinking_mode="adaptive",
+    accepts_effort=True,
+    accepts_xhigh_effort=True,
+    accepts_sampling=False,
+)
+_ADAPTIVE_4_6 = ClaudeCapabilities(
+    thinking_mode="adaptive",
+    accepts_effort=True,
+    accepts_xhigh_effort=False,
+    accepts_sampling=True,
+)
+_BUDGET = ClaudeCapabilities(
+    thinking_mode="budget",
+    accepts_effort=False,
+    accepts_xhigh_effort=False,
+    accepts_sampling=True,
+)
+_NO_THINKING = ClaudeCapabilities(
+    thinking_mode="none",
+    accepts_effort=False,
+    accepts_xhigh_effort=False,
+    accepts_sampling=True,
+)
+
+# ``claude-<family>-<major>[-<minor>]``; a minor is one or two digits so a date
+# snapshot (``claude-sonnet-4-20250514``) is not read as one.
+_FAMILY_ID_RE = re.compile(
+    r"claude-(opus|sonnet|haiku|fable|mythos)(?:-(\d+)(?:-(\d{1,2})(?!\d))?)?"
+)
+# Claude 3 naming put the version first: ``claude-3-7-sonnet-20250219``.
+_LEGACY_ID_RE = re.compile(r"claude-(\d+)(?:-(\d{1,2})(?!\d))?(?:-|$)")
+
+
+def claude_capabilities(model: str) -> ClaudeCapabilities:
+    """Classify a model id by the Messages API request surface it accepts.
+
+    Rules (Anthropic API, checked 2026-10):
+
+    - Opus 4.7 / 4.8, every 5.x (Opus 5 / 5.5, Sonnet 5 / 5.5), Fable and
+      Mythos: ``thinking: {"type": "adaptive"}``; ``budget_tokens`` is a 400.
+      Depth is ``output_config.effort`` (``low`` .. ``xhigh`` / ``max``).
+      Non-default ``temperature`` / ``top_p`` / ``top_k`` are a 400. Thinking
+      display defaults to ``omitted``, so ask for ``summarized`` explicitly.
+    - Opus 4.6 / Sonnet 4.6: adaptive thinking (``budget_tokens`` deprecated),
+      effort without ``xhigh``, sampling params allowed.
+    - Haiku 4.5, Sonnet 4.5, Opus 4.5 and older 4.x, Claude 3.7 Sonnet:
+      ``{"type": "enabled", "budget_tokens": N}`` with 1024 <= N < max_tokens;
+      ``effort`` is not sent (Haiku 4.5 / Sonnet 4.5 reject it).
+    - Other Claude 3 ids and Claude 2: no extended thinking at all.
+    - An unknown ``claude-*`` id is assumed to be a newer model (adaptive, no
+      sampling params). A non-Claude id served over an Anthropic-compatible
+      endpoint (MiniMax, ...) keeps the legacy ``budget_tokens`` payload.
+
+    Dotted ids from gateway catalogs (``claude-opus-5.5``) and provider
+    prefixes (``anthropic/``, ``us.anthropic.``) are accepted.
+    """
+    normalized = model.lower().replace(".", "-").replace("_", "-")
+    if "claude" not in normalized:
+        return _BUDGET
+
+    family_match = _FAMILY_ID_RE.search(normalized)
+    if family_match is not None:
+        family, major_text, minor_text = family_match.groups()
+        if family in {"fable", "mythos"} or major_text is None:
+            return _ADAPTIVE_NEWEST
+        major = int(major_text)
+        minor = int(minor_text) if minor_text is not None else 0
+        if major >= 5 or (major == 4 and minor >= 7):
+            return _ADAPTIVE_NEWEST
+        if major == 4 and minor == 6:
+            return _ADAPTIVE_4_6
+        if major == 4:
+            return _BUDGET
+        return _NO_THINKING if major < 3 else _BUDGET
+
+    legacy_match = _LEGACY_ID_RE.search(normalized)
+    if legacy_match is not None:
+        major = int(legacy_match.group(1))
+        minor = int(legacy_match.group(2) or 0)
+        if major == 3 and minor >= 7:
+            return _BUDGET
+        if major <= 3:
+            return _NO_THINKING
+    if "claude-instant" in normalized:
+        return _NO_THINKING
+    return _ADAPTIVE_NEWEST
+
+
+_EFFORT_BY_LEVEL: dict[str, str] = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+}
+
+
+def _effort_for_level(level: Any, caps: ClaudeCapabilities) -> str | None:
+    """Map an AgentOS thinking level to ``output_config.effort``.
+
+    ``adaptive`` / unset leaves effort to the model's default.
+    """
+    if level is None or not caps.accepts_effort:
+        return None
+    effort = _EFFORT_BY_LEVEL.get(str(level).strip().lower())
+    if effort == "xhigh" and not caps.accepts_xhigh_effort:
+        return "high"
+    return effort
 
 
 def _coerce_int(value: Any) -> int:
@@ -366,12 +546,19 @@ class AnthropicProvider:
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
         max_tokens = max(1, cfg.max_tokens)
+        caps = claude_capabilities(self._model)
         thinking_payload: dict[str, Any] | None = None
+        output_config: dict[str, Any] | None = None
         if cfg.thinking:
-            if _uses_adaptive_thinking(self._model):
-                thinking_payload = {"type": "adaptive"}
-            else:
-                budget_tokens = max(1, cfg.thinking_budget_tokens)
+            if caps.thinking_mode == "adaptive":
+                # 4.7+ / 5.x default thinking display to "omitted" (empty
+                # thinking text); ask for summaries so ThinkingDeltaEvents flow.
+                thinking_payload = {"type": "adaptive", "display": "summarized"}
+                effort = _effort_for_level(cfg.thinking_level, caps)
+                if effort is not None:
+                    output_config = {"effort": effort}
+            elif caps.thinking_mode == "budget":
+                budget_tokens = max(1024, cfg.thinking_budget_tokens)
                 if budget_tokens >= max_tokens:
                     max_tokens = budget_tokens + 4096
                 thinking_payload = {
@@ -394,7 +581,9 @@ class AnthropicProvider:
         system_payload = _build_system_payload(cfg)
         if system_payload:
             payload["system"] = system_payload
-        if cfg.temperature is not None and not cfg.thinking:
+        # Thinking requires the default temperature, and 4.7+ / 5.x / Fable
+        # reject sampling params outright, thinking or not.
+        if cfg.temperature is not None and thinking_payload is None and caps.accepts_sampling:
             payload["temperature"] = cfg.temperature
         if cfg.stop_sequences:
             payload["stop_sequences"] = cfg.stop_sequences
@@ -405,6 +594,8 @@ class AnthropicProvider:
                 payload["tool_choice"] = tool_choice_payload
         if thinking_payload:
             payload["thinking"] = thinking_payload
+        if output_config:
+            payload["output_config"] = output_config
 
         from agentos.engine.context_budget import coordinate_provider_context_budget
 
@@ -462,6 +653,7 @@ class AnthropicProvider:
         thinking_parts: list[str] = []
         thinking_signature: str | None = None
         stop_reason = "end_turn"
+        stop_details: dict[str, Any] | None = None
 
         try:
             async with httpx.AsyncClient(
@@ -487,6 +679,7 @@ class AnthropicProvider:
                         yield ErrorEvent(
                             message=f"HTTP {response.status_code}: {detail}",
                             code=str(response.status_code),
+                            retry_after_seconds=retry_after_from_response(response),
                         )
                         return
 
@@ -603,14 +796,29 @@ class AnthropicProvider:
                                     input_tokens = (
                                         base_input_tokens + cached_tokens + cache_creation_tokens
                                     )
-                            delta_stop_reason = (event.get("delta") or {}).get("stop_reason")
+                            message_delta = event.get("delta") or {}
+                            delta_stop_reason = message_delta.get("stop_reason")
                             if delta_stop_reason:
                                 stop_reason = delta_stop_reason
+                            # A safety-classifier decline (``refusal``) carries
+                            # ``stop_details`` with a category and explanation.
+                            delta_stop_details = message_delta.get("stop_details")
+                            if not isinstance(delta_stop_details, dict):
+                                delta_stop_details = event.get("stop_details")
+                            if isinstance(delta_stop_details, dict) and delta_stop_details:
+                                stop_details = dict(delta_stop_details)
 
                         elif etype == "message_stop":
                             reasoning_content = "".join(thinking_parts) or None
+                            normalized_stop = normalize_stop_reason(stop_reason)
+                            if normalized_stop is StopReason.UNKNOWN:
+                                log.info("anthropic.unknown_stop_reason", stop_reason=stop_reason)
                             yield DoneEvent(
-                                stop_reason=stop_reason,
+                                stop_reason=normalized_stop,
+                                raw_stop_reason=stop_reason,
+                                stop_details=(
+                                    stop_details if normalized_stop is StopReason.REFUSAL else None
+                                ),
                                 input_tokens=input_tokens,
                                 output_tokens=output_tokens,
                                 reasoning_content=reasoning_content,

@@ -13,6 +13,22 @@ No raw ``repr(exc)`` and no traceback text ever leaks into the envelope —
 the ``user_message`` field is sanitised so it is safe to show to an end
 user or write to a channel transcript.
 
+``user_message`` is chosen in this order:
+
+1. ``SafeToolUserMessage`` subclasses (``SafeToolError`` and friends) render
+   their ``user_message`` attribute verbatim.
+2. Any other ``ToolError`` renders ``str(exc)`` after secret redaction
+   (:func:`agentos.redact.redact_sensitive_text`, forced on, plus a bare
+   ``Bearer <token>`` pass). Tools raise ``ToolError`` with messages written
+   for the model ("file not found: ...", "unknown command ..."); hiding them
+   left the model retrying blind.
+3. A few builtin exception classes map to a fixed line in ``_USER_MESSAGES``.
+4. Everything else gets a generic "failed with an internal error" line, since
+   an arbitrary exception message may carry secrets an operator never meant
+   for the model.
+
+Every message is capped at ``_USER_MESSAGE_MAX_CHARS``.
+
 Callers expect a ``dict[str, Any]`` with exactly these five keys. Extra
 keys are a breaking change; additions go through a new slice.
 """
@@ -23,7 +39,8 @@ import json
 import re
 from typing import Any, Final
 
-from agentos.tools.types import SafeToolUserMessage
+from agentos.redact import mask_secret, redact_sensitive_text
+from agentos.tools.types import SafeToolUserMessage, ToolError
 
 # Class names whose instances represent transient infrastructure problems.
 # The list is intentionally conservative — subclass matching is handled by
@@ -92,7 +109,14 @@ _USER_MESSAGES: Final[dict[str, str]] = {
 }
 
 _TRACEBACK_FRAME_RE = re.compile(r'^\s+File ".+?", line \d+, in .+$', re.MULTILINE)
-_USER_MESSAGE_MAX_CHARS: Final[int] = 500
+_USER_MESSAGE_MAX_CHARS: Final[int] = 2000
+
+#: ``Bearer <token>`` outside an ``Authorization:`` header, which the shared
+#: redactor only recognises in header form. The value must look like a token
+#: (a digit or token punctuation somewhere in it) so prose such as "Bearer
+#: authentication failed" is left alone.
+_BARE_BEARER_RE = re.compile(r"(?<![A-Za-z0-9])(Bearer\s+)([A-Za-z0-9._~+/=-]{8,})", re.IGNORECASE)
+_TOKENISH_RE = re.compile(r"[0-9._~+/=-]")
 
 
 def _exception_class_name(exc: BaseException) -> str:
@@ -118,6 +142,28 @@ def _is_retriable(exc: BaseException) -> bool:
     return any(name in _RETRIABLE_CLASSES for name in mro)
 
 
+def _mask_bare_bearer(text: str) -> str:
+    def _mask(match: re.Match[str]) -> str:
+        value = match.group(2)
+        if not _TOKENISH_RE.search(value):
+            return match.group(0)
+        return f"{match.group(1)}{mask_secret(value)}"
+
+    return _BARE_BEARER_RE.sub(_mask, text)
+
+
+def _tool_error_message(exc: ToolError) -> str:
+    """Return a ``ToolError``'s own message with credentials masked.
+
+    Redaction is forced: this text goes straight into the model's context, so
+    an operator who disabled transcript redaction does not also opt every tool
+    error into carrying raw keys.
+    """
+
+    text = redact_sensitive_text(str(exc), force=True) or ""
+    return _mask_bare_bearer(text)
+
+
 def _sanitise_user_message(tool_name: str, exc: BaseException) -> str:
     """Derive a human-readable message for the envelope.
 
@@ -132,12 +178,17 @@ def _sanitise_user_message(tool_name: str, exc: BaseException) -> str:
         if isinstance(safe_message, str) and safe_message.strip():
             return safe_message
         return SafeToolUserMessage.user_message
+    if isinstance(exc, ToolError):
+        tool_message = _tool_error_message(exc)
+        if tool_message.strip():
+            return tool_message
     if class_name in _USER_MESSAGES:
         return _USER_MESSAGES[class_name]
 
     # Unknown classes: render a generic line that names the tool. Do NOT
     # interpolate str(exc) / repr(exc) — operators may have put secrets in
-    # the exception message.
+    # the exception message. ``ToolError`` is the exception: its message is
+    # written for the model and is redacted above.
     return f"The tool {tool_name!r} failed with an internal error."
 
 

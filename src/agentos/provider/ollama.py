@@ -11,12 +11,14 @@ import httpx
 from agentos.env import trust_env as _trust_env
 
 from .reasoning import ThinkTagStreamSplitter
+from .retry_after import retry_after_from_response
 from .types import (
     ChatConfig,
     DoneEvent,
     ErrorEvent,
     Message,
     ModelInfo,
+    StopReason,
     StreamEvent,
     TextDeltaEvent,
     ThinkingDeltaEvent,
@@ -24,6 +26,7 @@ from .types import (
     ToolUseDeltaEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
+    normalize_stop_reason,
 )
 
 _OLLAMA_DEFAULT_BASE = "http://localhost:11434"
@@ -329,7 +332,7 @@ class OllamaProvider:
 
         input_tokens = 0
         output_tokens = 0
-        done_reason = "stop"
+        done_reason: str | None = None
         response_model = self._model
         # Ollama tool calls accumulate in the full response (not streamed per-chunk)
         pending_tool_calls: list[dict[str, Any]] = []
@@ -364,6 +367,7 @@ class OllamaProvider:
                                 self._base_url,
                             ),
                             code=str(response.status_code),
+                            retry_after_seconds=retry_after_from_response(response),
                         )
                         return
 
@@ -453,7 +457,14 @@ class OllamaProvider:
                         )
 
                     yield DoneEvent(
-                        stop_reason="tool_use" if pending_tool_calls else done_reason,
+                        # Ollama parses tool calls whole, so a call that arrived
+                        # is runnable whatever ``done_reason`` says.
+                        stop_reason=(
+                            StopReason.TOOL_USE
+                            if pending_tool_calls
+                            else normalize_stop_reason(done_reason)
+                        ),
+                        raw_stop_reason=done_reason,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         reasoning_content="".join(reasoning_parts) or None,

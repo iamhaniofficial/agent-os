@@ -136,6 +136,9 @@ async def _handle_mcp_status(params: dict | None, ctx: RpcContext) -> dict[str, 
                 "authenticated": await _authenticated(runtime),
                 "connected": connected,
                 "tools": list(active[entry.name].registered_tools) if connected else [],
+                # Registered AgentOS name -> the server's own tool name. They
+                # differ when another server already held the short name.
+                "toolMap": active[entry.name].tool_map() if connected else {},
             }
         )
     return {"enabled": ctx.config.mcp.enabled, "servers": servers}

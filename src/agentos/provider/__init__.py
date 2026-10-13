@@ -52,6 +52,7 @@ from .types import (
     ModelInfo,
     ProviderHeartbeatEvent,
     QuotaStatus,
+    StopReason,
     StreamEvent,
     TextDeltaEvent,
     ThinkingDeltaEvent,
@@ -60,6 +61,7 @@ from .types import (
     ToolUseDeltaEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
+    normalize_stop_reason,
 )
 
 __all__ = [
@@ -102,6 +104,8 @@ __all__ = [
     "RefusalDecision",
     "should_refuse",
     # Types
+    "StopReason",
+    "normalize_stop_reason",
     "StreamEvent",
     "TextDeltaEvent",
     "ThinkingDeltaEvent",

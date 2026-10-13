@@ -153,9 +153,9 @@ def _coerce_tool_schedule(
     ``add_job(schedule_kind=..., schedule_value=..., schedule_tz=...)``.
 
     Raises ``SafeToolError`` whose message names the offending field and shows
-    the accepted shape so the model can self-correct on the next turn. Plain
-    ``ToolError`` would be sanitised to a generic "internal error" line, which
-    leaves the model nothing to correct against.
+    the accepted shape so the model can self-correct on the next turn. The
+    message is rendered verbatim, without the secret-redaction pass a plain
+    ``ToolError`` message goes through.
     """
     if not isinstance(schedule, dict):
         raise SafeToolError(

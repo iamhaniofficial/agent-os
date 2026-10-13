@@ -151,6 +151,8 @@ from agentos.provider import (
     decide_recovery_action,
 )
 from agentos.provider.circuit_breaker import trips_breaker
+from agentos.provider.failures import honoured_retry_after
+from agentos.provider.retry_after import DEFAULT_RETRY_AFTER_CAP_SECONDS
 from agentos.result_budget import persisted_result_max_chars
 from agentos.router_control import (
     RouterControlHoldStore,
@@ -396,6 +398,13 @@ class _EmergencyCompactionOverride:
     kept_entries: list[Any]
     reason: str
     compaction_id: str
+
+
+def _refusal_category_from_details(stop_details: object) -> str | None:
+    if not isinstance(stop_details, dict):
+        return None
+    category = stop_details.get("category")
+    return category if isinstance(category, str) and category else None
 
 
 def _non_negative_int(value: object) -> int:
@@ -1135,14 +1144,59 @@ def _selector_has_fallback(selector: Any) -> bool:
 class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors.
 
+    Streaming rule: every event is forwarded as soon as the stream has produced
+    one that proves the provider accepted the request — a non-empty text or
+    thinking delta, a tool-use event, or a provider heartbeat. Only a provider
+    error that arrives before any *content* event (text, thinking, tool use)
+    triggers the transparent failover to the selector's next provider; once
+    content has been forwarded, later errors pass through and the agent loop's
+    own retry policy handles them. Heartbeats are forwarded immediately but are
+    not content, so an error after heartbeats alone may still fail over.
+
     Also feeds the selector's circuit breaker: provider-health failures are
-    counted so a sustained outage opens the breaker, and the first byte of
-    real content closes it again.
+    counted so a sustained outage opens the breaker, and the first forwarded
+    content event (or a clean ``done``) closes it again.
+
+    A rate limit / overload that carries a short ``Retry-After`` hint (at most
+    ``retry_after_cap_seconds``) is *not* failed over here: the error is passed
+    through untouched so the agent loop can wait out the hint and retry the
+    same model, keeping its prompt cache. The agent asks this wrapper to fail
+    over (``fallback_after_invalid_response``) only once its retries are spent.
     """
 
-    def __init__(self, provider: Any, selector: Any) -> None:
+    def __init__(
+        self,
+        provider: Any,
+        selector: Any,
+        *,
+        retry_after_cap_seconds: float = DEFAULT_RETRY_AFTER_CAP_SECONDS,
+    ) -> None:
         self._provider = provider
         self._selector = selector
+        self._retry_after_cap_seconds = float(retry_after_cap_seconds)
+
+    def set_retry_after_cap_seconds(self, seconds: float) -> None:
+        """Adopt the agent's ``rate_limit_retry_after_cap_seconds``."""
+        self._retry_after_cap_seconds = float(seconds)
+
+    def _honoured_retry_after(
+        self, kind: ProviderFailureKind, event: ProviderErrorEvent
+    ) -> float | None:
+        return honoured_retry_after(
+            kind,
+            getattr(event, "retry_after_seconds", None),
+            self._retry_after_cap_seconds,
+        )
+
+    def _note_failure(self, kind: ProviderFailureKind, event: ProviderErrorEvent) -> bool:
+        """Record ``event`` against the breaker; True when it counted as a trip."""
+        retry_after = getattr(event, "retry_after_seconds", None)
+        self._record_failure(kind, event.message, retry_after)
+        return trips_breaker(
+            kind,
+            retry_after,
+            retry_after_cap_seconds=self._retry_after_cap_seconds,
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
@@ -1151,12 +1205,35 @@ class _SelectorFallbackProvider:
     def provider_name(self) -> str:
         return getattr(self._provider, "provider_name", "")
 
-    def _record_failure(self, kind: ProviderFailureKind, reason: str) -> None:
+    def _record_failure(
+        self,
+        kind: ProviderFailureKind,
+        reason: str,
+        retry_after_seconds: float | None = None,
+    ) -> None:
         recorder = getattr(self._selector, "record_provider_failure", None)
         if recorder is None:
             return
         try:
-            recorder(kind, reason)
+            if retry_after_seconds is None:
+                recorder(kind, reason)
+                return
+            try:
+                recorder(
+                    kind,
+                    reason,
+                    retry_after_seconds=retry_after_seconds,
+                    retry_after_cap_seconds=self._retry_after_cap_seconds,
+                )
+            except TypeError:
+                # A selector stand-in that predates the hint (tests, plugins):
+                # apply the exemption here and record the old way.
+                if trips_breaker(
+                    kind,
+                    retry_after_seconds,
+                    retry_after_cap_seconds=self._retry_after_cap_seconds,
+                ):
+                    recorder(kind, reason)
         except Exception:  # pragma: no cover - breaker must never break a turn
             log.debug("selector_fallback.breaker_failure_record_failed", exc_info=True)
 
@@ -1190,19 +1267,23 @@ class _SelectorFallbackProvider:
         tools: Any = None,
         config: Any = None,
     ) -> AsyncIterator[Any]:
-        emitted_user_visible_content = False
+        emitted_content = False
+        accepted = False
         saw_provider_error = False
         recorded_success = False
         recorded_failure = False
-        pre_text_buffer: list[Any] = []
+        # Only events that prove nothing (empty deltas, unknown kinds) seen before
+        # the provider has shown any sign of life are held back, so a failover
+        # does not leak a dead attempt's noise into the fallback's stream.
+        pre_accept_buffer: list[Any] = []
 
-        def drain_pre_text_buffer() -> list[Any]:
-            drained = list(pre_text_buffer)
-            pre_text_buffer.clear()
+        def drain_pre_accept_buffer() -> list[Any]:
+            drained = list(pre_accept_buffer)
+            pre_accept_buffer.clear()
             return drained
 
         async for event in self._provider.chat(messages, tools=tools, config=config):
-            if emitted_user_visible_content:
+            if emitted_content:
                 yield event
                 continue
 
@@ -1212,8 +1293,14 @@ class _SelectorFallbackProvider:
                 if not recorded_failure:
                     # One vote per stream: a provider that emits several error
                     # events for one request is still a single failed turn.
-                    recorded_failure = trips_breaker(kind)
-                    self._record_failure(kind, event.message)
+                    recorded_failure = self._note_failure(kind, event)
+                if self._honoured_retry_after(kind, event) is not None:
+                    # Short Retry-After: hand it to the agent loop, which waits
+                    # it out and retries this same model.
+                    for buffered_event in drain_pre_accept_buffer():
+                        yield buffered_event
+                    yield event
+                    continue
                 if _kind_uses_selector_fallback(kind):
                     failed_model = _selector_model_name(self._provider, self._selector)
                     try:
@@ -1221,7 +1308,7 @@ class _SelectorFallbackProvider:
                             RuntimeError(event.message)
                         )
                     except Exception:
-                        for buffered_event in drain_pre_text_buffer():
+                        for buffered_event in drain_pre_accept_buffer():
                             yield buffered_event
                         yield event
                         return
@@ -1236,15 +1323,16 @@ class _SelectorFallbackProvider:
                     async for fallback_event in self._fallback_chat(messages, tools, config):
                         yield fallback_event
                     return
-                for buffered_event in drain_pre_text_buffer():
+                for buffered_event in drain_pre_accept_buffer():
                     yield buffered_event
                 yield event
                 continue
 
-            if _is_non_empty_provider_text_delta(event):
-                for buffered_event in drain_pre_text_buffer():
+            if _is_provider_content_event(event):
+                for buffered_event in drain_pre_accept_buffer():
                     yield buffered_event
-                emitted_user_visible_content = True
+                accepted = True
+                emitted_content = True
                 if not recorded_success:
                     recorded_success = True
                     self._record_success()
@@ -1252,19 +1340,32 @@ class _SelectorFallbackProvider:
                 continue
 
             if getattr(event, "kind", "") == "done":
-                for buffered_event in drain_pre_text_buffer():
+                for buffered_event in drain_pre_accept_buffer():
                     yield buffered_event
                 # A clean stream proves the provider is healthy — including a
-                # tool-use-only turn that never emits user-visible text.
+                # turn that never emits any content at all.
                 if not saw_provider_error and not recorded_success:
                     recorded_success = True
                     self._record_success()
                 yield event
                 continue
 
-            pre_text_buffer.append(event)
+            if isinstance(event, ProviderHeartbeatEvent):
+                # Liveness, not content: forward at once so idle watchdogs see
+                # it, but keep the transparent failover available.
+                for buffered_event in drain_pre_accept_buffer():
+                    yield buffered_event
+                accepted = True
+                yield event
+                continue
 
-        for buffered_event in drain_pre_text_buffer():
+            if accepted:
+                yield event
+                continue
+
+            pre_accept_buffer.append(event)
+
+        for buffered_event in drain_pre_accept_buffer():
             yield buffered_event
 
     async def _fallback_chat(
@@ -1273,18 +1374,29 @@ class _SelectorFallbackProvider:
         tools: Any,
         config: Any,
     ) -> AsyncIterator[Any]:
-        """Stream the post-failover provider, recording its own breaker outcome."""
+        """Stream the post-failover provider, recording its own breaker outcome.
+
+        Same rule as :meth:`_chat`: events are forwarded as they arrive, and a
+        further failover only happens while no content has been forwarded yet.
+        """
+        emitted_content = False
         saw_provider_error = False
         recorded_success = False
         recorded_failure = False
         async for event in self._provider.chat(messages, tools=tools, config=config):
             if isinstance(event, ProviderErrorEvent):
                 saw_provider_error = True
+                # Classify every error: a later error must not be judged by an
+                # earlier one's kind.
+                kind = _classify_provider_event(self.provider_name, event)
                 if not recorded_failure:
-                    kind = _classify_provider_event(self.provider_name, event)
-                    recorded_failure = trips_breaker(kind)
-                    self._record_failure(kind, event.message)
-                if _kind_uses_selector_fallback(kind) and _selector_has_fallback(self._selector):
+                    recorded_failure = self._note_failure(kind, event)
+                if (
+                    not emitted_content
+                    and self._honoured_retry_after(kind, event) is None
+                    and _kind_uses_selector_fallback(kind)
+                    and _selector_has_fallback(self._selector)
+                ):
                     failed_model = _selector_model_name(self._provider, self._selector)
                     try:
                         self._provider = self._selector.next_fallback_after_failure(
@@ -1303,9 +1415,15 @@ class _SelectorFallbackProvider:
                         return
                     except Exception:
                         pass
-            elif not recorded_success and (
-                _is_non_empty_provider_text_delta(event)
-                or (getattr(event, "kind", "") == "done" and not saw_provider_error)
+            elif _is_provider_content_event(event):
+                emitted_content = True
+                if not recorded_success:
+                    recorded_success = True
+                    self._record_success()
+            elif (
+                not recorded_success
+                and getattr(event, "kind", "") == "done"
+                and not saw_provider_error
             ):
                 recorded_success = True
                 self._record_success()
@@ -1315,9 +1433,21 @@ class _SelectorFallbackProvider:
         return list(await self._provider.list_models())
 
 
-def _is_non_empty_provider_text_delta(event: Any) -> bool:
-    """Return True only once a provider event carries user-visible text."""
-    return getattr(event, "kind", "") == "text_delta" and bool(getattr(event, "text", ""))
+_PROVIDER_TOOL_USE_EVENT_KINDS: Final = frozenset(
+    {"tool_use_start", "tool_use_delta", "tool_use_end"}
+)
+
+
+def _is_provider_content_event(event: Any) -> bool:
+    """Return True for an event that commits the stream to this provider.
+
+    Non-empty text or thinking deltas and any tool-use event count; heartbeats,
+    errors, ``done`` and empty deltas do not.
+    """
+    kind = getattr(event, "kind", "")
+    if kind in ("text_delta", "thinking_delta"):
+        return bool(getattr(event, "text", ""))
+    return kind in _PROVIDER_TOOL_USE_EVENT_KINDS
 
 
 @dataclass
@@ -5250,6 +5380,12 @@ class TurnRunner:
                 ),
                 runtime_context_chars=(
                     done_event.runtime_context_chars if done_event is not None else 0
+                ),
+                stop_reason=done_event.stop_reason if done_event is not None else None,
+                refusal_category=(
+                    _refusal_category_from_details(done_event.stop_details)
+                    if done_event is not None and done_event.stop_reason == "refusal"
+                    else None
                 ),
             )
             write_decision_entry(entry)

@@ -61,6 +61,11 @@ Passive compaction can happen when AgentOS detects context pressure before
 or during agent work. The exact trigger depends on model context limits,
 configured budgets, current history, and tool output size.
 
+Inside a turn, the check runs before each model call, never after a reply has
+streamed, so compacting does not make the model answer the same step twice.
+Only context the model has already seen is summarized: a new request and fresh
+tool results always reach the model in full at least once.
+
 If passive compaction fails, the safest user response is usually:
 
 1. let the current turn finish or fail cleanly;

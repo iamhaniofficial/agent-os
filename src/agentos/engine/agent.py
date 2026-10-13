@@ -26,7 +26,7 @@ from agentos.engine.cache_break_monitor import (
     notify_compaction,
     record_prompt_state,
 )
-from agentos.engine.fallback import FallbackPolicy, backoff_sleep
+from agentos.engine.fallback import FallbackPolicy, backoff_sleep, retry_after_delay
 from agentos.engine.history import limit_turns, repair_tool_pairing
 from agentos.engine.progress_watchdog import (
     ProgressObservation,
@@ -89,9 +89,10 @@ from agentos.provider import (
 from agentos.provider.failures import (
     ProviderFailureKind,
     classify_provider_error,
+    honoured_retry_after,
     is_transport_timeout,
 )
-from agentos.provider.types import ContentBlockImage
+from agentos.provider.types import ContentBlockImage, StopReason, normalize_stop_reason
 from agentos.result_budget import (
     ToolResultBudgetClass,
     compact_tool_result_content,
@@ -157,6 +158,15 @@ _PROVIDER_OUTPUT_CONTINUE_PROMPT = (
     "been written. If a tool call was interrupted or incomplete, regenerate a complete "
     "tool call from scratch."
 )
+_PROVIDER_PAUSE_TURN_RESUME_PROMPT = (
+    "The previous provider response was paused before the turn finished. Continue from "
+    "the exact point where it paused. Do not repeat text that has already been written."
+)
+# A provider may pause a long-running turn (Anthropic ``pause_turn``). The engine
+# resumes it at most this many times per loop iteration, then treats the paused
+# response as the end of the turn.
+_MAX_PAUSE_TURN_RESUMES = 3
+_PROVIDER_REFUSAL_REPLY = "The model declined to respond to this request."
 
 
 def _cost_source_for_usage(cost_usd: float, billed_cost: float) -> str:
@@ -397,6 +407,7 @@ def _append_length_capped_continuation(
     *,
     response_text: str,
     tool_calls: list[ToolCall],
+    prompt: str = _PROVIDER_OUTPUT_CONTINUE_PROMPT,
 ) -> str:
     visible_text = strip_synthetic_tool_call_suffix(
         response_text,
@@ -406,8 +417,27 @@ def _append_length_capped_continuation(
         turn_messages.append(
             Message(role="assistant", content=[ContentBlockText(text=visible_text)])
         )
-    turn_messages.append(Message(role="user", content=_PROVIDER_OUTPUT_CONTINUE_PROMPT))
+    turn_messages.append(Message(role="user", content=prompt))
     return visible_text
+
+
+def _refusal_category(stop_details: dict[str, Any] | None) -> str | None:
+    if not isinstance(stop_details, dict):
+        return None
+    category = stop_details.get("category")
+    if isinstance(category, str) and category.strip():
+        return category.strip()
+    return None
+
+
+def _refusal_warning_message(stop_details: dict[str, Any] | None) -> str:
+    category = _refusal_category(stop_details)
+    if category:
+        return (
+            f"The model declined this request (safety category: {category}). "
+            "The turn ended without a retry."
+        )
+    return "The model declined this request. The turn ended without a retry."
 
 
 class _ProviderAttemptKind(StrEnum):
@@ -417,6 +447,11 @@ class _ProviderAttemptKind(StrEnum):
     INCOMPLETE_TOOLS = "incomplete_tools"
     STREAM_INCOMPLETE = "stream_incomplete"
     LENGTH_CAPPED = "length_capped"
+    # The provider declined (safety classifier / content filter). Final: never
+    # retried and never failed over, the turn ends with what was produced.
+    REFUSAL = "refusal"
+    # The provider paused a long-running turn and expects it to be resumed.
+    PAUSE_TURN = "pause_turn"
 
 
 class _IterationStreamTimeoutError(TimeoutError):
@@ -564,9 +599,22 @@ def _classify_provider_attempt(
             stop_reason=stop_reason,
             user_visible_emitted=user_visible_emitted,
         )
-    if (stop_reason or "").lower() == "length":
+    normalized_stop = normalize_stop_reason(stop_reason)
+    if normalized_stop is StopReason.REFUSAL:
+        return _ProviderAttemptClassification(
+            _ProviderAttemptKind.REFUSAL,
+            stop_reason=stop_reason,
+            user_visible_emitted=user_visible_emitted,
+        )
+    if normalized_stop is StopReason.MAX_TOKENS:
         return _ProviderAttemptClassification(
             _ProviderAttemptKind.LENGTH_CAPPED,
+            stop_reason=stop_reason,
+            user_visible_emitted=user_visible_emitted,
+        )
+    if normalized_stop is StopReason.PAUSE_TURN and not tool_calls:
+        return _ProviderAttemptClassification(
+            _ProviderAttemptKind.PAUSE_TURN,
             stop_reason=stop_reason,
             user_visible_emitted=user_visible_emitted,
         )
@@ -1846,6 +1894,11 @@ class Agent:
         # caches from messages[0].
         request_context_insert_index = len(turn_messages)
         runtime_context_insert_index = len(turn_messages)
+        # How many leading turn_messages a provider request has already carried.
+        # Preflight compaction only folds these into the summary: this turn's
+        # input and anything appended after the last call (the reply and its
+        # tool results) reach the provider intact.
+        provider_seen_message_count = len(turn_messages)
         if extra_messages:
             turn_messages.extend(extra_messages)
         # Only append text message if non-empty (multimodal may use extra_messages instead)
@@ -1907,6 +1960,11 @@ class Agent:
         last_actual_model = ""
         terminal_error: ErrorEvent | None = None
         final_text_parts: list[str] = []
+        # Normalized stop reason (and refusal details) of the last provider
+        # call that completed, surfaced on the turn's DoneEvent for the
+        # decision log.
+        turn_stop_reason: str | None = None
+        turn_stop_details: dict[str, Any] | None = None
         final_reasoning_parts: list[str] = []
         artifact_delivery_final_response_pending = False
         artifact_delivery_degraded_final_response = False
@@ -1921,6 +1979,15 @@ class Agent:
             base_backoff_ms=self.config.retry_base_backoff_ms,
             max_backoff_ms=self.config.retry_max_backoff_ms,
         )
+        _retry_after_cap_s = float(self.config.rate_limit_retry_after_cap_seconds)
+        # The selector-fallback wrapper decides whether a hinted 429 fails over
+        # straight away; it has to use the same cap this loop waits under.
+        _adopt_retry_after_cap = getattr(self.provider, "set_retry_after_cap_seconds", None)
+        if callable(_adopt_retry_after_cap):
+            try:
+                _adopt_retry_after_cap(_retry_after_cap_s)
+            except Exception:  # noqa: BLE001 - optional provider hook
+                logger.debug("provider.retry_after_cap_hook_failed", exc_info=True)
 
         # Timeout budgets: optional total turn budget, idle LLM stream budget,
         # and per-tool execution budget.
@@ -2153,6 +2220,8 @@ class Agent:
                 )
                 _attempt_retries_used = _retry_policy.used_attempts()
                 _invalid_response_fallback_done = False
+                _retry_after_fallback_done = False
+                _pause_turn_resumes = 0
                 while _retry_attempt <= _fallback.max_retries:
                     provider_error = None
                     assistant_text_parts = []
@@ -2238,6 +2307,107 @@ class Agent:
                         break
 
                     call_chat_cfg = chat_cfg
+
+                    # Check overflow against the live provider request before it
+                    # is sent, not after it streamed: once text or tool_use
+                    # events are out, re-calling the provider replays them to
+                    # the stream consumer (#3644).
+                    estimated_context_tokens = self._estimate_live_request_tokens(
+                        request_messages,
+                        tools=provider_tools_for_call,
+                        config=call_chat_cfg,
+                    )
+                    overflow_outcome = await self._preflight_context_overflow(
+                        turn_messages,
+                        estimated_context_tokens,
+                        seen_message_count=provider_seen_message_count,
+                        request_context_insert_index=request_context_insert_index,
+                        runtime_context_insert_index=runtime_context_insert_index,
+                    )
+                    if overflow_outcome is None:
+                        if overflow_retries >= self.config.max_overflow_retries:
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = self._context_overflow_error()
+                            yield terminal_error
+                            break
+                        # The estimate is a heuristic: send the request as is.
+                        # A real provider overflow takes the CONTEXT_OVERFLOW
+                        # branch below, and the next call checks again.
+                        overflow_retries += 1
+                        _log.warning(
+                            "compaction.preflight_failed",
+                            attempt=overflow_retries,
+                            max=self.config.max_overflow_retries,
+                            estimated_tokens=estimated_context_tokens,
+                        )
+                    elif overflow_outcome.compacted:
+                        # Lifetime counters keep feeding DoneEvent usage/cost
+                        # accounting for this turn.
+                        turn_messages = overflow_outcome.messages
+                        if overflow_outcome.request_context_insert_index is not None:
+                            request_context_insert_index = (
+                                overflow_outcome.request_context_insert_index
+                            )
+                        if overflow_outcome.runtime_context_insert_index is not None:
+                            runtime_context_insert_index = (
+                                overflow_outcome.runtime_context_insert_index
+                            )
+                        # The stream consumer persists the compaction and
+                        # refreshes the system prompt while handling this event,
+                        # so the request below is rebuilt after it.
+                        yield CompactionEvent(
+                            compaction_id=overflow_outcome.compaction_id,
+                            summary=overflow_outcome.summary,
+                            kept_entries=overflow_outcome.kept_entries,
+                            kept_count=len(overflow_outcome.messages),
+                            removed_count=overflow_outcome.removed_count,
+                        )
+                        overflow_retries = 0  # reset on success
+                        # Read cache_breakpoints from the refreshed self.config
+                        # (re-anchored by refresh_system_prompt):
+                        # chat_cfg.cache_breakpoints still holds the
+                        # pre-compaction base text and would miss the cache.
+                        chat_cfg = chat_cfg.model_copy(
+                            update={
+                                "system": self._context.system_prompt,
+                                "cache_breakpoints": (
+                                    self._cache_breakpoints_without_runtime_context(
+                                        self.config.cache_breakpoints
+                                    )
+                                ),
+                                "provider_request_max_chars": (
+                                    self._provider_request_proof_max_chars()
+                                ),
+                            }
+                        )
+                        call_chat_cfg = chat_cfg
+                        request_turn_messages = (
+                            [*turn_messages, max_iterations_finalization_message]
+                            if (
+                                max_iterations_finalization_pending
+                                and max_iterations_finalization_message is not None
+                            )
+                            else turn_messages
+                        )
+                        (
+                            request_messages,
+                            request_sanitize_result,
+                        ) = self._provider_request_messages_with_sanitize(
+                            request_turn_messages,
+                            request_context_message=request_context_message,
+                            request_context_insert_index=request_context_insert_index,
+                            runtime_context_message=runtime_context_message,
+                            runtime_context_insert_index=runtime_context_insert_index,
+                        )
+                        self._write_context_stage(
+                            "stream:context:compacted",
+                            request_messages,
+                            call_id=call_id,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            sanitize=request_sanitize_result,
+                        )
+                    provider_seen_message_count = len(turn_messages)
 
                     self._write_turn_call_log(
                         "llm_request",
@@ -2469,6 +2639,8 @@ class Agent:
                     if provider_done_for_log is not None:
                         response_payload["usage"] = {
                             "stop_reason": provider_done_for_log.stop_reason,
+                            "raw_stop_reason": provider_done_for_log.raw_stop_reason,
+                            "stop_details": provider_done_for_log.stop_details,
                             "input_tokens": provider_done_for_log.input_tokens,
                             "output_tokens": provider_done_for_log.output_tokens,
                             "reasoning_tokens": provider_done_for_log.reasoning_tokens,
@@ -2532,7 +2704,137 @@ class Agent:
                         reasoning_tokens=iter_reasoning_tokens,
                         user_visible_emitted=attempt_user_visible_emitted,
                     )
-                    if not _got_error and attempt_classification.kind != _ProviderAttemptKind.OK:
+                    if (
+                        not _got_error
+                        and attempt_classification.kind == _ProviderAttemptKind.PAUSE_TURN
+                    ):
+                        if _pause_turn_resumes < _MAX_PAUSE_TURN_RESUMES:
+                            # Keep what the paused response produced, then ask
+                            # the provider to carry on. The assistant text goes
+                            # into history and into the final reply, exactly as
+                            # for a length-capped continuation. A follow-up user
+                            # nudge (rather than a trailing assistant message) is
+                            # used because current Claude models reject an
+                            # assistant-last request as an unsupported prefill.
+                            _pause_turn_resumes += 1
+                            visible_text = _append_length_capped_continuation(
+                                turn_messages,
+                                response_text=response_text,
+                                tool_calls=tool_calls,
+                                prompt=_PROVIDER_PAUSE_TURN_RESUME_PROMPT,
+                            )
+                            if visible_text:
+                                final_text_parts.append(visible_text)
+                            logger.info(
+                                "provider.pause_turn_resume",
+                                session_key=self._session_key,
+                                model=last_actual_model or self.config.model_id or "",
+                                provider=type(self.provider).__name__,
+                                iteration=iterations,
+                                call_attempt=_call_attempt,
+                                resume=_pause_turn_resumes,
+                                budget=_MAX_PAUSE_TURN_RESUMES,
+                                visible_chars=len(visible_text),
+                            )
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="resume_paused_turn",
+                                reason="pause_turn",
+                                code="pause_turn",
+                                iteration=iterations,
+                                attempt=_call_attempt,
+                                resume=_pause_turn_resumes,
+                                budget=_MAX_PAUSE_TURN_RESUMES,
+                            )
+                            _call_attempt += 1
+                            continue
+                        # Resume budget spent: the paused response is the end of
+                        # the turn. Re-classify it as a normal end_turn so the
+                        # usual empty/visible checks apply.
+                        logger.warning(
+                            "provider.pause_turn_resume_exhausted",
+                            session_key=self._session_key,
+                            iteration=iterations,
+                            call_attempt=_call_attempt,
+                            budget=_MAX_PAUSE_TURN_RESUMES,
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="end_paused_turn",
+                            reason="pause_turn_resume_exhausted",
+                            code="pause_turn",
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            budget=_MAX_PAUSE_TURN_RESUMES,
+                        )
+                        if provider_done_for_log is not None:
+                            provider_done_for_log.stop_reason = StopReason.END_TURN
+                        stop_reason = StopReason.END_TURN
+                        attempt_classification = _classify_provider_attempt(
+                            text=response_text,
+                            tool_calls=tool_calls,
+                            pending_tools=pending_tools,
+                            got_done_event=_got_done_event,
+                            stop_reason=stop_reason,
+                            reasoning_content=iter_reasoning_content,
+                            reasoning_tokens=iter_reasoning_tokens,
+                            user_visible_emitted=attempt_user_visible_emitted,
+                        )
+                    if (
+                        not _got_error
+                        and attempt_classification.kind == _ProviderAttemptKind.REFUSAL
+                    ):
+                        # A safety decline is final: no retry, no failover to
+                        # another provider (that would be shopping for a model
+                        # that says yes). Keep whatever text the model wrote
+                        # before it declined; tool calls from a declined
+                        # response are never executed.
+                        refusal_details = (
+                            provider_done_for_log.stop_details
+                            if provider_done_for_log is not None
+                            else None
+                        )
+                        refusal_category = _refusal_category(refusal_details)
+                        dropped_tool_calls = len(tool_calls)
+                        tool_calls = []
+                        if not response_text.strip():
+                            response_text = _PROVIDER_REFUSAL_REPLY
+                            assistant_text_parts.append(response_text)
+                            attempt_user_visible_emitted = True
+                            yield TextDeltaEvent(text=response_text)
+                        logger.warning(
+                            "provider.refusal",
+                            session_key=self._session_key,
+                            model=last_actual_model or self.config.model_id or "",
+                            provider=type(self.provider).__name__,
+                            iteration=iterations,
+                            call_attempt=_call_attempt,
+                            category=refusal_category,
+                            raw_stop_reason=(
+                                provider_done_for_log.raw_stop_reason
+                                if provider_done_for_log is not None
+                                else None
+                            ),
+                            dropped_tool_calls=dropped_tool_calls,
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="finish_refused_turn",
+                            reason="refusal",
+                            code="provider_refusal",
+                            category=refusal_category,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            dropped_tool_calls=dropped_tool_calls,
+                        )
+                        yield WarningEvent(
+                            code="provider_refusal",
+                            message=_refusal_warning_message(refusal_details),
+                        )
+                    if not _got_error and attempt_classification.kind not in {
+                        _ProviderAttemptKind.OK,
+                        _ProviderAttemptKind.REFUSAL,
+                    }:
                         logger.warning(
                             "provider.invalid_response",
                             session_key=self._session_key,
@@ -2786,7 +3088,7 @@ class Agent:
                     if (
                         not _got_error
                         and attempt_classification.kind == _ProviderAttemptKind.OK
-                        and (stop_reason or "").lower() == "length"
+                        and normalize_stop_reason(stop_reason) is StopReason.MAX_TOKENS
                     ):
                         yield WarningEvent(
                             code="provider_output_truncated",
@@ -2847,7 +3149,9 @@ class Agent:
                                 "Returning the best partial result from completed work."
                             )
                             assistant_text_parts.append(response_text)
-                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
+                            provider_done_for_log = ProviderDoneEvent(
+                                stop_reason=StopReason.END_TURN
+                            )
                             _got_done_event = True
                             _got_error = False
                             max_iterations_finalization_pending = False
@@ -2971,6 +3275,7 @@ class Agent:
                                 yield terminal_error
                                 break
                             turn_messages = overflow_outcome.messages
+                            provider_seen_message_count = len(turn_messages)
                             request_context_insert_index = next_request_context_insert_index
                             runtime_context_insert_index = next_runtime_context_insert_index
                             yield WarningEvent(
@@ -2986,6 +3291,60 @@ class Agent:
                             )
                             _call_attempt += 1
                             continue
+                        _retry_after_s = honoured_retry_after(
+                            failure_kind,
+                            provider_error.retry_after_seconds,
+                            _retry_after_cap_s,
+                        )
+                        if _retry_after_s is not None:
+                            # The provider named a short wait. Honour it on the
+                            # same model (keeps the prompt cache and the price)
+                            # rather than a blind backoff or a failover.
+                            if _fallback.should_retry(kind, _retry_attempt):
+                                delay = retry_after_delay(_retry_after_s)
+                                _log.warning(
+                                    "provider.retry_after_wait",
+                                    attempt=_retry_attempt + 1,
+                                    kind=failure_kind.value,
+                                    retry_after_s=round(_retry_after_s, 3),
+                                    delay_s=round(delay, 2),
+                                )
+                                yield WarningEvent(
+                                    code="provider_retry_after_wait",
+                                    message=(
+                                        "The provider asked to retry in "
+                                        f"{_retry_after_s:g}s; waiting, then retrying "
+                                        "the same model."
+                                    ),
+                                )
+                                await asyncio.sleep(delay)
+                                _retry_attempt += 1
+                                _call_attempt += 1
+                                continue
+                            # Retries spent: now fail over, once, as an unhinted
+                            # rate limit would have done on the first error.
+                            if (
+                                not _retry_after_fallback_done
+                                and self._switch_to_invalid_response_fallback(
+                                    provider_error.message
+                                )
+                            ):
+                                _retry_after_fallback_done = True
+                                _log.warning(
+                                    "provider.retry_after_fallback",
+                                    attempt=_retry_attempt,
+                                    kind=failure_kind.value,
+                                    retry_after_s=round(_retry_after_s, 3),
+                                )
+                                yield WarningEvent(
+                                    code="provider_retry_after_fallback",
+                                    message=(
+                                        "The provider is still asking to wait; "
+                                        "switching to the fallback model."
+                                    ),
+                                )
+                                _call_attempt += 1
+                                continue
                         _is_timeout = is_transport_timeout(
                             raw_code=provider_error.code,
                             message=provider_error.message,
@@ -3044,6 +3403,9 @@ class Agent:
                     if provider_done_for_log is not None
                     else None
                 )
+                if final_stop_reason is not None:
+                    turn_stop_reason = str(final_stop_reason)
+                    turn_stop_details = getattr(provider_done_for_log, "stop_details", None)
                 final_classification = _classify_provider_attempt(
                     text=response_text,
                     tool_calls=tool_calls,
@@ -3054,7 +3416,10 @@ class Agent:
                     reasoning_tokens=iter_reasoning_tokens,
                     user_visible_emitted=attempt_user_visible_emitted,
                 )
-                if final_classification.kind != _ProviderAttemptKind.OK:
+                if final_classification.kind not in {
+                    _ProviderAttemptKind.OK,
+                    _ProviderAttemptKind.REFUSAL,
+                }:
                     logger.warning(
                         "provider.invalid_response_unhandled",
                         session_key=self._session_key,
@@ -3101,77 +3466,6 @@ class Agent:
 
                 if iter_reasoning_content:
                     final_reasoning_parts.append(iter_reasoning_content)
-
-                # Check overflow against the live provider request, not
-                # cumulative billable usage for the whole turn.
-                estimated_context_tokens = self._estimate_live_request_tokens(
-                    request_messages,
-                    tools=provider_tools_for_call,
-                    config=call_chat_cfg,
-                )
-                overflow_outcome = await self._check_context_overflow(
-                    turn_messages,
-                    estimated_context_tokens,
-                    request_context_insert_index=request_context_insert_index,
-                    runtime_context_insert_index=runtime_context_insert_index,
-                )
-                if overflow_outcome is None:
-                    if overflow_retries >= self.config.max_overflow_retries:
-                        yield self._transition(AgentState.ERROR)
-                        terminal_error = self._context_overflow_error()
-                        yield terminal_error
-                        break
-                    overflow_retries += 1
-                    _log.warning(
-                        "compaction.retry",
-                        attempt=overflow_retries,
-                        max=self.config.max_overflow_retries,
-                    )
-                    continue  # retry the tool loop iteration
-                if overflow_outcome.compacted:
-                    # Compaction happened — replace message list. Lifetime
-                    # counters keep feeding DoneEvent usage/cost accounting for
-                    # this turn.
-                    turn_messages = overflow_outcome.messages
-                    if overflow_outcome.request_context_insert_index is not None:
-                        request_context_insert_index = overflow_outcome.request_context_insert_index
-                    if overflow_outcome.runtime_context_insert_index is not None:
-                        runtime_context_insert_index = overflow_outcome.runtime_context_insert_index
-                    yield CompactionEvent(
-                        compaction_id=overflow_outcome.compaction_id,
-                        summary=overflow_outcome.summary,
-                        kept_entries=overflow_outcome.kept_entries,
-                        kept_count=len(overflow_outcome.messages),
-                        removed_count=overflow_outcome.removed_count,
-                    )
-                    overflow_retries = 0  # reset on success
-                    # Rebuild chat_cfg so next LLM call uses refreshed system
-                    # prompt. Read cache_breakpoints from the
-                    # refreshed self.config (re-anchored by
-                    # refresh_system_prompt) — chat_cfg.cache_breakpoints
-                    # would still hold pre-compaction base text and miss the
-                    # cache on the next provider call.
-                    chat_cfg = ChatConfig(
-                        max_tokens=chat_cfg.max_tokens,
-                        temperature=chat_cfg.temperature,
-                        system=self._context.system_prompt,
-                        thinking=thinking_enabled,
-                        thinking_budget_tokens=thinking_budget,
-                        timeout=chat_cfg.timeout,
-                        stop_sequences=chat_cfg.stop_sequences,
-                        cache_breakpoints=self._cache_breakpoints_without_runtime_context(
-                            self.config.cache_breakpoints
-                        ),
-                        cache_mode=chat_cfg.cache_mode,
-                        model_capabilities=self.config.model_capabilities,
-                        thinking_level=(
-                            self.config.thinking
-                            if isinstance(self.config.thinking, ThinkingLevel)
-                            else None
-                        ),
-                        provider_request_max_chars=(self._provider_request_proof_max_chars()),
-                        tool_choice=chat_cfg.tool_choice,
-                    )
 
                 assembled_text = "".join(assistant_text_parts)
                 visible_text = strip_synthetic_tool_call_suffix(
@@ -3817,6 +4111,8 @@ class Agent:
                     "\n".join(final_reasoning_parts) if final_reasoning_parts else None
                 ),
                 session_totals=session_totals,
+                stop_reason=turn_stop_reason,
+                stop_details=turn_stop_details,
             )
         # Reset for next turn
         self._state = AgentState.IDLE
@@ -4162,6 +4458,76 @@ class Agent:
 
         estimated_chars = len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
         return max(1, estimated_chars // 4)
+
+    async def _preflight_context_overflow(
+        self,
+        turn_messages: list[Message],
+        estimated_context_tokens: int,
+        *,
+        seen_message_count: int,
+        request_context_insert_index: int | None,
+        runtime_context_insert_index: int | None,
+    ) -> CompactionOutcome | None:
+        """Compact before a provider call when the live request is over threshold.
+
+        Only the leading ``seen_message_count`` messages, which an earlier
+        request already carried (or the history the turn started from), are
+        compacted. Compaction flattens messages to text, so the messages added
+        since (this turn's input, the latest reply and its tool results) are
+        kept verbatim after the compacted prefix: the model sees them in full
+        before they can be summarized.
+
+        Returns an uncompacted outcome when the request is under the threshold
+        or there is nothing to compact, and ``None`` when compaction failed.
+        """
+        unchanged = CompactionOutcome(
+            messages=turn_messages,
+            request_context_insert_index=request_context_insert_index,
+            runtime_context_insert_index=runtime_context_insert_index,
+        )
+        threshold = self.config.context_overflow_threshold * self.config.context_window_tokens
+        if estimated_context_tokens <= threshold:
+            return unchanged
+        split = max(0, min(seen_message_count, len(turn_messages)))
+        if split == 0:
+            return unchanged
+        prefix = turn_messages[:split]
+        tail = turn_messages[split:]
+
+        def _clip(index: int | None) -> int | None:
+            return None if index is None else min(index, split)
+
+        outcome = await self._check_context_overflow(
+            prefix,
+            estimated_context_tokens,
+            request_context_insert_index=_clip(request_context_insert_index),
+            runtime_context_insert_index=_clip(runtime_context_insert_index),
+        )
+        if outcome is None:
+            return None
+        if not outcome.compacted or (outcome.removed_count == 0 and not outcome.summary):
+            return unchanged
+
+        def _restore(adjusted: int | None, original: int | None) -> int | None:
+            if original is None or original <= split:
+                return adjusted
+            base = adjusted if adjusted is not None else len(outcome.messages)
+            return base + (original - split)
+
+        return CompactionOutcome(
+            messages=[*outcome.messages, *tail],
+            compacted=True,
+            summary=outcome.summary,
+            kept_entries=outcome.kept_entries,
+            removed_count=outcome.removed_count,
+            compaction_id=outcome.compaction_id,
+            request_context_insert_index=_restore(
+                outcome.request_context_insert_index, request_context_insert_index
+            ),
+            runtime_context_insert_index=_restore(
+                outcome.runtime_context_insert_index, runtime_context_insert_index
+            ),
+        )
 
     async def _check_context_overflow(
         self,
