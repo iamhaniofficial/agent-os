@@ -16,6 +16,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   exchange. Errored or aborted turns get none and cost no call, and answers
   are cached per reply so clients sharing a session share one call. On by
   default; `[sessions] suggest_next = false` turns it off.
+- Deferred tool loading. A request no longer carries every tool schema: 30
+  rarely used builtins (audio generation, git helpers, project and skill
+  administration, `browser`, `x_search`, `http_request`, ...) are listed by
+  name in a new `tool_search` tool instead, and the model loads the ones a task
+  needs; they stay loaded for the rest of the session, including after a
+  restart, and a reset starts lean again. `skill_view` loads the tools a skill
+  lists in `requires_tools`, and calling a deferred tool before loading it
+  returns an error that says how to load it. A stock request drops from 63 to
+  34 tool schemas (about 16k characters, ~4k tokens, less per call). Policy
+  still applies, and a surface narrowed by an allowlist defers nothing.
+  `[tools] defer_loading = false` sends every tool again; `agentos context`
+  reports the deferred count.
 
 ### Fixed
 - Providers: a 429 that said `Retry-After: 2` failed over to another model at

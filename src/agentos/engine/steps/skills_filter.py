@@ -89,6 +89,11 @@ async def filter_skills(ctx: TurnContext) -> TurnContext:
     # "why is this skill not offered?" — the engine must not compute the gate
     # its own way, or the two answers drift.
     available_tools = {t.name for t in ctx.tool_defs} if ctx.tool_defs else set()
+    # A deferred tool is one tool_search (or skill_view) away, so a skill that
+    # requires it is still offered.
+    from agentos.tools.deferred import deferred_tool_names
+
+    available_tools.update(deferred_tool_names(ctx.session_key))
     gated, availability = gate_skills(all_skills, available_tools, _eligibility_context())
 
     # ── always skills bypass filter, guaranteed visibility ──

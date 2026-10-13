@@ -2935,6 +2935,11 @@ class TurnRunner:
                 extra_context=extra_prompt_context,
             )
 
+            # Loaded deferred tools persist with the session; read them back
+            # before the tool list for this turn is built.
+            from agentos.tools.deferred import hydrate_loaded_tools
+
+            await hydrate_loaded_tools(self._session_manager, session_key)
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
                     session_key=session_key,
@@ -4210,7 +4215,21 @@ class TurnRunner:
             caller_kind=ctx.caller_kind if ctx else "none",
             denied_count=len(ctx.denied_tools) if ctx else 0,
         )
-        tool_defs = self._tool_registry.to_tool_definitions(ctx)
+        # Deferred tool loading: the request carries the always-loaded tools,
+        # tool_search, and whatever the session has loaded through it.
+        from agentos.tools.deferred import surface_for_turn
+
+        deferred_surface = surface_for_turn(
+            self._tool_registry,
+            ctx,
+            config=self._config,
+            session_manager=self._session_manager,
+        )
+        tool_defs = (
+            deferred_surface.tool_definitions()
+            if deferred_surface is not None
+            else self._tool_registry.request_tool_definitions(ctx, defer_loading=False)
+        )
         profile = resolve_profile(ctx)
         log.debug(
             "tool_policy.profile_post",
@@ -4231,6 +4250,8 @@ class TurnRunner:
             known_skill_names=known_skill_names,
             tool_hooks=self._tool_hooks,
         )
+        if deferred_surface is not None:
+            tool_handler = deferred_surface.guard(tool_handler)
         return tool_defs, tool_handler
 
     def _filter_tool_defs_by_capability(self, tool_defs: list) -> list:
@@ -4625,9 +4646,13 @@ class TurnRunner:
         unattended_context = bool(
             getattr(getattr(self._config, "heartbeat", None), "enabled", False)
         ) or bootstrap_context_mode in {"heartbeat_light", "unattended"}
+        from agentos.tools.deferred import prompt_tool_names
+
+        prompt_tools, deferred_prompt_tools = prompt_tool_names(tool_defs, session_key)
         base_prompt = assemble_system_prompt(
             agent_profile,
-            tools=[td.name for td in tool_defs] if tool_defs else None,
+            tools=prompt_tools or None,
+            deferred_tools=deferred_prompt_tools,
             memory=memory_text,
             runtime_info=runtime_info,
             docs_path=self._resolve_docs_path(),

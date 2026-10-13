@@ -190,6 +190,7 @@ class ToolSpec:
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
     result_budget_class: str | None = None
+    defer_loading: bool = False  # left out of requests until tool_search loads it
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import structlog
@@ -148,6 +148,30 @@ class ToolRegistry:
                 description = f"{description} {hint}"
         return description
 
+    def definition_for(
+        self,
+        rt: RegisteredTool,
+        ctx: ToolContext | None = None,
+        *,
+        description: str | None = None,
+    ) -> ToolDefinition:
+        """Build the provider-facing definition of one registered tool."""
+        active_ctx = ctx if ctx is not None else self._default_context()
+        return ToolDefinition(
+            name=rt.spec.name,
+            description=(
+                description if description is not None else self._description_for(rt, active_ctx)
+            ),
+            input_schema=ToolInputSchema(
+                type="object",
+                properties=self._parameters_for(rt, active_ctx),
+                required=rt.spec.required,
+            ),
+            execution_timeout_seconds=rt.spec.execution_timeout_seconds,
+            execution_timeout_argument=rt.spec.execution_timeout_argument,
+            execution_timeout_padding=rt.spec.execution_timeout_padding,
+        )
+
     def to_tool_definitions(self, ctx: ToolContext | None = None) -> list[ToolDefinition]:
         """Export tools as MCP-compatible ToolDefinition list.
 
@@ -155,23 +179,105 @@ class ToolRegistry:
         capability determine visibility.
 
         When *ctx* is None, all tools are returned (backward compat for tests).
+
+        This is every tool the context may use, deferred or not. What one
+        provider request actually carries is :meth:`request_tool_definitions`.
         """
         active_ctx = ctx if ctx is not None else self._default_context()
         return [
-            ToolDefinition(
-                name=rt.spec.name,
-                description=self._description_for(rt, active_ctx),
-                input_schema=ToolInputSchema(
-                    type="object",
-                    properties=self._parameters_for(rt, active_ctx),
-                    required=rt.spec.required,
-                ),
-                execution_timeout_seconds=rt.spec.execution_timeout_seconds,
-                execution_timeout_argument=rt.spec.execution_timeout_argument,
-                execution_timeout_padding=rt.spec.execution_timeout_padding,
-            )
+            self.definition_for(rt, active_ctx)
             for rt in self._iter_visible_tools(active_ctx, sort=True)
         ]
+
+    def deferred_tools(self, ctx: ToolContext | None = None) -> list[RegisteredTool]:
+        """Tools *ctx* may use that a request leaves out until ``tool_search`` loads them.
+
+        A tool is deferred when its spec sets ``defer_loading``, the context's
+        policy lets it be seen, and nobody asked for it by name. A surface
+        narrowed by an allowlist (an agent's ``tools.allow`` or profile, a cron
+        job's surface) defers nothing: every tool on it was put there on
+        purpose, and such a surface is already small. A tool surfaced for this
+        call is loaded up front for the same reason. With ``tool_search``
+        unregistered or denied there is no way to load anything, so nothing is
+        deferred. Sorted by name, so the catalog ``tool_search`` describes is
+        stable for the life of a session.
+        """
+        from agentos.tools.deferred import TOOL_SEARCH_NAME
+
+        active_ctx = ctx if ctx is not None else self._default_context()
+        if (
+            TOOL_SEARCH_NAME not in self._tools
+            or TOOL_SEARCH_NAME in active_ctx.denied_tools
+            or active_ctx.allowed_tools is not None
+        ):
+            return []
+        surfaced = active_ctx.surfaced_tools or set()
+        return [
+            rt
+            for rt in self._iter_visible_tools(active_ctx, sort=True)
+            if rt.spec.defer_loading and rt.spec.name not in surfaced
+        ]
+
+    def request_tool_definitions(
+        self,
+        ctx: ToolContext | None = None,
+        *,
+        loaded: Sequence[str] = (),
+        defer_loading: bool = True,
+    ) -> list[ToolDefinition]:
+        """The tool list one provider request carries.
+
+        Always-loaded tools come first, sorted by name; ``tool_search`` is among
+        them whenever something is deferred. Deferred tools the session has
+        loaded follow in the order they were loaded, which is also the order
+        ``tool_search`` appends them mid-turn — so a load extends the list
+        rather than reshuffling it, and the next turn sends the same prefix.
+
+        ``defer_loading=False`` (or nothing to defer) returns
+        :meth:`to_tool_definitions` minus ``tool_search``, which has nothing to
+        offer then even if an allowlist wildcard made it visible.
+        """
+        from agentos.tools.deferred import TOOL_SEARCH_NAME, render_tool_search_description
+
+        active_ctx = ctx if ctx is not None else self._default_context()
+        deferred = (
+            {rt.spec.name: rt for rt in self.deferred_tools(active_ctx)} if defer_loading else {}
+        )
+        if not deferred:
+            return [
+                definition
+                for definition in self.to_tool_definitions(active_ctx)
+                if definition.name != TOOL_SEARCH_NAME
+            ]
+
+        search_rt = self._tools[TOOL_SEARCH_NAME]
+        upfront = [
+            rt
+            for rt in self._iter_visible_tools(active_ctx)
+            if rt.spec.name not in deferred and rt.spec.name != TOOL_SEARCH_NAME
+        ]
+        upfront.append(search_rt)
+        upfront.sort(key=lambda rt: rt.spec.name)
+        definitions = [
+            self.definition_for(
+                rt,
+                active_ctx,
+                description=(
+                    render_tool_search_description(search_rt, list(deferred.values()))
+                    if rt is search_rt
+                    else None
+                ),
+            )
+            for rt in upfront
+        ]
+        seen: set[str] = set()
+        for name in loaded:
+            rt = deferred.get(name)
+            if rt is None or name in seen:
+                continue
+            seen.add(name)
+            definitions.append(self.definition_for(rt, active_ctx))
+        return definitions
 
     async def list_tools(
         self,
@@ -341,9 +447,13 @@ def tool(
     execution_timeout_argument: str | None = None,
     execution_timeout_padding: float = 0.0,
     result_budget_class: str | None = None,
+    defer_loading: bool = False,
     registry: ToolRegistry | None = None,
 ) -> Any:
     """Decorator to register an async function as a tool.
+
+    ``defer_loading=True`` keeps the tool out of provider requests until the
+    model loads it with ``tool_search`` (see :mod:`agentos.tools.deferred`).
 
     Usage::
 
@@ -361,6 +471,7 @@ def tool(
             execution_timeout_seconds=execution_timeout_seconds,
             execution_timeout_argument=execution_timeout_argument,
             execution_timeout_padding=execution_timeout_padding,
+            defer_loading=defer_loading,
             result_budget_class=result_budget_class,
         )
         target = registry if registry is not None else _default_registry

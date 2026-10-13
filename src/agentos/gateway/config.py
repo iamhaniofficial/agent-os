@@ -242,6 +242,10 @@ class ToolsConfig(BaseModel):
     """Top-level runtime tool policy configuration."""
 
     enabled: bool = True
+    # Leave the long tail of tools (``defer_loading`` in their spec) out of
+    # every request; the model loads them on demand through ``tool_search``.
+    # ``false`` sends every tool on every request, the pre-deferral behaviour.
+    defer_loading: bool = True
     profile: Literal["full", "minimal", "memory_only", "coding", "messaging"] | None = None
     allow: list[str] = Field(default_factory=list)
     deny: list[str] = Field(default_factory=list)

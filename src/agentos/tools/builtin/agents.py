@@ -106,6 +106,7 @@ def _check_spawned_by_or_raise(session_or_dict: object, current_key: str | None)
     description="List available agent configurations from the agent registry.",
     params={},
     required=[],
+    defer_loading=True,
 )
 async def agents_list() -> str:
     registry = _get_agent_registry()
