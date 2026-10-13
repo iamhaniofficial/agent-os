@@ -881,10 +881,6 @@ class Agent:
             return ContextBudgetClass.CONTROL
         return ContextBudgetClass.LOCAL
 
-    def _tool_use_argument_provider_request_max_chars(self, tool_name: str) -> int:
-        budget_class = self._context_budget_class(resolve_budget_class(tool_name))
-        return self._context_budget_governor().tool_argument_chars_for(budget_class)
-
     def _tool_result_provider_request_max_chars(
         self,
         budget_class: ToolResultBudgetClass | None = None,
@@ -3885,15 +3881,6 @@ class Agent:
         )
 
     @staticmethod
-    def _has_provider_context_replay_marker(arguments: dict[str, Any]) -> bool:
-        if Agent._has_provider_context_argument_marker(arguments):
-            return True
-        return any(
-            isinstance(value, str) and value.startswith(_INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX)
-            for value in arguments.values()
-        )
-
-    @staticmethod
     def _is_provider_context_projection_reuse_result(result: ToolResult) -> bool:
         status: Mapping[str, Any] = result.execution_status or {}
         return bool(
@@ -4231,7 +4218,6 @@ class Agent:
             tool_use_argument_projection_enabled=(self.config.tool_use_argument_projection_enabled),
             tool_failure_loop_block_threshold=(self.config.tool_failure_loop_block_threshold),
             max_safe_tool_concurrency=self.config.max_safe_tool_concurrency,
-            tool_result_external_keep_recent=self.config.tool_result_external_keep_recent,
             tool_result_store_dir=self.config.tool_result_store_dir,
             tool_result_store_session_id=self.config.tool_result_store_session_id,
             tool_result_store_session_key=self.config.tool_result_store_session_key,

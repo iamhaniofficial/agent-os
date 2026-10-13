@@ -356,7 +356,6 @@ class AgentConfig:
     provider_request_proof_max_chars: int = 0
     tool_use_argument_provider_request_max_chars: int = 0
     tool_use_argument_projection_enabled: bool = False
-    tool_result_external_keep_recent: int = 2
     tool_failure_loop_block_threshold: int = 3
     tool_result_store_dir: str | None = None
     tool_result_store_session_id: str | None = None

@@ -2498,12 +2498,6 @@ class TurnRunner:
             return
         yield
 
-    def _session_write_context_factory(
-        self,
-        session_key: str,
-    ) -> Callable[[], contextlib.AbstractAsyncContextManager[None]]:
-        return lambda: self._session_write_context(session_key)
-
     async def _append_session_message(self, session_key: str, **append_kwargs: Any) -> Any:
         if self._session_manager is None:
             return None
