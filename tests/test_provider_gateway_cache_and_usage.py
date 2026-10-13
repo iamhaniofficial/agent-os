@@ -135,13 +135,26 @@ def _tool_loop() -> tuple[list[Message], list[Message]]:
 # --- cache hints per upstream ---------------------------------------------
 
 
-def test_opencap_claude_gets_a_rolling_marker_on_the_last_input(
+def test_rolling_block_gateway_row_marks_the_last_input(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The rolling-marker mechanism stays for a gateway that proves to forward
+    it; exercised here through a stand-in table row."""
+    from agentos.provider import openai as openai_mod
+
+    row = openai_mod._AnthropicCacheGateway(
+        name="test-gateway",
+        provider_kinds=frozenset({"test-gateway"}),
+        hosts=frozenset({"gw.example.test"}),
+        model_prefixes=(),
+        model_substrings=("claude",),
+        style="rolling_block",
+    )
+    monkeypatch.setattr(openai_mod, "_ANTHROPIC_CACHE_GATEWAYS", (row,))
     recorder = _Recorder()
     recorder.install(monkeypatch)
     provider = OpenAIProvider(
-        api_key="k", model="claude-opus-5", base_url=_OPENCAP, provider_kind="opencap"
+        api_key="k", model="claude-opus-5", base_url="https://gw.example.test/v1"
     )
     first, second = _tool_loop()
 
@@ -155,8 +168,7 @@ def test_opencap_claude_gets_a_rolling_marker_on_the_last_input(
     assert n["messages"][3]["content"] == [
         {"type": "text", "text": "# A", "cache_control": {"type": "ephemeral"}}
     ]
-    # Next request: the marker moved to the new last user message; nothing on
-    # the system prompt, tools or the top level (OpenCAP caches those itself).
+    # Next request: the marker moved to the new last user message.
     assert _markers(n1) == ["$.messages[5].content[0]"]
     assert "cache_control" not in n1
     # Same prompt up to the new turn once the marker is set aside.
@@ -168,22 +180,14 @@ def test_opencap_claude_gets_a_rolling_marker_on_the_last_input(
     assert replay == prefix
 
 
-def test_opencap_matched_by_host_for_a_custom_provider_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    recorder = _Recorder()
-    recorder.install(monkeypatch)
-    provider = OpenAIProvider(api_key="k", model="claude-sonnet-5-5", base_url=_OPENCAP)
-
-    _run(provider, [Message(role="user", content="hi")], _CFG)
-
-    assert _markers(recorder.payloads[0]) == ["$.messages[1].content[0]"]
-
-
 @pytest.mark.parametrize(
     ("provider_kind", "base_url", "model"),
     [
-        ("opencap", _OPENCAP, "gpt-5.6-luna"),  # not a Claude model
+        # OpenCAP ignores per-message markers (measured 2026-10-13): none sent,
+        # by provider id or by host.
+        ("opencap", _OPENCAP, "claude-opus-5"),
+        ("openai", _OPENCAP, "claude-sonnet-5-5"),
+        ("opencap", _OPENCAP, "gpt-5.6-luna"),
         ("openai", "https://api.openai.com", "claude-opus-5"),
         ("deepseek", "https://api.deepseek.com", "deepseek-v4-flash"),
         ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3-pro"),
@@ -207,11 +211,14 @@ def test_no_anthropic_cache_hints_for_other_upstreams(
     assert recorder.payloads[0]["messages"][3]["content"] == "# A"
 
 
-def test_opencap_cache_mode_off_sends_no_hints(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cache_mode_off_sends_no_hints(monkeypatch: pytest.MonkeyPatch) -> None:
     recorder = _Recorder()
     recorder.install(monkeypatch)
     provider = OpenAIProvider(
-        api_key="k", model="claude-opus-5", base_url=_OPENCAP, provider_kind="opencap"
+        api_key="k",
+        model="anthropic/claude-opus-5.5",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
     )
 
     _run(provider, [Message(role="user", content="hi")], ChatConfig(cache_mode="off"))

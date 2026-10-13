@@ -60,12 +60,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (connect 12 s, write 30 s, read = the request timeout; env
   `AGENTOS_LLM_STREAM_CONNECT_TIMEOUT_SECONDS` /
   `AGENTOS_LLM_STREAM_WRITE_TIMEOUT_SECONDS`). (#3648)
-- Claude through OpenCAP now caches the conversation, not only the system
-  prompt and tools: the last user or tool message carries a rolling
-  `cache_control` marker, so each turn reads the previous turn's history
-  from cache instead of re-writing it. Which OpenAI-compatible gateways get
-  Anthropic cache hints is a small table (OpenRouter: request-level
-  `cache_control`, as before; OpenCAP: the rolling marker); api.openai.com,
+- Anthropic cache hints on OpenAI-compatible gateways come from a small
+  table of gateways known to forward them. OpenRouter is the one entry: Claude
+  models (`anthropic/...`) get the request-level `cache_control`, whose
+  breakpoint advances with the conversation, as before. api.openai.com,
   DeepSeek, Gemini, Zhipu and local servers get none. (#3648)
 - OpenAI (api.openai.com): requests carry a `prompt_cache_key` derived from
   the model, system prompt and tools, so turns sharing a prefix are routed to
