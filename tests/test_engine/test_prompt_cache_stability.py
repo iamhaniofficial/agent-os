@@ -459,19 +459,21 @@ async def test_summary_context_is_request_only_and_keeps_system_cache_anchor(
         "old question",
         "old answer",
     ]
-    request_context = call["messages"][2].content
-    assert "[Request context for this turn]" in request_context
-    assert "[Compacted Session Summaries]" in request_context
-    assert "summary outside transcript" in request_context
-    assert "<memory_context>volatile recall</memory_context>" in request_context
+    # Durable summaries and dynamic context ride as trailing blocks of the
+    # CURRENT user message -- after the stable prefix, never in the system
+    # prompt -- and are persisted with it (no later request rewrites them).
+    current = call["messages"][-1].content
+    assert len(call["messages"]) == 3
     assert call["messages"][-1].role == "user"
-    assert call["messages"][-1].content.startswith("current question")
-    assert "[Runtime context for this turn]" in call["messages"][-1].content
-    assert all(
-        "summary outside transcript" not in message.content
-        for message in agent._history
-        if isinstance(message.content, str)
+    assert current.startswith("current question")
+    assert "[Request context for this turn]" in current
+    assert "[Compacted Session Summaries]" in current
+    assert "summary outside transcript" in current
+    assert "<memory_context>volatile recall</memory_context>" in current
+    assert current.index("[Request context for this turn]") < current.index(
+        "[Runtime context for this turn]"
     )
+    assert agent._history[2] == call["messages"][-1]
 
 
 @pytest.mark.asyncio

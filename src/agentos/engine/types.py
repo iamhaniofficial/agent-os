@@ -240,8 +240,9 @@ class CompactionOutcome:
     kept_entries: list[dict] = field(default_factory=list)
     removed_count: int = 0
     compaction_id: str | None = None
-    request_context_insert_index: int | None = None
-    runtime_context_insert_index: int | None = None
+    # Index of the current turn's first input message in ``messages``
+    # (2 after a compaction: the summary exchange comes first).
+    turn_input_index: int = 0
 
 
 AgentEvent = (

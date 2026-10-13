@@ -995,6 +995,7 @@ class SessionManager:
                     target_session_id=child.session_id,
                     target_session_key=new_session_key,
                 )
+                forked_message_ids: dict[str, str] = {}
                 for entry in parent_entries:
                     # Build the forked row from the entry itself so a new
                     # TranscriptEntry column is carried over by default instead
@@ -1008,6 +1009,15 @@ class SessionManager:
                         session_id=child.session_id,
                         session_key=new_session_key,
                     )
+                    forked_message_ids[entry.message_id] = forked.message_id
+                    record = forked.provider_messages
+                    if isinstance(record, dict) and record.get("input_entry_id"):
+                        # The structured record names the user row it replays;
+                        # point it at the child's copy of that row.
+                        forked.provider_messages = {
+                            **record,
+                            "input_entry_id": forked_message_ids.get(str(record["input_entry_id"])),
+                        }
                     await self._storage.append_transcript_entry(forked)
                 for summary in parent_summaries:
                     await self._storage.save_summary(
@@ -1071,8 +1081,14 @@ class SessionManager:
         turn_usage: dict[str, Any] | None = None,
         token_count: int | None = None,
         provenance: dict[str, Any] | None = None,
+        provider_messages: dict[str, Any] | None = None,
     ) -> TranscriptEntry:
-        """Append a message to the session transcript and touch updated_at."""
+        """Append a message to the session transcript and touch updated_at.
+
+        *provider_messages* is the structured record of the provider-facing
+        messages an assistant turn appended (``agentos.engine.transcript``);
+        it is stored on assistant rows only.
+        """
         session_key = canonicalize_session_key(session_key)
         node = await self._storage.get_session(session_key)
         if node is None:
@@ -1090,6 +1106,7 @@ class SessionManager:
             reasoning_content=reasoning_content if role == "assistant" else None,
             turn_usage=turn_usage if role == "assistant" else None,
             token_count=token_count,
+            provider_messages=provider_messages if role == "assistant" else None,
         )
 
         # Apply provenance only if not already set (spec: never overwrite)

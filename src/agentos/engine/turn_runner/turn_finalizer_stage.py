@@ -126,6 +126,7 @@ class TranscriptAppendPort(Protocol):
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
+        provider_messages: dict[str, Any] | None = None,
     ) -> bool: ...
 
 
@@ -330,6 +331,10 @@ class TurnFinalizerStageInput:
     heartbeat_ack_max_chars: int
     no_memory_capture: bool
 
+    # From the Agent: the structured provider-message record of the turn
+    # (``agentos.engine.transcript``), persisted next to the flat segments.
+    provider_messages: dict[str, Any] | None = None
+
 
 @dataclass(frozen=True)
 class TurnFinalizerStageOutput:
@@ -480,6 +485,9 @@ class TurnFinalizerStage:
             if inp.done_event is not None and inp.done_event.reasoning_content:
                 reasoning_content = inp.done_event.reasoning_content
             token_count = inp.done_event.output_tokens if inp.done_event is not None else None
+            append_kwargs: dict[str, Any] = {}
+            if inp.provider_messages is not None:
+                append_kwargs["provider_messages"] = inp.provider_messages
             transcript_appended = await self._transcript_append.append_message(
                 inp.session_key,
                 role="assistant",
@@ -491,6 +499,7 @@ class TurnFinalizerStage:
                     resolved_model=inp.resolved_model,
                 ),
                 token_count=token_count,
+                **append_kwargs,
             )
             if transcript_appended:
                 try:

@@ -227,6 +227,11 @@ class TranscriptEntry(SQLModel, table=True):
     turn_usage: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     created_at: int = Field(default_factory=_now_ms)
     token_count: int | None = None
+    # Structured provider-facing messages this assistant turn appended
+    # (``agentos.engine.transcript`` record). ``tool_calls`` keeps the flat
+    # display segments the UI and memory read; this column is what the model
+    # replays. ``None`` on rows written before it existed.
+    provider_messages: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
 
     # Input provenance (never overwritten once set)
     provenance_kind: str | None = None

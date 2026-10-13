@@ -321,34 +321,54 @@ async def test_chunks_processed_count():
     assert result.chunks_processed >= 1
 
 
+def _install_sse_provider_transport(
+    monkeypatch,
+    captured: dict[str, object],
+    *,
+    error: Exception | None = None,
+) -> None:
+    """Serve the summarizer's provider request from an in-memory SSE stream.
+
+    ``call_compaction_llm`` goes through the ``LLMProvider`` abstraction (an
+    OpenAI-compatible provider when no session provider is passed), so the
+    fake sits at the provider's HTTP transport, not in the compaction module.
+    """
+    import json as _json
+
+    import httpx
+
+    real_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if error is not None:
+            raise error
+        captured["url"] = str(request.url)
+        captured["headers"] = dict(request.headers)
+        captured["json"] = _json.loads(request.content)
+        body = (
+            'data: {"choices":[{"delta":{"content":"summary"}}]}\n\n'
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body.encode("utf-8"),
+        )
+
+    monkeypatch.setattr(
+        "agentos.provider.openai.httpx.AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(handler),
+            timeout=kwargs.get("timeout"),
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_call_compaction_llm_adds_openrouter_app_attribution(monkeypatch) -> None:
     captured: dict[str, object] = {}
-
-    class FakeResponse:
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict:
-            return {"choices": [{"message": {"content": "summary"}}]}
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> bool:
-            return False
-
-        async def post(self, url, *, json, headers):
-            captured["url"] = url
-            captured["json"] = json
-            captured["headers"] = headers
-            return FakeResponse()
-
-    monkeypatch.setattr(
-        "agentos.session.compaction.httpx.AsyncClient",
-        lambda **kwargs: FakeClient(),
-    )
+    _install_sse_provider_transport(monkeypatch, captured)
 
     result = await call_compaction_llm(
         chunk_text="old conversation",
@@ -361,31 +381,20 @@ async def test_call_compaction_llm_adds_openrouter_app_attribution(monkeypatch) 
 
     assert result == "summary"
     assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
-    assert captured["headers"] == {
-        "Authorization": "Bearer test-key",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://useagentos.dev",
-        "X-OpenRouter-Title": "AgentOS",
-        "X-OpenRouter-Categories": "cli-agent,personal-agent",
-    }
+    headers = captured["headers"]
+    assert isinstance(headers, dict)
+    assert headers["authorization"] == "Bearer test-key"
+    assert headers["http-referer"] == "https://useagentos.dev"
+    assert headers["x-openrouter-title"] == "AgentOS"
+    assert headers["x-openrouter-categories"] == "cli-agent,personal-agent"
+    payload = captured["json"]
+    assert isinstance(payload, dict)
+    assert payload["model"] == "openai/gpt-4o-mini"
 
 
 @pytest.mark.asyncio
 async def test_call_compaction_llm_timeout_returns_none(monkeypatch) -> None:
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> bool:
-            return False
-
-        async def post(self, url, *, json, headers):
-            raise TimeoutError("summary timed out")
-
-    monkeypatch.setattr(
-        "agentos.session.compaction.httpx.AsyncClient",
-        lambda **kwargs: FakeClient(),
-    )
+    _install_sse_provider_transport(monkeypatch, {}, error=TimeoutError("summary timed out"))
 
     result = await call_compaction_llm(
         chunk_text="old conversation",
@@ -399,33 +408,46 @@ async def test_call_compaction_llm_timeout_returns_none(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_call_compaction_llm_streams_through_a_session_provider() -> None:
+    """A resolved session provider is used as is -- no raw HTTP, no key needed."""
+    from agentos.provider import DoneEvent, Message, TextDeltaEvent
+
+    calls: list[tuple[list[Message], object]] = []
+
+    class _Provider:
+        provider_name = "fake"
+
+        def chat(self, messages, tools=None, config=None):
+            calls.append((messages, config))
+
+            async def _stream():
+                yield TextDeltaEvent(text="provider ")
+                yield TextDeltaEvent(text="summary")
+                yield DoneEvent()
+
+            return _stream()
+
+    result = await call_compaction_llm(
+        chunk_text="old conversation",
+        identifier_instruction="Preserve exact IDs.",
+        model="any-model",
+        api_key="",
+        provider=_Provider(),
+    )
+
+    assert result == "provider summary"
+    assert len(calls) == 1
+    sent, config = calls[0]
+    assert "old conversation" in str(sent[0].content)
+    assert "Preserve exact IDs." in str(getattr(config, "system", ""))
+
+
+@pytest.mark.asyncio
 async def test_custom_instructions_are_user_scoped_and_identifier_policy_stays_system(
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
-
-    class FakeResponse:
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict:
-            return {"choices": [{"message": {"content": "summary"}}]}
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> bool:
-            return False
-
-        async def post(self, url, *, json, headers):
-            captured["json"] = json
-            return FakeResponse()
-
-    monkeypatch.setattr(
-        "agentos.session.compaction.httpx.AsyncClient",
-        lambda **kwargs: FakeClient(),
-    )
+    _install_sse_provider_transport(monkeypatch, captured)
 
     await call_compaction_llm(
         chunk_text="old conversation",

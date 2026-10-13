@@ -149,6 +149,19 @@ class DoneEvent:
     # Structured detail the provider attached to the stop, e.g. Anthropic's
     # refusal ``{"type": "refusal", "category": ..., "explanation": ...}``.
     stop_details: dict[str, Any] | None = None
+    # Every ``thinking`` / ``redacted_thinking`` block of the response, in
+    # stream order, each with its own ``signature`` / ``data``. This is the
+    # replay-safe form: put these blocks, unmodified and in this order, at the
+    # start of the assistant message's content. ``reasoning_content`` and
+    # ``thinking_signature`` above stay as the joined text and the last
+    # signature for older callers; they cannot round-trip more than one block.
+    thinking_blocks: list[ContentBlockThinking | ContentBlockRedactedThinking] = field(
+        default_factory=list
+    )
+    # OpenRouter ``reasoning_details`` of the response, fragments merged per
+    # ``index``. Store them on :attr:`Message.reasoning_details`; the
+    # OpenAI-compatible provider re-sends them verbatim to OpenRouter.
+    reasoning_details: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         given = self.stop_reason
@@ -351,6 +364,13 @@ class ContentBlockThinking(BaseModel):
     signature: str | None = None
 
 
+class ContentBlockRedactedThinking(BaseModel):
+    """An encrypted Anthropic thinking block; replayed byte-for-byte."""
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str
+
+
 class ContentBlockCompaction(BaseModel):
     type: Literal["compaction"] = "compaction"
     content: str | None = None
@@ -366,6 +386,7 @@ MessageContent = (
         | ContentBlockImage
         | ContentBlockDocument
         | ContentBlockThinking
+        | ContentBlockRedactedThinking
         | ContentBlockCompaction
     ]
 )
@@ -377,3 +398,6 @@ class Message(BaseModel):
     role: Literal["user", "assistant"]
     content: MessageContent
     reasoning_content: str | None = None
+    # OpenRouter ``reasoning_details`` from the response that produced this
+    # assistant message, kept verbatim for replay (see DoneEvent).
+    reasoning_details: list[dict[str, Any]] | None = None

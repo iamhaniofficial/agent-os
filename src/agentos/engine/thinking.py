@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from agentos.provider import ContentBlockText, ContentBlockThinking, Message
+from agentos.provider import (
+    ContentBlockRedactedThinking,
+    ContentBlockText,
+    ContentBlockThinking,
+    Message,
+)
+
+_REASONING_BLOCKS = (ContentBlockThinking, ContentBlockRedactedThinking)
 
 
 def _has_tool_use(content: object) -> bool:
@@ -19,8 +26,8 @@ def drop_reasoning(
 ) -> list[Message]:
     """Strip thinking blocks AND reasoning_content from assistant messages.
 
-    - Removes ContentBlockThinking blocks from content lists (Anthropic)
-    - Clears reasoning_content field (DeepSeek/OpenRouter)
+    - Removes thinking / redacted_thinking blocks from content lists (Anthropic)
+    - Clears reasoning_content and reasoning_details (DeepSeek/OpenRouter)
     - Optionally preserves reasoning_content on assistant messages
     - Inserts placeholder text block if content becomes empty
     - Returns original list reference if nothing changed
@@ -30,7 +37,9 @@ def drop_reasoning(
 
     for msg in messages:
         # Clear reasoning_content on any assistant message that has it
-        if msg.role == "assistant" and msg.reasoning_content is not None:
+        if msg.role == "assistant" and (
+            msg.reasoning_content is not None or msg.reasoning_details is not None
+        ):
             keep_tool_reasoning = preserve_tool_call_reasoning and _has_tool_use(msg.content)
             keep_reasoning_content = preserve_reasoning_content or keep_tool_reasoning
             touched = True
@@ -38,7 +47,7 @@ def drop_reasoning(
                 filtered = [
                     b
                     for b in msg.content
-                    if keep_tool_reasoning or not isinstance(b, ContentBlockThinking)
+                    if keep_tool_reasoning or not isinstance(b, _REASONING_BLOCKS)
                 ]
                 if not filtered:
                     filtered = [ContentBlockText(text="")]
@@ -49,6 +58,9 @@ def drop_reasoning(
                         reasoning_content=(
                             msg.reasoning_content if keep_reasoning_content else None
                         ),
+                        reasoning_details=(
+                            msg.reasoning_details if keep_reasoning_content else None
+                        ),
                     )
                 )
             else:
@@ -58,6 +70,9 @@ def drop_reasoning(
                         content=msg.content,
                         reasoning_content=(
                             msg.reasoning_content if keep_reasoning_content else None
+                        ),
+                        reasoning_details=(
+                            msg.reasoning_details if keep_reasoning_content else None
                         ),
                     )
                 )
@@ -75,7 +90,7 @@ def drop_reasoning(
         filtered = []
         changed = False
         for block in msg.content:
-            if isinstance(block, ContentBlockThinking):
+            if isinstance(block, _REASONING_BLOCKS):
                 touched = True
                 changed = True
                 continue

@@ -7,8 +7,9 @@ dependencies the agent-bootstrap slice needs (the five
 provider helper, the memory sync managers + private-memory check, and
 the Agent constructor) so the slice runs against deterministic stubs.
 
-It then probes ``_maybe_compact_on_t3_upgrade`` (the line immediately
-after the slice in ``_run_turn``) to capture the post-slice locals and
+It then probes ``_load_history`` (the first runner call after the slice in
+``_run_turn``, reached through the history stage) to capture the post-slice
+locals and
 raise a sentinel ``BaseException`` that halts the generator without
 touching downstream stages. The raising-stub case (#11) exercises the
 propagation path through the runtime's terminal ``except Exception``
@@ -104,8 +105,8 @@ class _SliceCapture(BaseException):
 def _capture_locals_at_post_slice() -> dict[str, Any]:
     """Read ``_run_turn``'s locals at the boundary right after the slice.
 
-    The probe is hooked onto ``_maybe_compact_on_t3_upgrade`` (the very
-    next call site after the agent-bootstrap slice). At entry, the
+    The probe is hooked onto ``_load_history`` (the first runner call after
+    the agent-bootstrap slice, via the history stage). At entry, the
     caller's frame contains every local the agent-bootstrap boundary must
     populate.
     """
@@ -325,16 +326,15 @@ def _patch_memory_helpers(runner):
 
 
 def _patch_post_slice_probe(runner):
-    """Hook _maybe_compact_on_t3_upgrade (first call past the slice)."""
+    """Hook _load_history (first runner call past the slice)."""
 
     async def _probe(
-        self, session_key, turn, context_window_tokens,
-        *, compaction_provider=None, compaction_model=None,
+        self, agent, session_key, *, trim_last_user=True,
     ):  # noqa: ARG001, ARG002
         snapshot = _capture_locals_at_post_slice()
         raise _SliceCapture(snapshot)
 
-    runner._maybe_compact_on_t3_upgrade = _probe.__get__(runner, TurnRunner)
+    runner._load_history = _probe.__get__(runner, TurnRunner)
 
 
 def _patch_observability(runner):
