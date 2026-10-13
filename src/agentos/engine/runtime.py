@@ -19,12 +19,12 @@ import os
 import platform
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Hashable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Final, Literal, SupportsInt, TypeGuard, cast
+from typing import Any, Final, SupportsInt, TypeGuard, cast
 
 import structlog
 
@@ -269,82 +269,6 @@ def _hooks_mode_from_env() -> str:
 def _is_deepseek_model_id(model: str) -> bool:
     normalized = model.strip().lower()
     return normalized.startswith("deepseek") or "/deepseek" in normalized
-
-
-# Tools that are safe to run concurrently within a single LLM turn.
-# Any tool name absent from this set is treated as mutex (serial dispatch).
-_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "agents_list",
-        "git_diff",
-        "git_log",
-        "git_status",
-        "glob_search",
-        "grep_search",
-        "image",
-        "list_dir",
-        "memory_get",
-        "memory_search",
-        "pdf",
-        "projects_list",
-        "read_file",
-        "read_spreadsheet",
-        "session_search",
-        "session_status",
-        "sessions_history",
-        "sessions_list",
-        "skill_list",
-        "skill_search_community",
-        "skill_view",
-        "tts",
-        "web_fetch",
-        "web_search",
-    }
-)
-
-_ToolConcurrencyMode = Literal["mutex", "concurrent", "keyed", "predicate"]
-
-
-@dataclass(frozen=True)
-class _ToolConcurrencyPolicy:
-    mode: _ToolConcurrencyMode
-    key: Hashable | None = None
-    max_inflight: int | None = None
-    limit_key: Hashable | None = None
-
-
-_MUTEX_TOOL_POLICY = _ToolConcurrencyPolicy(mode="mutex")
-_CONCURRENT_TOOL_POLICY = _ToolConcurrencyPolicy(mode="concurrent")
-
-
-def _get_tool_concurrency_policy(
-    tool_name: str,
-    arguments: Mapping[str, Any] | None = None,
-    *,
-    parent_session_key: str | None = None,
-) -> _ToolConcurrencyPolicy:
-    if tool_name in _SAFE_TOOL_NAMES:
-        return _CONCURRENT_TOOL_POLICY
-    if tool_name == "sessions_send":
-        session_key = (arguments or {}).get("session_key")
-        if isinstance(session_key, str) and session_key.strip():
-            return _ToolConcurrencyPolicy(
-                mode="keyed",
-                key=("sessions_send", session_key.strip()),
-            )
-        return _MUTEX_TOOL_POLICY
-    if tool_name == "sessions_spawn":
-        from agentos.tools.types import current_tool_context  # noqa: PLC0415
-
-        ctx = current_tool_context.get()
-        parent_key = parent_session_key or (ctx.session_key if ctx is not None else None)
-        if parent_key:
-            return _ToolConcurrencyPolicy(
-                mode="keyed",
-                key=("sessions_spawn", parent_key),
-            )
-        return _MUTEX_TOOL_POLICY
-    return _MUTEX_TOOL_POLICY
 
 
 # Per-call-chain owner tracking for session-lock re-entry detection.

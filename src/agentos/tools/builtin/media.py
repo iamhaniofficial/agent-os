@@ -105,6 +105,8 @@ def configure_audio(config: Any | None) -> None:
 
 @tool(
     name="image",
+    concurrency="parallel",
+    read_only=True,
     description=(
         "Analyze an image using a vision-capable model. "
         "Accepts only a real local file path or HTTP(S) URL. "
@@ -647,6 +649,8 @@ def _resolve_generated_image_path(filename: str | None, output_format: str) -> P
 
 @tool(
     name="pdf",
+    concurrency="parallel",
+    read_only=True,
     description=(
         "Extract text from a PDF file, optionally filtered by page range. "
         "If a prompt is supplied, the extracted text is sent to the LLM for analysis."
@@ -1887,6 +1891,7 @@ async def voice_search(
 
 @tool(
     name="tts",
+    concurrency="parallel",
     description=(
         "Synthesize text to speech audio using a TTS provider. "
         "Returns an explicit not_available envelope when no TTS provider is configured."

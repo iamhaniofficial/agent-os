@@ -136,6 +136,8 @@ async def projects_create(
 
 @tool(
     name="projects_list",
+    concurrency="parallel",
+    read_only=True,
     description=(
         "List projects (with per-project session counts). Knowledge text is "
         "included only for the calling session's own project."

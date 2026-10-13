@@ -127,6 +127,8 @@ def build_request_for_git(args: tuple[str, ...], cwd: Path, action_kind: str, po
 
 @tool(
     name="git_status",
+    concurrency="parallel",
+    read_only=True,
     description="Show the working tree status.",
     params={
         "workdir": {"type": "string", "description": "Git repository directory (default: cwd)."},
@@ -199,6 +201,8 @@ def _git_diff_argv(a: dict[str, Any]) -> tuple[str, ...]:
 
 @tool(
     name="git_diff",
+    concurrency="parallel",
+    read_only=True,
     description="Show git diff against HEAD (staged + unstaged changes).",
     params={
         "path": {"type": "string", "description": "Limit diff to this path."},
@@ -295,6 +299,8 @@ async def git_commit(
 
 @tool(
     name="git_log",
+    concurrency="parallel",
+    read_only=True,
     description="Show recent git commit log.",
     params={
         "count": {"type": "integer", "description": "Number of commits to show (default 10)."},

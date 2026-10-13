@@ -743,6 +743,8 @@ def _search_error_payload(
 
 @tool(
     name="web_search",
+    concurrency="parallel",
+    read_only=True,
     description="Search the web and return results with titles, URLs, and snippets.",
     params={
         "query": {"type": "string", "description": "Search query."},

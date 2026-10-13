@@ -103,6 +103,8 @@ def _check_spawned_by_or_raise(session_or_dict: object, current_key: str | None)
 
 @tool(
     name="agents_list",
+    concurrency="parallel",
+    read_only=True,
     description="List available agent configurations from the agent registry.",
     params={},
     required=[],

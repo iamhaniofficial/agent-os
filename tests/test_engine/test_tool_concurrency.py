@@ -1,7 +1,7 @@
 """Concurrent tool dispatch tests.
 
-Verifies that same-turn safe tools run concurrently via asyncio.gather
-and mutex tools remain serial.  All tests use mock LLM and mock tool
+Verifies that same-turn tools registered ``concurrency="parallel"`` run
+concurrently and exclusive tools remain serial.  All tests use mock LLM and mock tool
 handlers; no real network or provider calls are made.
 """
 
@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from agentos.engine import Agent, AgentConfig, ToolResult
-from agentos.engine.runtime import _SAFE_TOOL_NAMES, _get_tool_concurrency_policy
+from agentos.engine.tool_batch import registry_spec_lookup, resolve_tool_concurrency
 from agentos.engine.types import ToolCall
 from agentos.provider import (
     ChatConfig,
@@ -27,6 +27,13 @@ from agentos.provider import DoneEvent as ProviderDone
 from agentos.provider import TextDeltaEvent as ProviderTextDelta
 from agentos.provider import ToolUseEndEvent as ProviderToolUseEnd
 from agentos.provider import ToolUseStartEvent as ProviderToolUseStart
+from agentos.tools.registry import get_default_registry
+
+# Builtins that declare ``concurrency="parallel"`` at registration (the former
+# runtime allowlist). Any other tool runs exclusive.
+_SAFE_TOOL_NAMES = frozenset(
+    rt.spec.name for rt in get_default_registry().all_tools() if rt.spec.concurrency == "parallel"
+)
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -129,7 +136,7 @@ async def _collect(agent: Agent, message: str = "go") -> list[Any]:
 
 
 # ---------------------------------------------------------------------------
-# Pick two safe tool names that are guaranteed to be in _SAFE_TOOL_NAMES
+# Pick safe tool names that are registered parallel
 # ---------------------------------------------------------------------------
 
 _SAFE_SAMPLE = sorted(_SAFE_TOOL_NAMES)[:6]  # pick 6 safe names for the concurrent test
@@ -142,10 +149,10 @@ def test_web_search_is_safe_for_same_turn_concurrency() -> None:
 
 def test_sessions_spawn_policy_keys_by_parent_session() -> None:
     """Spawn policy is scoped to the parent session rather than global state."""
-    policy = _get_tool_concurrency_policy(
-        "sessions_spawn",
+    policy = resolve_tool_concurrency(
+        registry_spec_lookup(None)("sessions_spawn"),
         {},
-        parent_session_key="agent:main:parent-a",
+        session_key="agent:main:parent-a",
     )
 
     assert policy.mode == "keyed"

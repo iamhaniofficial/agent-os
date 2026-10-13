@@ -33,6 +33,8 @@ def create_session_search_tool(
 
     @tool(
         name="session_search",
+        concurrency="parallel",
+        read_only=True,
         description=(
             "Full-text search across persisted session transcripts. Returns matching "
             "excerpts with session context. Use when exact prior chat wording, "

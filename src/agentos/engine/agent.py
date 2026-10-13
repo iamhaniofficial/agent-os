@@ -42,6 +42,7 @@ from agentos.engine.session_sanitize import (
 )
 from agentos.engine.thinking import drop_reasoning
 from agentos.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
+from agentos.engine.tool_batch import ToolBatchExecutor, registry_spec_lookup
 from agentos.engine.tool_result_store import (
     ToolResultRecord,
     ToolResultStore,
@@ -98,7 +99,6 @@ from agentos.result_budget import (
     compact_tool_result_content,
     resolve_budget_class,
 )
-from agentos.router_control import router_control_replay_event_from_payload
 from agentos.session.compaction import (
     CompactionConfig,
     CompactionRequest,
@@ -137,7 +137,6 @@ from .types import (
     ThinkingLevel,
     ToolCall,
     ToolResult,
-    ToolResultEvent,
     ToolUseStartEvent,
     WarningEvent,
 )
@@ -3564,324 +3563,39 @@ class Agent:
                 # ------ STREAMING → TOOL_CALLING ------
                 yield self._transition(AgentState.TOOL_CALLING)
 
-                # Execute tools and collect results. Concurrent/keyed tools run
-                # in bounded batches; mutex tools run serially. Results are
-                # emitted in the original tool_calls arrival order regardless
-                # of completion order.
-                from agentos.engine.runtime import (  # noqa: PLC0415
-                    _get_tool_concurrency_policy,
+                # Execute tools under each tool's declared concurrency and
+                # deliver every result as soon as it finishes; approvals are
+                # awaited concurrently. ``outcomes`` keeps the original
+                # tool_calls order, one result per tool_use.
+                tool_batch = ToolBatchExecutor(
+                    execute=self._execute_tool,
+                    project=self._project_tool_result_for_delivery,
+                    timeout_for=self._tool_execution_timeout,
+                    spec_for=registry_spec_lookup(self._tool_registry),
+                    deadline=tool_deadline,
+                    total_deadline=_total_deadline,
+                    iteration_timeout=self.config.iteration_timeout,
+                    session_key=self._session_key,
+                    max_concurrency=self._max_safe_tool_concurrency(),
+                    heartbeat_interval=self._tool_activity_heartbeat_interval(),
+                    approval_wait_timeout=self._approval_wait_timeout(),
+                    pending_approval=_pending_approval_payload,
+                    wait_for_approval=_wait_for_pending_approval_resolution,
+                    artifact_event=lambda a: ArtifactEvent(**_artifact_event_kwargs(a)),
+                    pending_warnings=self._pending_warnings,
+                    preflight_results=preflight_tool_results,
+                    call_log=self._write_turn_call_log,
+                    iteration=iterations,
+                    clock=_loop.time,
                 )
-
-                tool_result_blocks: list[ContentBlockToolResult] = []
-                executed_results: list[ToolResult] = []
-                turn_yielded = False
-
-                # Map tool_use_id -> ToolResult built up below.
-                results_by_id: dict[str, ToolResult] = {}
-
-                def _cap_timeout_by_deadlines(timeout: float) -> float:
-                    remaining = min(timeout, max(0.0, tool_deadline - _loop.time()))
-                    if _total_deadline is not None:
-                        remaining = min(remaining, max(0.0, _total_deadline - _loop.time()))
-                    return max(0.001, remaining)
-
-                async def _run_one(tc: ToolCall) -> ToolResult:
-                    started = time.monotonic()
-                    self._write_turn_call_log(
-                        "tool_request",
-                        iteration=iterations,
-                        tool_use_id=tc.tool_use_id,
-                        name=tc.tool_name,
-                        arguments=tc.arguments,
-                    )
-                    tool_timeout = _cap_timeout_by_deadlines(self._tool_execution_timeout(tc))
-                    preflight_result = preflight_tool_results.get(tc.tool_use_id)
-                    if preflight_result is not None:
-                        res = preflight_result
-                    else:
-                        try:
-                            res = await asyncio.wait_for(
-                                self._execute_tool(tc), timeout=tool_timeout
-                            )
-                        except TimeoutError:
-                            res = ToolResult(
-                                tool_use_id=tc.tool_use_id,
-                                tool_name=tc.tool_name,
-                                content=(f"Tool '{tc.tool_name}' timed out after {tool_timeout}s"),
-                                is_error=True,
-                                execution_status=runtime_execution_status(
-                                    "timeout",
-                                    reason="runtime_timeout",
-                                    timed_out=True,
-                                ),
-                            )
-                    self._write_turn_call_log(
-                        "tool_response",
-                        iteration=iterations,
-                        tool_use_id=res.tool_use_id,
-                        name=res.tool_name,
-                        result=res.content,
-                        result_chars=len(res.content),
-                        is_error=res.is_error,
-                        duration_ms=int((time.monotonic() - started) * 1000),
-                    )
-                    return res
-
-                async def _collect_tool_tasks(
-                    task_to_tool_call: dict[asyncio.Task[ToolResult], ToolCall],
-                ) -> AsyncIterator[RunHeartbeatEvent]:
-                    pending = set(task_to_tool_call)
-                    if not pending:
-                        return
-
-                    interval = self._tool_activity_heartbeat_interval()
-                    started = time.monotonic()
-                    last_event_at = started
-                    try:
-                        while pending:
-                            remaining = max(0.0, tool_deadline - _loop.time())
-                            if _total_deadline is not None:
-                                remaining = min(
-                                    remaining,
-                                    max(0.0, _total_deadline - _loop.time()),
-                                )
-                            if remaining <= 0:
-                                for task, tc in list(task_to_tool_call.items()):
-                                    if task in pending:
-                                        task.cancel()
-                                        results_by_id[tc.tool_use_id] = ToolResult(
-                                            tool_use_id=tc.tool_use_id,
-                                            tool_name=tc.tool_name,
-                                            content=(
-                                                f"Tool '{tc.tool_name}' timed out after "
-                                                f"{self.config.iteration_timeout}s"
-                                            ),
-                                            is_error=True,
-                                            execution_status=runtime_execution_status(
-                                                "timeout",
-                                                reason="runtime_timeout",
-                                                timed_out=True,
-                                            ),
-                                        )
-                                return
-                            wait_timeout = remaining if interval <= 0 else min(interval, remaining)
-                            done, pending = await asyncio.wait(
-                                pending,
-                                timeout=max(0.001, wait_timeout),
-                                return_when=asyncio.FIRST_COMPLETED,
-                            )
-                            if not done:
-                                if _loop.time() >= tool_deadline or (
-                                    _total_deadline is not None and _loop.time() >= _total_deadline
-                                ):
-                                    for task, tc in list(task_to_tool_call.items()):
-                                        if task in pending:
-                                            task.cancel()
-                                            results_by_id[tc.tool_use_id] = ToolResult(
-                                                tool_use_id=tc.tool_use_id,
-                                                tool_name=tc.tool_name,
-                                                content=(
-                                                    f"Tool '{tc.tool_name}' timed out after "
-                                                    f"{self.config.iteration_timeout}s"
-                                                ),
-                                                is_error=True,
-                                                execution_status=runtime_execution_status(
-                                                    "timeout",
-                                                    reason="runtime_timeout",
-                                                    timed_out=True,
-                                                ),
-                                            )
-                                    return
-                                now = time.monotonic()
-                                yield RunHeartbeatEvent(
-                                    phase="tool",
-                                    elapsed_ms=int((now - started) * 1000),
-                                    idle_ms=int((now - last_event_at) * 1000),
-                                    message="Tool still running",
-                                )
-                                continue
-
-                            last_event_at = time.monotonic()
-                            for task in done:
-                                tc = task_to_tool_call[task]
-                                try:
-                                    outcome = task.result()
-                                except asyncio.CancelledError:
-                                    outcome = ToolResult(
-                                        tool_use_id=tc.tool_use_id,
-                                        tool_name=tc.tool_name,
-                                        content=f"Tool '{tc.tool_name}' was cancelled",
-                                        is_error=True,
-                                        execution_status=runtime_execution_status(
-                                            "cancelled",
-                                            reason="cancelled",
-                                        ),
-                                    )
-                                except Exception as exc:  # noqa: BLE001
-                                    outcome = ToolResult(
-                                        tool_use_id=tc.tool_use_id,
-                                        tool_name=tc.tool_name,
-                                        content=f"Tool '{tc.tool_name}' raised: {exc}",
-                                        is_error=True,
-                                        execution_status=runtime_execution_status(
-                                            "error",
-                                            reason="runtime_error",
-                                        ),
-                                    )
-                                results_by_id[tc.tool_use_id] = outcome
-                    finally:
-                        for task in pending:
-                            if not task.done():
-                                task.cancel()
-                        for task in pending:
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await task
-
-                # Dispatch preserving original order: accumulate consecutive
-                # concurrent/keyed tools into a batch and flush before each
-                # mutex tool, then run the mutex tool serially. This ensures
-                # that a parallel tool appearing after a mutex tool cannot start
-                # until that mutex tool has completed.
-                parallel_batch: list[ToolCall] = []
-
-                async def _flush_parallel_batch(
-                    batch: list[ToolCall],
-                ) -> AsyncIterator[RunHeartbeatEvent]:
-                    if not batch:
-                        return
-                    semaphore = asyncio.Semaphore(self._max_safe_tool_concurrency())
-                    keyed_locks: dict[Any, asyncio.Lock] = {}
-                    limiters: dict[Any, asyncio.Semaphore] = {}
-
-                    async def _run_limited(tc: ToolCall) -> ToolResult:
-                        policy = _get_tool_concurrency_policy(
-                            tc.tool_name,
-                            tc.arguments,
-                            parent_session_key=self._session_key,
-                        )
-                        key_lock = (
-                            keyed_locks.setdefault(policy.key, asyncio.Lock())
-                            if policy.key is not None
-                            else None
-                        )
-                        limiter = None
-                        if policy.max_inflight is not None:
-                            limit_key = policy.limit_key or tc.tool_name
-                            limiter = limiters.setdefault(
-                                limit_key,
-                                asyncio.Semaphore(max(1, int(policy.max_inflight))),
-                            )
-
-                        async def _run_after_policy_locks() -> ToolResult:
-                            async with semaphore:
-                                return await _run_one(tc)
-
-                        async def _run_after_key_lock() -> ToolResult:
-                            if limiter is None:
-                                return await _run_after_policy_locks()
-                            async with limiter:
-                                return await _run_after_policy_locks()
-
-                        if key_lock is None:
-                            return await _run_after_key_lock()
-                        async with key_lock:
-                            return await _run_after_key_lock()
-
-                    task_to_tool_call = {asyncio.create_task(_run_limited(tc)): tc for tc in batch}
-                    async for event in _collect_tool_tasks(task_to_tool_call):
-                        yield event
-
-                for tc in tool_calls:
-                    policy = _get_tool_concurrency_policy(
-                        tc.tool_name,
-                        tc.arguments,
-                        parent_session_key=self._session_key,
-                    )
-                    if policy.mode != "mutex":
-                        parallel_batch.append(tc)
-                    else:
-                        async for event in _flush_parallel_batch(parallel_batch):
-                            yield event
-                        parallel_batch = []
-                        async for event in _collect_tool_tasks(
-                            {asyncio.create_task(_run_one(tc)): tc}
-                        ):
-                            yield event
-
-                async for event in _flush_parallel_batch(parallel_batch):
+                async for event in tool_batch.run(tool_calls):
                     yield event
-
-                # Emit results in original tool_calls order.
-                for tc in tool_calls:
-                    result = results_by_id[tc.tool_use_id]
-                    result_tool_call = tc
-                    for artifact in result.artifacts:
-                        yield ArtifactEvent(**_artifact_event_kwargs(artifact))
-                    projected_result = await self._project_tool_result_for_delivery(
-                        result,
-                        tool_call=result_tool_call,
-                    )
-                    yield ToolResultEvent(
-                        tool_use_id=projected_result.tool_use_id,
-                        tool_name=projected_result.tool_name,
-                        result=projected_result.content,
-                        is_error=projected_result.is_error,
-                        arguments=tc.arguments,
-                        execution_status=projected_result.execution_status,
-                        thought_signature=tc.thought_signature,
-                    )
-                    replay_event = router_control_replay_event_from_payload(result.content)
-                    if replay_event is not None:
-                        yield replay_event
-                    pending_approval = _pending_approval_payload(result.content)
-                    if pending_approval is not None and not tc.arguments.get("approval_id"):
-                        await _wait_for_pending_approval_resolution(
-                            pending_approval,
-                            timeout=_cap_timeout_by_deadlines(self._approval_wait_timeout()),
-                        )
-                        retry_arguments = dict(tc.arguments)
-                        retry_arguments["approval_id"] = pending_approval["approval_id"]
-                        retry_call = ToolCall(
-                            tool_use_id=tc.tool_use_id,
-                            tool_name=tc.tool_name,
-                            arguments=retry_arguments,
-                            synthetic_from_text=tc.synthetic_from_text,
-                            origin_trace=tc.origin_trace,
-                            thought_signature=tc.thought_signature,
-                        )
-                        result = await _run_one(retry_call)
-                        result_tool_call = retry_call
-                        for artifact in result.artifacts:
-                            yield ArtifactEvent(**_artifact_event_kwargs(artifact))
-                        projected_result = await self._project_tool_result_for_delivery(
-                            result,
-                            tool_call=result_tool_call,
-                        )
-                        yield ToolResultEvent(
-                            tool_use_id=projected_result.tool_use_id,
-                            tool_name=projected_result.tool_name,
-                            result=projected_result.content,
-                            is_error=projected_result.is_error,
-                            arguments=retry_arguments,
-                            execution_status=projected_result.execution_status,
-                            thought_signature=retry_call.thought_signature,
-                        )
-                        replay_event = router_control_replay_event_from_payload(result.content)
-                        if replay_event is not None:
-                            yield replay_event
-                    executed_results.append(result)
-                    while self._pending_warnings:
-                        yield self._pending_warnings.pop(0)
-                    if self._is_turn_yield_result(result) or result.terminates_turn:
-                        turn_yielded = True
-                    tool_result_blocks.append(
-                        ContentBlockToolResult(
-                            tool_use_id=projected_result.tool_use_id,
-                            content=projected_result.content,
-                            is_error=projected_result.is_error,
-                            execution_status=projected_result.execution_status,
-                        )
-                    )
+                tool_result_blocks = tool_batch.result_blocks()
+                executed_results = tool_batch.executed_results
+                turn_yielded = any(
+                    self._is_turn_yield_result(result) or result.terminates_turn
+                    for result in executed_results
+                )
 
                 terminal_artifacts = self._terminal_artifact_delivery_artifacts(executed_results)
                 if terminal_artifacts:

@@ -343,6 +343,8 @@ def _active_run_budget_policy() -> ToolRunBudgetPolicy:
 
 @tool(
     name="web_fetch",
+    concurrency="parallel",
+    read_only=True,
     description=(
         "Fetch a URL and extract readable content as markdown or plain text. "
         "Uses a multi-extractor pipeline (readability → Firecrawl escalation → "

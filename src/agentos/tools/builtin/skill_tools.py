@@ -449,6 +449,8 @@ def create_skill_tools(loader: SkillLoader) -> None:
 
     @tool(
         name="skill_list",
+        concurrency="parallel",
+        read_only=True,
         description="List all available skills with name, description, and eligibility.",
     )
     async def skill_list() -> str:
@@ -799,6 +801,8 @@ def create_skill_tools(loader: SkillLoader) -> None:
 
     @tool(
         name="skill_view",
+        concurrency="parallel",
+        read_only=True,
         description=(
             "Read a skill's SKILL.md content by name. A large skill comes back as its "
             "opening sections plus an index of the rest — pass section to read one of "
@@ -893,6 +897,8 @@ def create_skill_tools(loader: SkillLoader) -> None:
 
     @tool(
         name="skill_search_community",
+        concurrency="parallel",
+        read_only=True,
         description=(
             "Search Community skill sources such as ClawHub. Use this when the user asks to "
             "find, search, browse, or locate installable skills from the community marketplace. "
