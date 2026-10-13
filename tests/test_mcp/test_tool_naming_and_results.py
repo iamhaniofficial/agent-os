@@ -223,8 +223,11 @@ async def test_is_error_text_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
 
     payload = json.loads(result.content)
     assert result.is_error is True
-    assert len(payload["user_message"]) <= 500
-    assert payload["user_message"].endswith("[truncated]")
+    # The server text is cut by the MCP wrapper (400 chars) before the
+    # envelope's own 2000-char cap applies, so the message stays short.
+    assert len(payload["user_message"]) <= 600
+    assert "...[truncated]</untrusted>" in payload["user_message"]
+    assert "E" * 401 not in payload["user_message"]
 
 
 @pytest.mark.asyncio
