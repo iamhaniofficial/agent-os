@@ -1547,7 +1547,11 @@ Tool schemas dominate it — around 7,300 tokens on a stock install, charged on
 every call in every turn — and the command prices each `[tools] profile` against
 the current one so the trade is visible before you make it. A profile is fixed
 for the session, so narrowing it does not disturb the prompt cache. `--top <n>`
-(default 10) sets how many of the largest tools it lists.
+(default 10) sets how many of the largest tools it lists. The figure already
+leaves out deferred tools (`tools.defer_loading`, on by default): the long tail
+the model loads on demand through `tool_search`, which the command counts on
+its own line. `agentos config set tools.defer_loading false` sends every tool
+on every request again.
 
 Every CLI command logs to stderr at `INFO` and above, so its output is only
 the command's own. Set `AGENTOS_LOG_LEVEL=debug` to see the debug-level events

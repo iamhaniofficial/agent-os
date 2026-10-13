@@ -30,6 +30,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `ChatConfig.parallel_tool_calls = False` maps to OpenAI
   `parallel_tool_calls` / Anthropic `disable_parallel_tool_use`. Existing tool
   payloads are unchanged. (#3648)
+- Deferred tool loading. A request no longer carries every tool schema: 30
+  rarely used builtins (audio generation, git helpers, project and skill
+  administration, `browser`, `x_search`, `http_request`, ...) are listed by
+  name in a new `tool_search` tool instead, and the model loads the ones a task
+  needs; they stay loaded for the rest of the session, including after a
+  restart, and a reset starts lean again. `skill_view` loads the tools a skill
+  lists in `requires_tools`, and calling a deferred tool before loading it
+  returns an error that says how to load it. A stock request drops from 63 to
+  34 tool schemas (about 16k characters, ~4k tokens, less per call). Policy
+  still applies, and a surface narrowed by an allowlist defers nothing.
+  `[tools] defer_loading = false` sends every tool again; `agentos context`
+  reports the deferred count.
 
 ### Changed
 - Anthropic prompt cache now covers the whole conversation, not only the
@@ -46,8 +58,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - OpenAI (api.openai.com): requests carry a `prompt_cache_key` derived from
   the model, system prompt and tools, so turns sharing a prefix are routed to
   the same cache. Not sent to other OpenAI-compatible upstreams. (#3648)
-
-### Changed
 - Tool calls: each result now reaches the chat as soon as its tool finishes
   instead of after the whole batch, so a fast `read_file` is shown while a slow
   `web_fetch` beside it is still running. When several calls in one turn stop
@@ -60,6 +70,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `requires_approval`) instead of a hard-coded list of names in the engine; a
   tool that declares nothing, MCP tools included, still runs alone. Up to 8
   parallel calls run at once (was 6).
+
 
 ### Fixed
 - Anthropic extended thinking: every thinking delta of a response was joined

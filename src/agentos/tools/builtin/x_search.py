@@ -529,6 +529,7 @@ def _degraded_state(
     required=["query"],
     execution_timeout_seconds=_ENGINE_TIMEOUT_CEILING_SECONDS,
     result_budget_class="external",
+    defer_loading=True,
 )
 @sandboxed(
     kind="web.fetch",

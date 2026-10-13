@@ -134,6 +134,7 @@ def build_request_for_git(args: tuple[str, ...], cwd: Path, action_kind: str, po
         "workdir": {"type": "string", "description": "Git repository directory (default: cwd)."},
     },
     required=[],
+    defer_loading=True,
 )
 @sandboxed(
     kind="git.read",
@@ -213,6 +214,7 @@ def _git_diff_argv(a: dict[str, Any]) -> tuple[str, ...]:
         "workdir": {"type": "string", "description": "Git repository directory (default: cwd)."},
     },
     required=[],
+    defer_loading=True,
 )
 @sandboxed(
     kind="git.read",
@@ -307,6 +309,7 @@ async def git_commit(
         "workdir": {"type": "string", "description": "Git repository directory (default: cwd)."},
     },
     required=[],
+    defer_loading=True,
 )
 @sandboxed(
     kind="git.read",

@@ -128,6 +128,7 @@ def _gate_env_set(name: str, approval_id: str | None) -> str | None:
             "description": "Only return variables that are not set",
         },
     },
+    defer_loading=True,
 )
 async def env_list(missing_only: bool = False) -> str:
     catalog = env_catalog.build_catalog(present_names=set(env_store.read_env_file()))

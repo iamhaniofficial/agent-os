@@ -1270,6 +1270,7 @@ def _short_song_preview_lyrics(lyrics: str) -> str:
         },
     },
     required=["sample_audio", "name"],
+    defer_loading=True,
 )
 async def voice_clone(
     sample_audio: str,
@@ -1340,6 +1341,7 @@ async def voice_clone(
         },
     },
     required=["source_audio", "target_voice"],
+    defer_loading=True,
 )
 async def voice_convert(
     source_audio: str,
@@ -1410,6 +1412,7 @@ async def voice_convert(
         "num_speakers": {"type": "integer", "description": "Optional speaker count."},
     },
     required=["source_media", "target_language"],
+    defer_loading=True,
 )
 async def dubbing_generate(
     source_media: str,
@@ -1474,6 +1477,7 @@ async def dubbing_generate(
     description="Check the status of an ElevenLabs dubbing job.",
     params={"dubbing_id": {"type": "string", "description": "ElevenLabs dubbing job id."}},
     required=["dubbing_id"],
+    defer_loading=True,
 )
 async def dubbing_status(dubbing_id: str) -> str:
     if not dubbing_id or not dubbing_id.strip():
@@ -1522,6 +1526,7 @@ _DUBBING_FAILED_STATUSES = {"failed", "error", "cancelled", "canceled"}
         "timeout_seconds": {"type": "number", "description": "Max wait time."},
     },
     required=["dubbing_id", "language_code"],
+    defer_loading=True,
 )
 async def dubbing_download(
     dubbing_id: str,
@@ -1607,6 +1612,7 @@ async def dubbing_download(
         "output_path": {"type": "string", "description": "Optional output audio path."},
     },
     required=["prompt"],
+    defer_loading=True,
 )
 async def music_generate(
     prompt: str,
@@ -1665,6 +1671,7 @@ async def music_generate(
         "output_path": {"type": "string", "description": "Optional output audio path."},
     },
     required=["lyrics"],
+    defer_loading=True,
 )
 async def song_generate(
     lyrics: str,
@@ -1763,6 +1770,7 @@ async def song_generate(
         }
     },
     required=[],
+    defer_loading=True,
 )
 async def audio_provider_capabilities(probe_live: bool = False) -> str:
     config = _resolve_audio_config()
@@ -1841,6 +1849,7 @@ async def audio_provider_capabilities(probe_live: bool = False) -> str:
         },
     },
     required=[],
+    defer_loading=True,
 )
 async def voice_search(
     language: str = "",
@@ -1950,6 +1959,7 @@ async def voice_search(
         },
     },
     required=["text"],
+    defer_loading=True,
 )
 async def tts(
     text: str,

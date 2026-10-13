@@ -845,6 +845,7 @@ async def session_status() -> str:
         },
     },
     required=["name"],
+    defer_loading=True,
 )
 async def session_rename(name: str) -> str:
     """Set (or clear) the calling session's ``display_name``.

@@ -25,9 +25,12 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 {% if tools -%}
 ## Available Tools
 
-{% for tool in tools -%}
+{% for tool in tools if tool not in deferred_tools -%}
 - {{ tool }}
 {% endfor %}
+{% if deferred_tools %}
+More tools are installed but not loaded, to keep each request small; `tool_search` lists them. Call `tool_search` to load the ones a task needs before calling them; a loaded tool stays available for the rest of the session. A tool named elsewhere in this prompt may be one of them.
+{% endif %}
 
 {% endif -%}
 

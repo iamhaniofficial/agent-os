@@ -215,6 +215,7 @@ class ToolSpec:
     # ``approval_required`` envelope). Descriptive only: whether a given call
     # needs approval is still decided inside the tool.
     requires_approval: bool = False
+    defer_loading: bool = False  # left out of requests until tool_search loads it
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

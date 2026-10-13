@@ -466,6 +466,27 @@ to the provider and no tool handler is exposed for the turn. When you do enable
 tools on smaller local models, keep a positive `agent_max_iterations` so
 malformed or repetitive tool calls terminate predictably.
 
+### Deferred tools
+
+By default a request carries only the tools a typical turn needs. The long tail
+(audio generation, git helpers, project and skill administration, `browser`,
+`x_search`, `http_request`, and a few more) is listed by name in the
+`tool_search` tool instead; the model calls `tool_search` to load the ones a
+task needs, and they stay loaded for the rest of the session (a reset starts
+lean again). Reading a skill with `skill_view` also loads the tools that skill
+lists in `requires_tools`. Policy still applies: a tool the session may not use
+is neither listed nor loadable. A surface narrowed by an allowlist (an agent's
+`tools.allow` or `profile`, a cron job's tools) defers nothing.
+
+To send every tool on every request, as before:
+
+```toml
+[tools]
+defer_loading = false
+```
+
+`agentos context` shows what a request carries with the current setting.
+
 ## Prompt Cache Configuration
 
 Controls prompt prefix caching for LLM providers that support it (Anthropic, OpenAI, DeepSeek, OpenRouter, etc.):

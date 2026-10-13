@@ -441,6 +441,11 @@ class AgentBootstrapStage:
             memory_sync_manager=memory.sync_manager,
             tool_context=inp.tool_context,
         )
+        # A deferred tool loaded mid-turn goes on this agent's tool list, so
+        # its next provider request already carries it.
+        from agentos.tools.deferred import bind_agent_tools
+
+        bind_agent_tools(inp.tool_handler, agent)
 
         return StageOutcome.success(
             AgentBootstrapStageOutput(

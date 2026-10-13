@@ -207,6 +207,7 @@ def _save_http_response_body(raw_body: bytes, output_path: str | None) -> tuple[
     },
     required=["url"],
     result_budget_class="external",
+    defer_loading=True,
 )
 @sandboxed(
     kind="network.http",

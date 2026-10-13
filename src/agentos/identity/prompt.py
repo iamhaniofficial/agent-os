@@ -23,6 +23,7 @@ def assemble_system_prompt(
     profile: AgentProfile,
     *,
     tools: list[str] | None = None,
+    deferred_tools: list[str] | None = None,
     skills: list[str] | None = None,
     memory: str | None = None,
     runtime_info: dict[str, str] | None = None,
@@ -44,7 +45,10 @@ def assemble_system_prompt(
 
     Args:
         profile: The agent profile containing identity and workspace context.
-        tools: List of available tool names.
+        tools: List of available tool names, deferred ones included, so the
+            sections that depend on a tool stay on when it is one load away.
+        deferred_tools: The subset of ``tools`` the request leaves out until
+            ``tool_search`` loads them. Not listed under Available Tools.
         skills: List of available skill names.
         memory: Memory section content (omitted in minimal mode).
         runtime_info: OS/shell/workspace metadata for Runtime section.
@@ -76,6 +80,7 @@ def assemble_system_prompt(
         "soul_body": soul_body,
         "agents_doc": profile.agents_doc,
         "tools": tools or [],
+        "deferred_tools": set(deferred_tools or ()),
         "skills": skills or [],
         "memory": memory,
         "prompt_mode": profile.prompt_mode,

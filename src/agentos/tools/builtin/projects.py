@@ -107,6 +107,7 @@ async def _calling_session_project_id(mgr: object) -> str | None:
         },
     },
     required=["name"],
+    defer_loading=True,
 )
 async def projects_create(
     name: str = "",
@@ -149,6 +150,7 @@ async def projects_create(
         },
     },
     required=[],
+    defer_loading=True,
 )
 async def projects_list(agent_id: str | None = None) -> str:
     try:
@@ -196,6 +198,7 @@ async def projects_list(agent_id: str | None = None) -> str:
         },
     },
     required=["project_id"],
+    defer_loading=True,
 )
 async def projects_update(
     project_id: str = "",
@@ -252,6 +255,7 @@ async def projects_update(
         },
     },
     required=[],
+    defer_loading=True,
 )
 async def projects_move_session(
     project_id: str | None = None,
