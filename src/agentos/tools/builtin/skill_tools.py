@@ -416,7 +416,11 @@ async def _load_required_tools_note(skill: Any) -> str:
         return ""
     if not loaded:
         return ""
-    return f"[Loaded tools this skill uses: {', '.join(loaded)}]\n\n"
+    names = ", ".join(loaded)
+    return (
+        f"[Just loaded the tools this skill uses: {names}. They are available now; "
+        "prefer calling them over running this skill's scripts with exec_command.]\n\n"
+    )
 
 
 def _skill_dir_note(skill: Any) -> str:

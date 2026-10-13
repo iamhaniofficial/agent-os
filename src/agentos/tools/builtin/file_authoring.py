@@ -442,7 +442,6 @@ def _published_response(
         },
     },
     required=["rows"],
-    defer_loading=True,
 )
 async def create_csv(rows: list[list[Any]], name: str | None = None) -> str:
     output = io.StringIO(newline="")
@@ -471,7 +470,6 @@ async def create_csv(rows: list[list[Any]], name: str | None = None) -> str:
         },
     },
     required=["sheets"],
-    defer_loading=True,
 )
 async def create_xlsx(sheets: list[dict[str, Any]], name: str | None = None) -> str:
     if not isinstance(sheets, list) or not sheets:
@@ -521,7 +519,6 @@ async def create_xlsx(sheets: list[dict[str, Any]], name: str | None = None) -> 
     },
     required=["slides"],
     exposed_by_default=False,
-    defer_loading=True,
 )
 async def create_pptx(slides: list[dict[str, Any]], name: str | None = None) -> str:
     if not isinstance(slides, list) or not slides:
@@ -590,7 +587,6 @@ async def create_pptx(slides: list[dict[str, Any]], name: str | None = None) -> 
         "body": {"type": "string", "description": "Optional fallback body text."},
     },
     required=["title"],
-    defer_loading=True,
 )
 async def create_pdf_report(
     title: str,

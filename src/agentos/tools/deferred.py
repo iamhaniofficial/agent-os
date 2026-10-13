@@ -71,10 +71,17 @@ LOADED_STATE_PROVIDER = "portable"
 #: ``cron`` directly, and the trading agent drives everything through
 #: ``exec_command`` and skills — none of that may depend on a search first.
 #:
+#: The structured document builders (create_csv/xlsx/pdf_report/pptx) and the
+#: git helpers (git_status/diff/log) were deferred at first and moved back:
+#: replaying live QA turns ("make me an excel file", "what are the recent
+#: commits") showed the model taking the shell or a skill script whenever they
+#: were one load away, even with the "load first" list in the system prompt,
+#: and calling them directly once they were in the request.
+#:
 #: Deferred: tools a typical turn does not touch and whose absence the model
-#: can always repair with one ``tool_search`` call. 31 names; ``create_pptx`` is
-#: also hidden unless allowed, so a stock gateway defers 30 and its request
-#: drops from 63 to 34 schemas. ``test_deferred_tools`` pins these numbers.
+#: can always repair with one ``tool_search`` call. 24 names, all visible on a
+#: stock gateway, whose request drops from 63 to 40 schemas.
+#: ``test_deferred_tools`` pins these numbers.
 DEFERRED_BUILTIN_TOOLS: frozenset[str] = frozenset(
     {
         # Audio generation. Every one is reached through a bundled studio
@@ -89,16 +96,6 @@ DEFERRED_BUILTIN_TOOLS: frozenset[str] = frozenset(
         "voice_clone",
         "voice_convert",
         "voice_search",
-        # Structured document builders; write_file / execute_code cover the
-        # common case and these are an occasional convenience.
-        "create_csv",
-        "create_pdf_report",
-        "create_pptx",
-        "create_xlsx",
-        # Git helpers that exec_command already covers.
-        "git_diff",
-        "git_log",
-        "git_status",
         # Project (session group) administration.
         "projects_create",
         "projects_list",
@@ -215,19 +212,25 @@ def deferred_tool_names(session_key: str | None) -> list[str]:
 def prompt_tool_names(
     tool_defs: Iterable[Any] | None,
     session_key: str | None,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], dict[str, str]]:
     """Tool names for the system prompt: ``(available, deferred)``.
 
     ``available`` adds the deferred tools to the request's, so a prompt section
     that depends on a tool (artifact delivery, memory recall) does not vanish
-    because that tool is one load away. Neither list depends on what has been
-    loaded, so loading a tool never changes the system prompt.
+    because that tool is one load away. ``deferred`` maps each deferred tool to
+    its one-line summary, which the prompt lists under a "load first" heading:
+    a name hidden in the ``tool_search`` description alone was not enough for
+    the model to reach for it instead of the shell. Neither depends on what has
+    been loaded, so loading a tool never changes the system prompt.
     """
 
     active = [name for name in (getattr(td, "name", "") for td in tool_defs or ()) if name]
-    deferred = deferred_tool_names(session_key)
-    if not deferred:
-        return active, []
+    surface = surface_for(session_key)
+    if surface is None or not surface.deferred:
+        return active, {}
+    deferred = {
+        name: summarize_description(rt.spec.description) for name, rt in surface.deferred.items()
+    }
     return sorted(set(active) | set(deferred)), deferred
 
 

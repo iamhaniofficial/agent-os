@@ -43,17 +43,17 @@ SESSION = "agent:main:deferred-test"
 
 #: The default request must carry at least this many fewer tool schemas than
 #: the full surface. Without the per-agent memory and skill tools, the bare
-#: builtin registry defers 26 (tool_search adds one back).
-MIN_SCHEMAS_SAVED = 25
+#: builtin registry defers 20 (tool_search adds one back).
+MIN_SCHEMAS_SAVED = 19
 
 #: Pinned so the CHANGELOG, docs/configuration.md and the tool_search docstring
-#: cannot drift from the code: 31 builtins are marked deferred; on a stock
-#: gateway (builtins + skill + memory tools) 30 of them are deferred, because
-#: create_pptx is hidden unless allowed, and a request goes from 63 to 34.
-FLAGGED_BUILTINS = 31
-STOCK_DEFERRED = 30
+#: cannot drift from the code: 24 builtins are marked deferred, all of them
+#: visible on a stock gateway (builtins + skill + memory tools), whose request
+#: goes from 63 to 40 tool schemas.
+FLAGGED_BUILTINS = 24
+STOCK_DEFERRED = 24
 STOCK_FULL_SCHEMAS = 63
-STOCK_REQUEST_SCHEMAS = 34
+STOCK_REQUEST_SCHEMAS = 40
 
 
 async def _ok(**_kwargs: Any) -> str:
@@ -199,7 +199,7 @@ def test_default_request_is_much_smaller_than_the_full_surface() -> None:
 
     assert len(full) - len(request) >= MIN_SCHEMAS_SAVED
     # The tool_search catalog is far cheaper than the schemas it stands for.
-    assert full_chars - request_chars >= 10_000
+    assert full_chars - request_chars >= 8_000
 
 
 def test_builtin_registration_sites_match_the_documented_set() -> None:
@@ -223,6 +223,14 @@ def test_builtin_registration_sites_match_the_documented_set() -> None:
         "image_generate",
         "publish_artifact",
         "cron",
+        # Moved back after live QA: deferred, the model took the shell instead.
+        "create_csv",
+        "create_xlsx",
+        "create_pdf_report",
+        "create_pptx",
+        "git_status",
+        "git_diff",
+        "git_log",
         TOOL_SEARCH_NAME,
     ):
         rt = registry.get(name)
@@ -374,13 +382,18 @@ def test_prompt_lists_only_loaded_tools_but_keeps_tool_dependent_sections() -> N
     tools, deferred_names = prompt_tool_names(request, SESSION)
     profile = AgentProfile(agent_id="main", identity=AgentIdentity(name="Test"))
     prompt = assemble_system_prompt(profile, tools=tools, deferred_tools=deferred_names)
-    listing = prompt.split("## Available Tools", 1)[1].split("##", 1)[0]
+    listing, load_first = (
+        prompt.split("## Available Tools", 1)[1]
+        .split("\n## ", 1)[0]
+        .split("### Tools that must be loaded first", 1)
+    )
 
     assert "- read_file" in listing
     assert "- tts" not in listing
-    assert "`tool_search`" in listing
+    assert "- tts: " in load_first
+    assert "`tool_search(" in load_first
     assert set(deferred_names) <= set(tools)
-    assert deferred_tool_names(SESSION) == deferred_names
+    assert deferred_tool_names(SESSION) == list(deferred_names)
 
     # Without deferral the prompt is exactly what it was.
     plain = assemble_system_prompt(profile, tools=["read_file", "tts"])
@@ -404,7 +417,8 @@ async def test_skill_view_loads_the_deferred_tools_a_skill_requires() -> None:
     finally:
         current_tool_context.reset(token)
 
-    assert note == "[Loaded tools this skill uses: voice_maker]\n\n"
+    assert note.startswith("[Just loaded the tools this skill uses: voice_maker.")
+    assert "prefer calling them over running this skill's scripts with exec_command" in note
     assert again == ""
     assert surface.loaded == ["voice_maker"]
 
@@ -475,12 +489,12 @@ def test_the_documented_numbers_match_a_stock_gateway_surface() -> None:
     entry = changelog[changelog.index("- Deferred tool loading.") :].split("\n- ", 1)[0]
     flat = " ".join(entry.split())
     assert f"{FLAGGED_BUILTINS} rarely used builtins" in flat
-    assert f"stock gateway {STOCK_DEFERRED} of them" in flat
     assert f"from {STOCK_FULL_SCHEMAS} to {STOCK_REQUEST_SCHEMAS} tool schemas" in flat
     docs = " ".join((root / "docs" / "configuration.md").read_text(encoding="utf-8").split())
-    assert f"{FLAGGED_BUILTINS} builtins" in docs and f"{STOCK_DEFERRED} of them" in docs
+    assert f"{FLAGGED_BUILTINS} builtins" in docs
+    assert f"{STOCK_REQUEST_SCHEMAS} tool schemas instead of {STOCK_FULL_SCHEMAS}" in docs
     search_doc = " ".join((tool_search_module.__doc__ or "").split())
-    assert f"stands in for {STOCK_DEFERRED} tools ({FLAGGED_BUILTINS} are" in search_doc
+    assert f"stands in for {STOCK_DEFERRED} tools" in search_doc
     assert f"from {STOCK_FULL_SCHEMAS} to {STOCK_REQUEST_SCHEMAS} tool schemas" in search_doc
 
 
@@ -514,7 +528,7 @@ def test_disabled_tools_clear_a_stale_surface() -> None:
     assert defs == [] and handler is None
     assert deferred_tool_names(SESSION) == []
     tools, deferred_names = prompt_tool_names(defs, SESSION)
-    assert (tools, deferred_names) == ([], [])
+    assert (tools, deferred_names) == ([], {})
 
 
 def test_agentos_context_honours_defer_loading(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -529,10 +543,43 @@ def test_agentos_context_honours_defer_loading(monkeypatch: pytest.MonkeyPatch) 
         # Debug logs share stdout under the test runner; the JSON is the last line.
         json_line = [row for row in result.output.splitlines() if row.startswith("{")][-1]
         payload = json.loads(json_line)
+        counts[value] = (payload["defer_loading"], payload["deferred_tools"])
         return next(s["items"] for s in payload["sections"] if s["name"] == "tools")
 
+    counts: dict[str, tuple[bool, int]] = {}
     ctx = ToolContext()
     registry = get_default_registry()
     assert tool_count("false") == len(registry.request_tool_definitions(ctx, defer_loading=False))
     assert tool_count("true") == len(registry.request_tool_definitions(ctx))
     assert tool_count("false") > tool_count("true")
+    # --json carries the deferred count the text output prints.
+    assert counts["false"] == (False, 0)
+    assert counts["true"] == (True, len(registry.deferred_tools(ctx)))
+    assert counts["true"][1] > 0
+
+
+def test_rendered_prompt_lists_every_deferred_tool_with_the_load_instruction() -> None:
+    """Live QA: a name only inside tool_search's description was not enough."""
+
+    registry = get_default_registry()
+    surface = DeferredToolSurface.build(registry, _ctx())
+    assert surface is not None
+    tools, deferred_map = prompt_tool_names(surface.tool_definitions(), SESSION)
+    profile = AgentProfile(agent_id="main", identity=AgentIdentity(name="Test"))
+    prompt = assemble_system_prompt(profile, tools=tools, deferred_tools=deferred_map)
+
+    section = prompt.split("### Tools that must be loaded first", 1)[1].split("\n## ", 1)[0]
+    assert 'call `tool_search(names=["<name>"])` once, then call the tool' in section
+    assert "Prefer a matching tool here over the shell or a skill script." in section
+    assert set(deferred_map) == set(surface.deferred)
+    for name, rt in surface.deferred.items():
+        line = f"- {name}: {deferred.summarize_description(rt.spec.description)}"
+        assert line in section, name
+    # One line per tool, no schemas.
+    assert '"properties"' not in section
+    assert len(section) < 4_000
+
+    search = next(d for d in surface.tool_definitions() if d.name == TOOL_SEARCH_NAME)
+    assert search.description.startswith("Before using the shell or a skill script")
+    for name in surface.deferred:
+        assert f"- {name}" in search.description

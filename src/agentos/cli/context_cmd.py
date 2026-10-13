@@ -84,9 +84,14 @@ def context(
 
     defer_loading = _defer_loading_configured()
     breakdown = _measure(defer_loading)
+    deferred_count = _deferred_count(defer_loading)
 
     if json_output:
-        print_json(breakdown.to_dict())
+        payload = breakdown.to_dict()
+        # Same facts as the text output's deferred line.
+        payload["defer_loading"] = defer_loading
+        payload["deferred_tools"] = deferred_count
+        print_json(payload)
         return
 
     console.print()
@@ -104,7 +109,6 @@ def context(
             f"{section.tokens:,}",
         )
     console.print(section_table)
-    deferred_count = _deferred_count(defer_loading)
     if deferred_count:
         console.print(
             f"{deferred_count} more tools are deferred: left out of each request until "
