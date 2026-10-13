@@ -33,9 +33,7 @@ from agentos.engine.turn_runner.attachment_stage import (
 )
 from agentos.engine.turn_runner.compaction_and_history_stage import (
     HistoryLoaderPort,
-    PreflightCompactionPort,
     RequestContextPrependPort,
-    T3UpgradeCompactionPort,
 )
 from agentos.engine.turn_runner.input_stage import ExtraContextResolver
 from agentos.engine.turn_runner.prompt_assembler_stage import (
@@ -573,62 +571,6 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
 # ---------------------------------------------------------------------------
 
 
-class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
-    """Bind ``TurnRunner._maybe_compact_on_t3_upgrade`` as a Protocol port.
-
-    Forwards positional + keyword arguments verbatim. The helper
-    handles its own ``asyncio.CancelledError`` re-raise and the
-    log-and-record swallow for other exceptions; the adapter preserves
-    that contract by not adding any try/except.
-    """
-
-    def __init__(self, runner: TurnRunner) -> None:
-        self._runner = runner
-
-    async def maybe_compact(
-        self,
-        *,
-        session_key: str,
-        turn: Any,
-        context_window_tokens: int,
-        compaction_provider: Any | None,
-        compaction_model: str | None,
-    ) -> str:
-        return await self._runner._maybe_compact_on_t3_upgrade(
-            session_key,
-            turn,
-            context_window_tokens,
-            compaction_provider=compaction_provider,
-            compaction_model=compaction_model,
-        )
-
-
-class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
-    """Bind ``TurnRunner._maybe_preflight_compact`` as a Protocol port.
-
-    Forwards positional + keyword arguments verbatim. Same exception
-    contract as the T3 adapter.
-    """
-
-    def __init__(self, runner: TurnRunner) -> None:
-        self._runner = runner
-
-    async def maybe_compact(
-        self,
-        *,
-        session_key: str,
-        context_window_tokens: int,
-        compaction_provider: Any | None,
-        compaction_model: str | None,
-    ) -> None:
-        await self._runner._maybe_preflight_compact(
-            session_key,
-            context_window_tokens,
-            compaction_provider=compaction_provider,
-            compaction_model=compaction_model,
-        )
-
-
 class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
     """Bind ``TurnRunner._load_history`` as a Protocol port.
 
@@ -769,6 +711,11 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
         snapshot = snapshots.get(session_key) if snapshots is not None else None
         if snapshot is not None and "snapshot" in params:
             persist_kwargs["snapshot"] = snapshot
+        # Durable pre-image before the destructive rewrite (the guarantee the
+        # removed before-turn preflight/T3 paths gave). A failing checkpoint
+        # raises here, so nothing is archived without it. Ephemeral sessions
+        # (subagent, cron) are compacted without a checkpoint, as before.
+        await self._record_checkpoint(session_key, compaction_id)
         async with self._runner._session_write_context(session_key):
             persisted = await persist_method(
                 session_key,
@@ -801,6 +748,30 @@ class _TurnRunnerCompactionPersistAdapter(CompactionPersistPort):
                 compaction_id,
                 COMPACTION_PERSISTED_EVENT,
             ),
+        )
+
+    async def _record_checkpoint(self, session_key: str, compaction_id: str | None) -> None:
+        from agentos.engine.compaction_service import is_ephemeral_session
+        from agentos.session.compaction_lifecycle import new_compaction_id
+
+        if is_ephemeral_session(session_key):
+            return
+        session_manager = self._runner._session_manager
+        if not callable(getattr(type(session_manager), "record_memory_checkpoint", None)):
+            return
+        get_transcript = getattr(session_manager, "get_transcript", None)
+        if not callable(get_transcript):
+            return
+        transcript = get_transcript(session_key)
+        if inspect.isawaitable(transcript):
+            transcript = await transcript
+        if not isinstance(transcript, list) or not transcript:
+            return
+        await self._runner._record_checkpoint_before_compaction(
+            session_key,
+            transcript,
+            turn_id=compaction_id or new_compaction_id(),
+            source="agent_inline_compaction",
         )
 
 
@@ -954,6 +925,7 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
+        provider_messages: dict[str, Any] | None = None,
     ) -> bool:
         session_manager = self._runner._session_manager
         if session_manager is None:
@@ -971,6 +943,10 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
             append_kwargs["turn_usage"] = turn_usage
         if accepts_keyword_arg(session_manager.append_message, "token_count"):
             append_kwargs["token_count"] = token_count
+        if provider_messages is not None and accepts_keyword_arg(
+            session_manager.append_message, "provider_messages"
+        ):
+            append_kwargs["provider_messages"] = provider_messages
         await self._runner._append_session_message(session_key, **append_kwargs)
         return True
 

@@ -72,6 +72,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   parallel calls run at once (was 6).
 
 
+### Changed
+- Engine: the conversation is now an append-only transcript, so consecutive
+  provider requests share a byte-identical prefix and prompt caches keep
+  hitting. Every assistant row stores the exact provider-facing messages of
+  its turn (new `transcript_entries.provider_messages` column, kind
+  `agentos.provider_messages` v1): the input message, each assistant message
+  with per-block `thinking` / `redacted_thinking` signatures and OpenRouter
+  `reasoning_details`, and every tool call/result pair; the next turn replays
+  it verbatim. Rows written before keep loading through the old
+  reconstruction plus a one-time migration, and the flat display segments are
+  still written for the UI. Nothing rewrites a message after it was sent: an
+  oversized tool result is projected once, before its first request (the full
+  output stays in the tool-result store); the per-request aggregate
+  projection, historical re-projection, argument re-sanitizing and three
+  pairing-repair passes are gone (one pass at load, then only the new
+  messages); the timestamp, skills list and request context are trailing text
+  of the current user turn instead of being spliced in on every request, and
+  the skills list and request context are only repeated when they change.
+  Replayed reasoning is no longer stripped on load except for models whose
+  capabilities say they take none.
+- Engine: one `CompactionService` replaces the five compaction paths
+  (in-turn preflight, provider-overflow retry, T3-upgrade, before-turn DB
+  preflight, emergency request-scoped trim). It triggers on the live request
+  estimate against `context window x preflight_compact_ratio` (0.85) before
+  every provider call -- the first call of a turn included -- and never while
+  a tool round is open; a provider that still reports an overflow invokes the
+  same service. The result is always one summary exchange followed by the
+  current turn verbatim (images, per-block thinking and tool pairs kept);
+  only when the current turn alone does not fit are its oldest complete tool
+  rounds folded in. The summarizer goes through the session's `LLMProvider`
+  (manual `/compact` included) instead of raw HTTP to an OpenAI-shaped
+  endpoint, falling back to a deterministic digest. A durable checkpoint is
+  recorded before any compaction rewrites stored rows; subagent and cron
+  sessions (canonical `agent:<id>:subagent:<run>` keys included) skip it.
+
 ### Fixed
 - Anthropic extended thinking: every thinking delta of a response was joined
   into one block with only the last signature, and `redacted_thinking` blocks

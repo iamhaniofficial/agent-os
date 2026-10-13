@@ -1,31 +1,28 @@
 """Snapshot regression net for ``CompactionAndHistoryStage`` through ``TurnRunner._run_turn``.
 
 The corpus enumerates every input shape the stage has been observed to
-handle and pins the output snapshot. The harness patches the four
-BEFORE-turn helpers the slice owns (``_maybe_compact_on_t3_upgrade``,
-``_maybe_preflight_compact``, ``_load_history``,
-``_prepend_request_context_prompt``) plus reuses the upstream stage's
-patch helpers from the agent-bootstrap snapshot harness so the slice
-runs against deterministic stubs.
+handle and pins the output snapshot. The harness patches the BEFORE-turn
+helper the slice owns (``_load_history``; the T3-upgrade and DB-preflight
+compaction helpers are gone -- compaction runs in the agent's
+``CompactionService``) plus reuses the upstream stage's patch helpers from
+the agent-bootstrap snapshot harness so the slice runs against
+deterministic stubs.
 
 It then probes ``_build_attachment_messages`` (the line immediately
 after the slice in ``_run_turn``) to capture the post-slice locals and
 raise a sentinel ``BaseException`` that halts the generator without
-touching downstream stages. The raising-stub cases (#12 raising
-CompactionHook, #13 raising HistoryLoader) exercise the hook-isolation
-contract and the exception-propagation contract.
+touching downstream stages. The raising-loader case exercises the
+exception-propagation contract.
 """
 
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from agentos.engine.hooks.types import CompactionState
 from agentos.engine.runtime import TurnRunner
 from agentos.engine.types import ErrorEvent
 
@@ -82,6 +79,9 @@ def _capture_locals_at_post_slice() -> dict[str, Any]:
         "agent_request_context_prompt_after": getattr(
             getattr(agent, "config", None), "request_context_prompt", None
         ),
+        "agent_context_overflow_threshold": getattr(
+            getattr(agent, "config", None), "context_overflow_threshold", None
+        ),
     }
 
 
@@ -130,34 +130,6 @@ def _patch_thinking(runner: TurnRunner) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _patch_t3(runner, *, return_value="not_applicable", raises=None, calls=None):
-    async def _t3(
-        self, session_key, turn, context_window_tokens,  # noqa: ARG001, ARG002
-        *, compaction_provider=None, compaction_model=None,
-    ):
-        if calls is not None:
-            calls.append({"session_key": session_key})
-        if raises is not None:
-            raise raises("t3 boom")
-        return return_value
-
-    runner._maybe_compact_on_t3_upgrade = _t3.__get__(runner, TurnRunner)
-
-
-def _patch_preflight(runner, *, raises=None, calls=None):
-    async def _preflight(
-        self, session_key, context_window_tokens,  # noqa: ARG001, ARG002
-        *, compaction_provider=None, compaction_model=None,
-    ):
-        if calls is not None:
-            calls.append({"session_key": session_key})
-        if raises is not None:
-            raise raises("preflight boom")
-        return None
-
-    runner._maybe_preflight_compact = _preflight.__get__(runner, TurnRunner)
-
-
 def _patch_load_history(runner, *, return_value=None, raises=None, calls=None):
     async def _load(self, agent, session_key, *, trim_last_user=True):  # noqa: ARG001, ARG002
         if calls is not None:
@@ -180,41 +152,19 @@ def _patch_post_slice_probe(runner):
 
 
 # ---------------------------------------------------------------------------
-# Recording compaction hook for hook-aware cases
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _RecordingCompactionHook:
-    name: str = "rec"
-    before_raises: type[BaseException] | None = None
-    events: list[tuple[str, str]] = field(default_factory=list)
-
-    async def before_compact(self, state: CompactionState) -> None:
-        self.events.append(("before", state.extra.get("phase", "")))
-        if self.before_raises is not None:
-            raise self.before_raises("hook before boom")
-
-    async def after_compact(self, state: CompactionState, outcome: Any) -> None:  # noqa: ARG002
-        self.events.append(("after", state.extra.get("phase", "")))
-
-
-# ---------------------------------------------------------------------------
 # Corpus — 13 cases per the design.
 # ---------------------------------------------------------------------------
 
 
 _CASE_BASE: dict[str, Any] = dict(
     session_key="agent:main:s1",
-    t3_return="not_applicable",
-    t3_raises=None,
-    preflight_raises=None,
     history_return=None,
     history_raises=None,
     request_context_in=None,
     expected_final_request_context=None,
-    hook=None,
     history_has_persisted_user=True,
+    preflight_compact_ratio=None,
+    expected_threshold=0.85,
 )
 
 
@@ -225,16 +175,8 @@ def _case(case_id: str, **overrides: Any) -> tuple[str, dict[str, Any]]:
 
 
 _CORPUS: list[tuple[str, dict[str, Any]]] = [
-    _case("neither_compaction_fires"),
-    _case("t3_upgrade_fires", t3_return="handled"),
-    _case("t3_disabled_preflight_fires", t3_return="not_applicable"),
-    _case(
-        "cron_prefix_t3_not_applicable",
-        session_key="cron:tick:s1",
-        t3_return="not_applicable",
-    ),
-    _case("t3_flush_failed_preflight_fallthrough", t3_return="flush_failed"),
-    _case("compaction_circuit_open", t3_return="handled"),
+    _case("no_durable_context"),
+    _case("cron_session", session_key="cron:tick:s1"),
     _case(
         "durable_summaries_exist",
         history_return="SUMMARY-X",
@@ -245,12 +187,18 @@ _CORPUS: list[tuple[str, dict[str, Any]]] = [
         history_return="[Context Summary] body",
         expected_final_request_context="[Context Summary] body",
     ),
+    _case(
+        "summary_prepended_to_dynamic_context",
+        history_return="SUMMARY-Y",
+        request_context_in="DYNAMIC",
+        expected_final_request_context="SUMMARY-Y\n\nDYNAMIC",
+    ),
     _case("trim_last_user_true", history_has_persisted_user=True),
     _case("trim_last_user_false", history_has_persisted_user=False),
-    _case("compaction_hook_registered", hook=_RecordingCompactionHook()),
     _case(
-        "raising_compaction_hook_isolated",
-        hook=_RecordingCompactionHook(before_raises=RuntimeError),
+        "configured_compaction_ratio_reaches_agent",
+        preflight_compact_ratio=0.6,
+        expected_threshold=0.6,
     ),
     _case("history_loader_raises", history_raises=RuntimeError),
 ]
@@ -308,18 +256,7 @@ def _setup_runner(case: dict[str, Any]) -> tuple[TurnRunner, dict[str, list]]:
     _patch_memory_helpers(runner)
     _patch_observability(runner)
 
-    call_log: dict[str, list] = {"t3": [], "preflight": [], "history": []}
-    _patch_t3(
-        runner,
-        return_value=case["t3_return"],
-        raises=case["t3_raises"],
-        calls=call_log["t3"],
-    )
-    _patch_preflight(
-        runner,
-        raises=case["preflight_raises"],
-        calls=call_log["preflight"],
-    )
+    call_log: dict[str, list] = {"history": []}
     _patch_load_history(
         runner,
         return_value=case["history_return"],
@@ -327,28 +264,8 @@ def _setup_runner(case: dict[str, Any]) -> tuple[TurnRunner, dict[str, list]]:
         calls=call_log["history"],
     )
     _patch_post_slice_probe(runner)
-
-    hook = case["hook"]
-    if hook is not None:
-        # Re-instantiate the stage with hooks; the production stage
-        # exposes ``compaction_hooks`` via constructor only.
-        from agentos.engine.turn_runner.compaction_and_history_stage import (
-            CompactionAndHistoryStage,
-        )
-        from agentos.engine.turn_runner.harness import (
-            _RequestContextPrependAdapter,
-            _TurnRunnerHistoryLoaderAdapter,
-            _TurnRunnerPreflightCompactionAdapter,
-            _TurnRunnerT3UpgradeCompactionAdapter,
-        )
-
-        runner._compaction_and_history_stage = CompactionAndHistoryStage(
-            t3_upgrade=_TurnRunnerT3UpgradeCompactionAdapter(runner),
-            preflight=_TurnRunnerPreflightCompactionAdapter(runner),
-            history_loader=_TurnRunnerHistoryLoaderAdapter(runner),
-            request_context_prepender=_RequestContextPrependAdapter(),
-            compaction_hooks=(hook,),
-        )
+    if case["preflight_compact_ratio"] is not None:
+        runner._config = SimpleNamespace(preflight_compact_ratio=case["preflight_compact_ratio"])
 
     return runner, call_log
 
@@ -408,10 +325,7 @@ async def test_compaction_and_history_stage_snapshot(
         assert len(yielded) == 1
         assert isinstance(yielded[0], ErrorEvent)
         assert yielded[0].code == "agent_error"
-        assert len(call_log["t3"]) == 1
-        if case["t3_return"] in {"not_applicable", "flush_failed"}:
-            assert len(call_log["preflight"]) == 1
-        # And history must have been attempted once before raising.
+        # History must have been attempted once before raising.
         assert len(call_log["history"]) == 1
         return
 
@@ -423,21 +337,14 @@ async def test_compaction_and_history_stage_snapshot(
         "agent_request_context_prompt_after": case[
             "expected_final_request_context"
         ],
+        "agent_context_overflow_threshold": case["expected_threshold"],
     }
     assert captured == expected_snapshot, (
         f"case={case_id}: snapshot diverged.\n"
         f"  expected={expected_snapshot}\n  actual  ={captured}"
     )
 
-    # Routing assertions: t3 always invoked exactly once.
-    assert len(call_log["t3"]) == 1, f"{case_id}: t3 calls"
-    # Preflight invoked only on fall-through sentinels.
-    fall_through = case["t3_return"] in {"not_applicable", "flush_failed"}
-    expected_pre_calls = 1 if fall_through else 0
-    assert len(call_log["preflight"]) == expected_pre_calls, (
-        f"{case_id}: preflight calls"
-    )
-    # History always loaded once.
+    # History always loaded once, with the caller's trim flag.
     assert len(call_log["history"]) == 1
     assert (
         call_log["history"][0]["trim_last_user"]
@@ -445,39 +352,14 @@ async def test_compaction_and_history_stage_snapshot(
     )
 
 
-@pytest.mark.asyncio
-async def test_compaction_hook_fan_out(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When hooks are registered, the stage fires the 4-tuple sequence."""
-    case = dict(_CASE_BASE)
-    case["hook"] = _RecordingCompactionHook()
-    runner, _ = _setup_runner(case)
-    captured, _, raised = await _drive(runner, case)
-    assert raised is None
-    assert captured is not None
-
-    hook = case["hook"]
-    assert hook.events == [
-        ("before", "t3_upgrade"),
-        ("after", "t3_upgrade"),
-        ("before", "preflight"),
-        ("after", "preflight"),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_raising_hook_does_not_break_turn(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A hook that raises in before_compact MUST NOT break the turn."""
-    case = dict(_CASE_BASE)
-    case["hook"] = _RecordingCompactionHook(before_raises=RuntimeError)
-    runner, call_log = _setup_runner(case)
-    captured, _, raised = await _drive(runner, case)
-
-    # Turn still completes; t3 + preflight still fired.
-    assert raised is None
-    assert captured is not None
-    assert len(call_log["t3"]) == 1
-    assert len(call_log["preflight"]) == 1
+def test_runner_has_no_before_turn_compaction_paths() -> None:
+    """T3-upgrade, DB preflight and emergency trims were folded into the
+    agent's CompactionService; the runner keeps none of them."""
+    runner = _build_runner()
+    for name in (
+        "_maybe_compact_on_t3_upgrade",
+        "_maybe_preflight_compact",
+        "_record_emergency_ephemeral_compaction",
+        "_emergency_compaction_overrides",
+    ):
+        assert not hasattr(runner, name), name

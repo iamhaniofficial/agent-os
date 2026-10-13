@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -30,21 +31,38 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+_MESSAGE_HASH_MEMO_MAX = 4096
+# id(message) -> (message, hash). Sealed transcript messages are immutable and
+# repeat in every request of a session, so each is hashed once instead of once
+# per provider call (the full re-hash made a long tool loop quadratic). The
+# message is held so its id cannot be reused while the entry lives.
+_message_hash_memo: OrderedDict[int, tuple[Message, str]] = OrderedDict()
+
+
+def _message_hash(message: Message) -> str:
+    key = id(message)
+    cached = _message_hash_memo.get(key)
+    if cached is not None and cached[0] is message:
+        _message_hash_memo.move_to_end(key)
+        return cached[1]
+    digest = _stable_hash(message)
+    _message_hash_memo[key] = (message, digest)
+    if len(_message_hash_memo) > _MESSAGE_HASH_MEMO_MAX:
+        _message_hash_memo.popitem(last=False)
+    return digest
+
+
 def _message_prefix_messages(messages: list[Message], *, tail_count: int = 2) -> list[Message]:
     if tail_count <= 0:
         return list(messages)
     return list(messages[:-tail_count])
 
 
-def _message_prefix_payload(messages: list[Message], *, tail_count: int = 2) -> list[Any]:
-    return [
-        _jsonable(message) for message in _message_prefix_messages(messages, tail_count=tail_count)
-    ]
-
-
 def _message_prefix_item_kind(message: Message) -> str:
     content = message.content
     if isinstance(content, str):
+        # Legacy shapes: volatile context used to travel as its own message.
+        # It is now trailing text of the turn's input message (history).
         if content.startswith("[Request context for this turn]"):
             return "request_context"
         if content.startswith("[Runtime context for this turn]"):
@@ -170,19 +188,18 @@ class CacheBreakMonitor:
         model: str,
     ) -> PromptStateSnapshot:
         messages_prefix_messages = _message_prefix_messages(messages)
-        messages_prefix_payload = [_jsonable(message) for message in messages_prefix_messages]
+        item_hashes = tuple(_message_hash(message) for message in messages_prefix_messages)
         cache_control_payload = _cache_control_payload(config)
         return PromptStateSnapshot(
             system_hash=_stable_hash(config.system or ""),
             tools_hash=_stable_hash(tools or []),
-            messages_prefix_hash=_stable_hash(messages_prefix_payload),
+            # Hash of the per-message hashes: equal iff every prefix message is.
+            messages_prefix_hash=_stable_hash(list(item_hashes)),
             cache_control_hash=_stable_hash(cache_control_payload),
             model=model,
             message_count=len(messages),
             tool_count=len(tools or []),
-            messages_prefix_item_hashes=tuple(
-                _stable_hash(message) for message in messages_prefix_payload
-            ),
+            messages_prefix_item_hashes=item_hashes,
             messages_prefix_item_kinds=tuple(
                 _message_prefix_item_kind(message) for message in messages_prefix_messages
             ),

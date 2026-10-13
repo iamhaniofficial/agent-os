@@ -387,9 +387,17 @@ def _sanitize_content(content: Any) -> tuple[Any, int, bool]:
     return sanitized_blocks, removed_total, True
 
 
+_KNOWN_BLOCK_CLASSES = tuple(_BLOCK_MODELS.values())
+
+
 def _sanitize_block(block: Any) -> tuple[Any, int, bool]:
     if isinstance(block, dict):
         return _sanitize_block_dict(block)
+    if type(block) in _KNOWN_BLOCK_CLASSES:
+        # A validated block of a known type carries no extra keys (pydantic
+        # ignores extras), so dumping it to look for metadata is wasted work
+        # on every turn. Only dict blocks and unknown models are inspected.
+        return block, 0, False
 
     model_dump = getattr(block, "model_dump", None)
     if callable(model_dump):

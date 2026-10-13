@@ -31,9 +31,7 @@ from agentos.engine.turn_runner.compaction_and_history_stage import (
     CompactionAndHistoryStageInput,
     CompactionAndHistoryStageOutput,
     HistoryLoaderPort,
-    PreflightCompactionPort,
     RequestContextPrependPort,
-    T3UpgradeCompactionPort,
 )
 from agentos.engine.turn_runner.context import TurnContext
 from agentos.engine.turn_runner.input_stage import (
@@ -112,7 +110,6 @@ __all__ = [
     "MemorySyncNotifyPort",
     "ModelCatalogPort",
     "PipelineExecutionPort",
-    "PreflightCompactionPort",
     "PromptAssemblerPort",
     "PromptAssemblerStage",
     "PromptAssemblerStageInput",
@@ -133,7 +130,6 @@ __all__ = [
     "StreamConsumerStage",
     "StreamConsumerStageInput",
     "SystemPromptRefreshPort",
-    "T3UpgradeCompactionPort",
     "TimeoutBudgetPort",
     "ToolBuilderPort",
     "TranscriptAppendPort",
