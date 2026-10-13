@@ -495,6 +495,14 @@ clamped to 4,000-12,000 characters:
 agentos config set compaction.history_tool_result_max_chars 20000
 ```
 
+The in-turn compaction summary is an auxiliary side task (`compaction`, the
+router's cheapest text tier unless `[auxiliary.tasks.compaction]` names a
+model) bounded by `compaction.summary_timeout_seconds` (default 45):
+
+```sh
+agentos config set compaction.summary_timeout_seconds 30
+```
+
 Search:
 
 ```sh

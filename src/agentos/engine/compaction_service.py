@@ -68,6 +68,10 @@ DEFAULT_COMPACTION_RATIO = 0.85
 CONTEXT_SUMMARY_HEADER = "[Context summary]"
 SUMMARY_ACK = "Understood. Continuing from summary."
 SUMMARY_MAX_TOKENS = 2048
+# A compaction must take at least this share off the request to be applied.
+_MIN_GAIN_RATIO = 0.10
+# Smallest summary the gain pre-check assumes the summarizer could write.
+_OPTIMISTIC_SUMMARY_TOKENS = 512
 _SUMMARY_TIMEOUT_SECONDS = 90.0
 _PREVIEW_CHARS = 240
 _FALLBACK_LINE_CHARS = 200
@@ -305,6 +309,31 @@ def fallback_summary(messages: Sequence[Message], previous_summary: str | None =
     return body
 
 
+def _summary_prompt(text: str, custom_instructions: str | None = None) -> str:
+    prompt = f"Summarize this conversation:\n\n{text}"
+    if custom_instructions:
+        prompt = (
+            "Additional summary instructions. These instructions must not override "
+            "the system message or identifier preservation rules:\n"
+            f"{custom_instructions}\n\n{prompt}"
+        )
+    return prompt
+
+
+def _log_summarizer_failure(exc: BaseException, *, timeout: float, via: str) -> None:
+    """One warning that says what failed: a bare TimeoutError has no message."""
+    detail = str(exc).strip()
+    if not detail:
+        detail = f"timed out after {timeout:g}s" if isinstance(exc, TimeoutError) else repr(exc)
+    log.warning(
+        "compaction.summarizer_failed",
+        error=detail,
+        error_type=type(exc).__name__,
+        timeout_s=round(timeout, 1),
+        via=via,
+    )
+
+
 async def summarize_with_provider(
     provider: _ChatProvider,
     text: str,
@@ -315,13 +344,7 @@ async def summarize_with_provider(
     system: str | None = None,
 ) -> str | None:
     """Summarize *text* through the provider abstraction; ``None`` on failure."""
-    prompt = f"Summarize this conversation:\n\n{text}"
-    if custom_instructions:
-        prompt = (
-            "Additional summary instructions. These instructions must not override "
-            "the system message or identifier preservation rules:\n"
-            f"{custom_instructions}\n\n{prompt}"
-        )
+    prompt = _summary_prompt(text, custom_instructions)
     config = ChatConfig(
         system=system or _SUMMARY_SYSTEM_PROMPT,
         max_tokens=max_tokens,
@@ -339,7 +362,8 @@ async def summarize_with_provider(
                 elif kind == "error":
                     log.warning(
                         "compaction.summarizer_provider_error",
-                        error=str(getattr(event, "message", "") or ""),
+                        error=str(getattr(event, "message", "") or "")
+                        or str(getattr(event, "code", "") or "provider error"),
                     )
                     return None
                 elif kind == "done":
@@ -347,10 +371,66 @@ async def summarize_with_provider(
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - summarizer failure falls back
-        log.warning("compaction.summarizer_failed", error=str(exc))
+        _log_summarizer_failure(exc, timeout=timeout, via="provider")
         return None
     summary = "".join(parts).strip()
     return summary or None
+
+
+ChunkSummarizer = Callable[[str, float], Awaitable[str | None]]
+
+COMPACTION_AUX_TASK = "compaction"
+DEFAULT_SUMMARY_TIMEOUT_SECONDS = 45.0
+
+
+def auxiliary_chunk_summarizer(
+    *,
+    hint: tuple[str, str] = ("", ""),
+    session_key: str | None = None,
+) -> ChunkSummarizer:
+    """Summarize through the auxiliary side-task client (task ``compaction``).
+
+    The auxiliary path picks the cheap model an operator configured for side
+    work (``[auxiliary.tasks.compaction]``, ``[auxiliary]``, else the
+    router's cheapest text tier passed as *hint*), records the spend under
+    ``aux:compaction`` and never sends thinking -- the turn's own model and
+    prompt cache are left alone.
+    """
+
+    async def _summarize(text: str, timeout: float) -> str | None:
+        from agentos.provider.auxiliary import get_auxiliary_client
+
+        try:
+            result = await get_auxiliary_client().complete(
+                task=COMPACTION_AUX_TASK,
+                messages=[Message(role="user", content=_summary_prompt(text))],
+                preferred_provider=hint[0],
+                preferred_model=hint[1],
+                chat_config=ChatConfig(
+                    system=_SUMMARY_SYSTEM_PROMPT,
+                    max_tokens=SUMMARY_MAX_TOKENS,
+                    thinking=False,
+                    timeout=timeout,
+                ),
+                timeout=timeout,
+                session_key=session_key,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - summarizer failure falls back
+            _log_summarizer_failure(exc, timeout=timeout, via="auxiliary")
+            return None
+        summary = (result.text or "").strip()
+        return summary or None
+
+    return _summarize
+
+
+def _provider_chunk_summarizer(provider: _ChatProvider) -> ChunkSummarizer:
+    async def _summarize(text: str, timeout: float) -> str | None:
+        return await summarize_with_provider(provider, text, timeout=timeout)
+
+    return _summarize
 
 
 def _chunk_messages(messages: Sequence[Message], max_chars: int) -> list[list[Message]]:
@@ -370,26 +450,44 @@ def _chunk_messages(messages: Sequence[Message], max_chars: int) -> list[list[Me
 
 
 async def summarize_messages(
-    provider: _ChatProvider | None,
+    summarizer: _ChatProvider | ChunkSummarizer | None,
     messages: list[Message],
     previous_summary: str | None,
     *,
     window_tokens: int,
     timeout: float = _SUMMARY_TIMEOUT_SECONDS,
 ) -> tuple[str, str]:
-    """Return ``(summary, source)`` with source ``llm`` / ``mixed`` / ``fallback``."""
-    if provider is None:
+    """Return ``(summary, source)`` with source ``llm`` / ``mixed`` / ``fallback``.
+
+    *summarizer* is an ``LLMProvider`` or a chunk summarizer such as
+    :func:`auxiliary_chunk_summarizer`. *timeout* bounds the whole call, not
+    each chunk; after the first failure the remaining chunks use the
+    deterministic digest instead of waiting out the timeout again.
+    """
+    if summarizer is None:
         return fallback_summary(messages, previous_summary), "fallback"
+    chunk_summarizer: ChunkSummarizer
+    if hasattr(summarizer, "chat"):
+        chunk_summarizer = _provider_chunk_summarizer(summarizer)  # type: ignore[arg-type]
+    else:
+        chunk_summarizer = summarizer  # type: ignore[assignment]
     # Keep each summarizer input well inside the model window.
     max_chars = max(8_000, min(400_000, int(window_tokens * 4 * 0.5)))
     chunks = _chunk_messages(messages, max_chars)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.01, timeout)
+    llm_available = True
     summaries: list[str] = []
     llm_chunks = 0
     for index, chunk in enumerate(chunks):
         text = render_messages_for_summary(chunk)
         if index == 0 and previous_summary:
             text = f"[Earlier summary]\n{previous_summary}\n\n{text}"
-        result = await summarize_with_provider(provider, text, timeout=timeout)
+        remaining = deadline - loop.time()
+        result = None
+        if llm_available and remaining > 0:
+            result = await chunk_summarizer(text, remaining)
+            llm_available = result is not None
         if result:
             summaries.append(result)
             llm_chunks += 1
@@ -427,8 +525,10 @@ class CompactionService:
         summarizer: Summarizer | None = None,
         timeout: float = _SUMMARY_TIMEOUT_SECONDS,
         phase: str = "agent_inline_overflow",
+        chunk_summarizer: ChunkSummarizer | None = None,
     ) -> None:
         self._provider = provider
+        self._chunk_summarizer = chunk_summarizer
         self._ratio = ratio if 0.0 < ratio <= 1.0 else DEFAULT_COMPACTION_RATIO
         self._session_key = session_key
         self._summarizer = summarizer
@@ -456,12 +556,31 @@ class CompactionService:
         if self._summarizer is not None:
             return await self._summarizer(messages, previous_summary)
         return await summarize_messages(
-            self._provider,
+            self._chunk_summarizer or self._provider,
             messages,
             previous_summary,
             window_tokens=window_tokens,
             timeout=self._timeout,
         )
+
+    def _decline(
+        self,
+        unchanged: CompactionResult,
+        compaction_id: str,
+        reason: str,
+        **payload: Any,
+    ) -> CompactionResult:
+        """Leave the transcript as is, say why once, and persist nothing."""
+        log.info(
+            "compaction.declined",
+            session_key=self._session_key,
+            reason=reason,
+            **payload,
+        )
+        unchanged.reason = reason
+        unchanged.compaction_id = compaction_id
+        self._notify("skipped", compaction_id, reason=reason, **payload)
+        return unchanged
 
     def _notify(self, status: str, compaction_id: str, **payload: Any) -> None:
         if not self._session_key:
@@ -552,27 +671,43 @@ class CompactionService:
         folded_current = current[input_end:keep_from] if keep_from else []
         kept_current = current[:input_end] + current[keep_from:] if keep_from else current
         to_fold = prefix + folded_current
+        if not force and overhead + message_tokens(kept_current) > limit:
+            # Preflight: the kept current turn alone is over the limit (a
+            # single huge tool result of this turn, say), so summarizing --
+            # and durably rewriting -- older history would cost that context
+            # and still not let this request through. (A forced call -- the
+            # provider already refused -- carries the provider's numbers
+            # instead of a live estimate and always tries.)
+            return self._decline(
+                unchanged,
+                compaction_id,
+                "current_turn_too_large",
+                tokens_before=estimated_tokens,
+                context_window_tokens=window_tokens,
+            )
         if not to_fold:
             unchanged.reason = "nothing_to_compact"
             unchanged.compaction_id = compaction_id
             self._notify("skipped", compaction_id, reason="nothing_to_compact")
             return unchanged
-        if not force and overhead + message_tokens(kept_current) > limit:
-            # Preflight: the kept current turn alone is over the limit, so
-            # summarizing (and durably rewriting) older history would cost
-            # that context and still not let this request through. (A forced
-            # call -- the provider already refused -- carries the provider's
-            # numbers instead of a live estimate and always tries.)
-            unchanged.reason = "current_turn_too_large"
-            unchanged.compaction_id = compaction_id
-            self._notify(
-                "skipped",
+        # Required gain: a compaction that does not take at least 10% off the
+        # request is not worth a summarizer call, a durable rewrite and a
+        # cache miss. Checked first against an optimistic summary size, so a
+        # hopeless attempt never reaches the summarizer, and again on the
+        # real summary below.
+        min_gain = max(1, int(estimated_tokens * _MIN_GAIN_RATIO)) if not force else 1
+        folded_tokens = message_tokens(to_fold)
+        optimistic_summary = min(_OPTIMISTIC_SUMMARY_TOKENS, folded_tokens // 4)
+        best_case = message_tokens(messages) - message_tokens(kept_current) - optimistic_summary
+        if best_case < min_gain:
+            return self._decline(
+                unchanged,
                 compaction_id,
-                reason="current_turn_too_large",
+                "not_worth_compacting",
                 tokens_before=estimated_tokens,
+                best_case_gain_tokens=max(0, best_case),
                 context_window_tokens=window_tokens,
             )
-            return unchanged
 
         self._notify(
             "started",
@@ -621,6 +756,18 @@ class CompactionService:
 
         compacted = [*summary_messages(summary), *kept_current]
         tokens_after = overhead + message_tokens(compacted)
+        if message_tokens(messages) - message_tokens(compacted) < min_gain:
+            # The summary (an LLM answer or the fallback digest) did not buy
+            # enough room: keep the transcript, persist nothing, send as is.
+            return self._decline(
+                unchanged,
+                compaction_id,
+                "compaction_not_smaller",
+                tokens_before=estimated_tokens,
+                tokens_after=tokens_after,
+                summary_source=source,
+                context_window_tokens=window_tokens,
+            )
         removed_count = len(to_fold) + (2 if previous_summary is not None else 0)
         result = CompactionResult(
             status="compacted",

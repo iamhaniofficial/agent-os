@@ -317,6 +317,11 @@ class AgentConfig:
     # head/tail + store handle when their turn ends ([compaction]
     # history_tool_result_max_chars). 0 = 2% of the window, clamped 4k-12k.
     history_tool_result_max_chars: int = 0
+    # Inline compaction summarizer: auxiliary-client timeout ([compaction]
+    # summary_timeout_seconds) and the (provider, model) hint for it -- the
+    # router's cheapest text tier, filled in by the runtime.
+    compaction_summary_timeout_seconds: float = 45.0
+    compaction_summary_model_hint: tuple[str, str] = ("", "")
     # Retry policy for transient LLM errors (429, 500, 503)
     max_provider_retries: int = 3
     length_capped_continuations: int = 1

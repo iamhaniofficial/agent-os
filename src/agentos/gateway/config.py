@@ -1567,6 +1567,9 @@ class CompactionLlmConfig(BaseSettings):
     # every later turn (once; earlier turns are never rewritten again).
     # 0 = 2% of the model's context window in chars, clamped to 4k-12k.
     history_tool_result_max_chars: int = Field(default=0, ge=0)
+    # Bound on the in-turn compaction summary call (auxiliary model, task
+    # ``compaction``). On timeout a deterministic digest is used instead.
+    summary_timeout_seconds: float = Field(default=45.0, gt=0.0, le=600.0)
 
 
 class AuxiliaryTaskConfig(BaseModel):

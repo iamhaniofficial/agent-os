@@ -25,7 +25,7 @@ from agentos.engine.cache_break_monitor import (
     check_response_for_cache_break,
     record_prompt_state,
 )
-from agentos.engine.compaction_service import CompactionService
+from agentos.engine.compaction_service import CompactionService, auxiliary_chunk_summarizer
 from agentos.engine.fallback import FallbackPolicy, backoff_sleep, retry_after_delay
 from agentos.engine.history import limit_turns, repair_tool_pairing
 from agentos.engine.progress_watchdog import (
@@ -178,6 +178,11 @@ _PROVIDER_PAUSE_TURN_RESUME_PROMPT = (
 # response as the end of the turn.
 _MAX_PAUSE_TURN_RESUMES = 3
 _PROVIDER_REFUSAL_REPLY = "The model declined to respond to this request."
+# CompactionService outcomes that leave the transcript untouched because
+# compacting would not help this turn; not retried at the same size.
+_COMPACTION_DECLINE_REASONS = frozenset(
+    {"current_turn_too_large", "not_worth_compacting", "compaction_not_smaller"}
+)
 
 
 def _cost_source_for_usage(cost_usd: float, billed_cost: float) -> str:
@@ -737,6 +742,7 @@ class Agent:
         self._turn_reset = False
         self._turn_compaction_id: str | None = None
         self._turn_record: TranscriptRecord | None = None
+        self._turn_compaction_declined_tokens: int | None = None
         self._message_sizes = MessageSizeCache(Agent._live_request_jsonable)
 
     def _context_overflow_error(self) -> ErrorEvent:
@@ -1359,6 +1365,7 @@ class Agent:
         self._turn_reset = False
         self._turn_compaction_id = None
         self._turn_record = None
+        self._turn_compaction_declined_tokens = None
         # Index of this turn's first input message: compaction keeps it and
         # everything after it (the current turn) and summarizes the rest.
         turn_input_index = len(turn_messages)
@@ -1717,6 +1724,12 @@ class Agent:
                 _invalid_response_fallback_done = False
                 _retry_after_fallback_done = False
                 _pause_turn_resumes = 0
+                # The attempt whose thinking the consumer is seeing. A retry of
+                # the same step re-streams reasoning the UI already shows, so
+                # later attempts' thinking deltas are not re-emitted (they still
+                # reach the transcript through the done event). Continuations,
+                # which keep the previous output, reset it.
+                _thinking_shown_attempt: int | None = None
                 while _retry_attempt <= _fallback.max_retries:
                     provider_error = None
                     assistant_text_parts = []
@@ -1918,7 +1931,11 @@ class Agent:
                             elif isinstance(raw_ev, ProviderThinkingDelta):
                                 # Reasoning is display-only: never mixed into the
                                 # reply text, never counted as user-visible output.
-                                if raw_ev.text:
+                                if raw_ev.text and _thinking_shown_attempt in (
+                                    None,
+                                    _call_attempt,
+                                ):
+                                    _thinking_shown_attempt = _call_attempt
                                     yield ThinkingEvent(text=raw_ev.text)
 
                             elif isinstance(raw_ev, ProviderToolUseStart):
@@ -2214,6 +2231,7 @@ class Agent:
                                 resume=_pause_turn_resumes,
                                 budget=_MAX_PAUSE_TURN_RESUMES,
                             )
+                            _thinking_shown_attempt = None
                             _call_attempt += 1
                             continue
                         # Resume budget spent: the paused response is the end of
@@ -2457,6 +2475,7 @@ class Agent:
                                     "the response automatically."
                                 ),
                             )
+                            _thinking_shown_attempt = None
                             _call_attempt += 1
                             continue
 
@@ -3781,10 +3800,19 @@ class Agent:
 
     def _compaction_service(self, *, window_tokens: int | None = None) -> CompactionService:
         del window_tokens
+        hint = getattr(self.config, "compaction_summary_model_hint", None) or ("", "")
         return CompactionService(
             provider=self.provider,
             ratio=float(self.config.context_overflow_threshold),
             session_key=self._session_key,
+            # Summaries go through the auxiliary side-task client (cheap model,
+            # no thinking, accounted as aux:compaction), never the turn's own
+            # model, and are bounded by their own timeout.
+            chunk_summarizer=auxiliary_chunk_summarizer(
+                hint=(str(hint[0] or ""), str(hint[1] or "")),
+                session_key=self._session_key,
+            ),
+            timeout=float(getattr(self.config, "compaction_summary_timeout_seconds", 45.0) or 45.0),
         )
 
     def _compaction_budget_tokens(self) -> int | None:
@@ -3842,6 +3870,11 @@ class Agent:
         self._last_compaction_refusal_reason = None
         window_tokens = compaction_window_tokens or self.config.context_window_tokens
         input_index = len(messages) if turn_input_index is None else turn_input_index
+        declined_at = self._turn_compaction_declined_tokens
+        if not force and declined_at is not None and estimated_context_tokens <= declined_at * 1.25:
+            # This turn already found compaction not worth it at about this
+            # size; do not pay for (or log) the same attempt on every request.
+            return CompactionOutcome(messages=messages, turn_input_index=input_index)
         result = await self._compaction_service().compact(
             messages,
             turn_input_index=input_index,
@@ -3855,6 +3888,8 @@ class Agent:
         if result.status == "failed":
             self._last_compaction_refusal_reason = result.reason or "compaction_failed"
             return None
+        if result.reason in _COMPACTION_DECLINE_REASONS and not force:
+            self._turn_compaction_declined_tokens = estimated_context_tokens
         if result.reason == "current_turn_too_large":
             # Nothing was summarized or rewritten. Before a call the request
             # goes out as is (the estimate is a heuristic); after a provider

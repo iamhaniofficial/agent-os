@@ -102,6 +102,35 @@ class _Catalog:
         return None
 
 
+@pytest.fixture(autouse=True)
+def _auxiliary_client(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Route the summarizer's auxiliary client to the test provider.
+
+    The in-turn summarizer runs as the auxiliary side task ``compaction``
+    (cheap model, no thinking), not on the turn's own model.
+    """
+    from agentos.provider import auxiliary
+
+    built: list[dict[str, Any]] = []
+
+    def _factory(**kwargs: Any) -> Any:
+        built.append(kwargs)
+        return _AUX_PROVIDER["provider"]
+
+    monkeypatch.setattr(
+        auxiliary,
+        "_client",
+        auxiliary.AuxiliaryClient(
+            config={"provider": "opencap", "model": "cheap-model"},
+            provider_factory=_factory,
+        ),
+    )
+    return built
+
+
+_AUX_PROVIDER: dict[str, Any] = {}
+
+
 @pytest.fixture
 async def storages() -> AsyncIterator[list[SessionStorage]]:
     opened: list[SessionStorage] = []
@@ -178,6 +207,7 @@ async def test_preflight_under_threshold_does_not_compact(
 ) -> None:
     manager = await _manager(tmp_path, storages)
     provider = _Provider()
+    _AUX_PROVIDER["provider"] = provider
     runner = _runner(provider, manager, tmp_path, ratio=0.9, context_window=1_000_000)
     await _seed(manager, KEY, rounds=1)
 
@@ -191,10 +221,13 @@ async def test_preflight_under_threshold_does_not_compact(
 
 @pytest.mark.asyncio
 async def test_preflight_compacts_before_the_first_call_and_persists_it(
-    tmp_path: Path, storages: list[SessionStorage]
+    tmp_path: Path,
+    storages: list[SessionStorage],
+    _auxiliary_client: list[dict[str, Any]],
 ) -> None:
     manager = await _manager(tmp_path, storages)
     provider = _Provider()
+    _AUX_PROVIDER["provider"] = provider
     runner = _runner(provider, manager, tmp_path)
     await _seed(manager, KEY)
     rows_before = len(await manager.get_transcript(KEY))
@@ -202,9 +235,14 @@ async def test_preflight_compacts_before_the_first_call_and_persists_it(
     first = await _turn(runner, manager, KEY, "deploy status?", tmp_path)
 
     assert any(isinstance(event, DoneEvent) for event in first)
-    # The summarizer went through the session's provider, over the old rows
-    # (in chunks that fit the model window).
+    # The summarizer ran as the auxiliary side task on the cheap model, over
+    # the old rows (in chunks that fit the model window).
     assert provider.summarizer_requests
+    from agentos.gateway.session_titler import fast_model_hint
+
+    cheapest_tier = fast_model_hint(runner._config, task="compaction")
+    assert cheapest_tier[1]
+    assert {kwargs["model"] for kwargs in _auxiliary_client} == {cheapest_tier[1]}
     assert "old question 0" in str(provider.summarizer_requests[0][0].content)
     summarizer_calls = len(provider.summarizer_requests)
     # The very first turn request already carries the single-summary shape.
@@ -252,6 +290,7 @@ async def test_canonical_subagent_session_compacts_without_a_checkpoint(
     key = "agent:main:subagent:run-7"
     manager = await _manager(tmp_path, storages)
     provider = _Provider()
+    _AUX_PROVIDER["provider"] = provider
     runner = _runner(provider, manager, tmp_path)
     await _seed(manager, key)
 
@@ -270,6 +309,7 @@ async def test_checkpoint_failure_prevents_the_destructive_rewrite(
     # No checkpoint workspace: record_memory_checkpoint raises.
     manager = await _manager(tmp_path, storages, checkpoint=False)
     provider = _Provider()
+    _AUX_PROVIDER["provider"] = provider
     runner = _runner(provider, manager, tmp_path)
     await _seed(manager, KEY)
     rows_before = len(await manager.get_transcript(KEY))
