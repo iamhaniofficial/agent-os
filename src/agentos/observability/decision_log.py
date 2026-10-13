@@ -29,7 +29,7 @@ from agentos.redact import mask_url_userinfo
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 _INTENT_SUMMARY_MAX_CHARS = 500
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _URL_RE = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
@@ -181,6 +181,11 @@ class DecisionEntry:
     skills_invoked: list[str] = field(default_factory=list)
     pipeline_steps: list[PipelineStepRecord] = field(default_factory=list)
     savings: SavingsTelemetry = field(default_factory=SavingsTelemetry)
+    # Normalized stop reason of the turn's last provider call (``end_turn``,
+    # ``max_tokens``, ``refusal``...). ``refusal_category`` is the provider's
+    # safety category when the model declined. Added in schema 15.
+    stop_reason: str | None = None
+    refusal_category: str | None = None
     schema_version: int = SCHEMA_VERSION
 
 

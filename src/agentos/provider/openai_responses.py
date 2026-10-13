@@ -29,15 +29,54 @@ from .types import (
     ErrorEvent,
     Message,
     ModelInfo,
+    StopReason,
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
     ToolUseDeltaEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
+    normalize_stop_reason,
 )
 
 _OPENAI_RESPONSES_BASE = "https://api.openai.com/v1"
+
+
+def _responses_stop_reason(
+    data: dict[str, Any],
+    *,
+    emitted_tool: bool,
+    refusal_text: str | None,
+) -> tuple[StopReason, str | None, dict[str, Any] | None]:
+    """Normalize a Responses ``status`` / ``incomplete_details`` pair.
+
+    ``incomplete`` carries its cause in ``incomplete_details.reason``
+    (``max_output_tokens`` or ``content_filter``); ``completed`` is an end of
+    turn, or ``tool_use`` when function calls were emitted. A ``refusal``
+    content part is a model decline even on a completed response.
+    """
+
+    raw_status = data.get("status")
+    status = raw_status if isinstance(raw_status, str) and raw_status else None
+    details = data.get("incomplete_details")
+    reason = details.get("reason") if isinstance(details, dict) else None
+    raw: str | None = status
+    if status == "incomplete":
+        raw = f"incomplete:{reason}" if isinstance(reason, str) and reason else status
+        normalized = (
+            normalize_stop_reason(reason)
+            if isinstance(reason, str) and reason
+            else StopReason.UNKNOWN
+        )
+    elif status is None or status == "completed":
+        normalized = StopReason.TOOL_USE if emitted_tool else StopReason.END_TURN
+    else:
+        normalized = StopReason.UNKNOWN
+    if refusal_text is not None:
+        return StopReason.REFUSAL, raw, {"type": "refusal", "explanation": refusal_text}
+    if normalized is StopReason.REFUSAL:
+        return normalized, raw, {"type": "refusal", "category": reason}
+    return normalized, raw, None
 
 
 def _responses_tool(tool: ToolDefinition) -> dict[str, Any]:
@@ -285,6 +324,7 @@ class OpenAIResponsesProvider:
             return
 
         emitted_tool = False
+        refusal_text: str | None = None
         for item in data.get("output") or []:
             if not isinstance(item, dict):
                 continue
@@ -294,6 +334,9 @@ class OpenAIResponsesProvider:
                         text = part.get("text")
                         if isinstance(text, str) and text:
                             yield TextDeltaEvent(text=text)
+                    elif isinstance(part, dict) and part.get("type") == "refusal":
+                        refusal = part.get("refusal")
+                        refusal_text = refusal if isinstance(refusal, str) else ""
             elif item.get("type") == "function_call":
                 emitted_tool = True
                 call_id = item.get("call_id") or item.get("id") or f"call_{uuid4().hex[:12]}"
@@ -315,8 +358,15 @@ class OpenAIResponsesProvider:
         input_tokens, output_tokens, reasoning_tokens, cached_tokens = _usage_fields(
             data.get("usage")
         )
+        stop_reason, raw_stop_reason, stop_details = _responses_stop_reason(
+            data,
+            emitted_tool=emitted_tool,
+            refusal_text=refusal_text,
+        )
         yield DoneEvent(
-            stop_reason="tool_use" if emitted_tool else "end_turn",
+            stop_reason=stop_reason,
+            raw_stop_reason=raw_stop_reason,
+            stop_details=stop_details,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             reasoning_tokens=reasoning_tokens,

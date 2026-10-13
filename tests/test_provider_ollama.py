@@ -215,7 +215,8 @@ def test_ollama_preserves_non_tool_done_reason_and_model(
     events = asyncio.run(_run())
 
     done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.stop_reason == "length"
+    assert done.stop_reason == "max_tokens"
+    assert done.raw_stop_reason == "length"
     assert done.model == "qwen2.5:7b"
 
 
@@ -260,7 +261,8 @@ def test_ollama_ignores_malformed_tool_call_chunks(monkeypatch: pytest.MonkeyPat
 
     assert not any(isinstance(event, ToolUseEndEvent) for event in events)
     done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.stop_reason == "stop"
+    assert done.stop_reason == "end_turn"
+    assert done.raw_stop_reason == "stop"
 
 
 def _patch_raising_transport(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:

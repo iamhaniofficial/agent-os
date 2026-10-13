@@ -26,6 +26,7 @@ from .types import (
     ErrorEvent,
     Message,
     ModelInfo,
+    StopReason,
     StreamEvent,
     TextDeltaEvent,
     ThinkingDeltaEvent,
@@ -33,6 +34,7 @@ from .types import (
     ToolUseDeltaEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
+    normalize_stop_reason,
 )
 
 log = structlog.get_logger(__name__)
@@ -651,6 +653,7 @@ class AnthropicProvider:
         thinking_parts: list[str] = []
         thinking_signature: str | None = None
         stop_reason = "end_turn"
+        stop_details: dict[str, Any] | None = None
 
         try:
             async with httpx.AsyncClient(
@@ -793,14 +796,29 @@ class AnthropicProvider:
                                     input_tokens = (
                                         base_input_tokens + cached_tokens + cache_creation_tokens
                                     )
-                            delta_stop_reason = (event.get("delta") or {}).get("stop_reason")
+                            message_delta = event.get("delta") or {}
+                            delta_stop_reason = message_delta.get("stop_reason")
                             if delta_stop_reason:
                                 stop_reason = delta_stop_reason
+                            # A safety-classifier decline (``refusal``) carries
+                            # ``stop_details`` with a category and explanation.
+                            delta_stop_details = message_delta.get("stop_details")
+                            if not isinstance(delta_stop_details, dict):
+                                delta_stop_details = event.get("stop_details")
+                            if isinstance(delta_stop_details, dict) and delta_stop_details:
+                                stop_details = dict(delta_stop_details)
 
                         elif etype == "message_stop":
                             reasoning_content = "".join(thinking_parts) or None
+                            normalized_stop = normalize_stop_reason(stop_reason)
+                            if normalized_stop is StopReason.UNKNOWN:
+                                log.info("anthropic.unknown_stop_reason", stop_reason=stop_reason)
                             yield DoneEvent(
-                                stop_reason=stop_reason,
+                                stop_reason=normalized_stop,
+                                raw_stop_reason=stop_reason,
+                                stop_details=(
+                                    stop_details if normalized_stop is StopReason.REFUSAL else None
+                                ),
                                 input_tokens=input_tokens,
                                 output_tokens=output_tokens,
                                 reasoning_content=reasoning_content,
