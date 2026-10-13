@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import json
+import subprocess
+import sys
 from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,6 +23,7 @@ from agentos.session.manager import SessionManager
 from agentos.session.storage import SessionStorage
 from agentos.tool_boundary import ToolCall, ToolResult
 from agentos.tools import deferred
+from agentos.tools.builtin import tool_search as tool_search_module
 from agentos.tools.deferred import (
     DEFERRED_BUILTIN_TOOLS,
     TOOL_SEARCH_NAME,
@@ -37,8 +42,18 @@ from agentos.tools.types import ToolContext, ToolSpec, current_tool_context
 SESSION = "agent:main:deferred-test"
 
 #: The default request must carry at least this many fewer tool schemas than
-#: the full surface. 30 builtins are deferred today (tool_search adds one back).
+#: the full surface. Without the per-agent memory and skill tools, the bare
+#: builtin registry defers 26 (tool_search adds one back).
 MIN_SCHEMAS_SAVED = 25
+
+#: Pinned so the CHANGELOG, docs/configuration.md and the tool_search docstring
+#: cannot drift from the code: 31 builtins are marked deferred; on a stock
+#: gateway (builtins + skill + memory tools) 30 of them are deferred, because
+#: create_pptx is hidden unless allowed, and a request goes from 63 to 34.
+FLAGGED_BUILTINS = 31
+STOCK_DEFERRED = 30
+STOCK_FULL_SCHEMAS = 63
+STOCK_REQUEST_SCHEMAS = 34
 
 
 async def _ok(**_kwargs: Any) -> str:
@@ -399,3 +414,125 @@ def _handler_returning(content: str) -> Any:
         return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content=content)
 
     return _handler
+
+
+# ---------------------------------------------------------------------------
+# Pinned numbers, concurrency, disabled tools, `agentos context`
+# ---------------------------------------------------------------------------
+
+_STOCK_MEASURE = """
+import json
+from unittest.mock import MagicMock
+import agentos.tools.builtin  # noqa: F401
+from agentos.tools.builtin.memory_tools import create_memory_tools
+from agentos.tools.builtin.skill_tools import create_skill_tools
+from agentos.tools.registry import get_default_registry
+from agentos.tools.types import ToolContext
+create_skill_tools(MagicMock())
+create_memory_tools(MagicMock(), MagicMock())
+reg = get_default_registry()
+ctx = ToolContext(session_key="agent:main:main")
+print("MEASURE " + json.dumps({
+    "deferred": len(reg.deferred_tools(ctx)),
+    "full": len(reg.to_tool_definitions(ctx)),
+    "request": len(reg.request_tool_definitions(ctx)),
+    "concurrency": {
+        name: [reg.get(name).spec.concurrency, reg.get(name).spec.read_only]
+        for name in ("tool_search", "skill_view")
+    },
+}))
+"""
+
+
+@functools.cache
+def _stock_measure() -> dict[str, Any]:
+    """A stock gateway surface, built in a subprocess so the per-agent memory
+    and skill tools it registers do not leak into this test session."""
+
+    out = subprocess.run(
+        [sys.executable, "-c", _STOCK_MEASURE],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    ).stdout
+    line = next(row for row in out.splitlines() if row.startswith("MEASURE "))
+    return dict(json.loads(line[len("MEASURE ") :]))
+
+
+def test_the_documented_numbers_match_a_stock_gateway_surface() -> None:
+    measured = _stock_measure()
+
+    assert len(DEFERRED_BUILTIN_TOOLS) == FLAGGED_BUILTINS
+    assert (measured["deferred"], measured["full"], measured["request"]) == (
+        STOCK_DEFERRED,
+        STOCK_FULL_SCHEMAS,
+        STOCK_REQUEST_SCHEMAS,
+    ), "update CHANGELOG.md, docs/configuration.md and the tool_search docstring"
+
+    root = Path(__file__).resolve().parents[2]
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    entry = changelog[changelog.index("- Deferred tool loading.") :].split("\n- ", 1)[0]
+    flat = " ".join(entry.split())
+    assert f"{FLAGGED_BUILTINS} rarely used builtins" in flat
+    assert f"stock gateway {STOCK_DEFERRED} of them" in flat
+    assert f"from {STOCK_FULL_SCHEMAS} to {STOCK_REQUEST_SCHEMAS} tool schemas" in flat
+    docs = " ".join((root / "docs" / "configuration.md").read_text(encoding="utf-8").split())
+    assert f"{FLAGGED_BUILTINS} builtins" in docs and f"{STOCK_DEFERRED} of them" in docs
+    search_doc = " ".join((tool_search_module.__doc__ or "").split())
+    assert f"stands in for {STOCK_DEFERRED} tools ({FLAGGED_BUILTINS} are" in search_doc
+    assert f"from {STOCK_FULL_SCHEMAS} to {STOCK_REQUEST_SCHEMAS} tool schemas" in search_doc
+
+
+def test_tools_that_change_the_loaded_set_run_alone() -> None:
+    """A deferred tool batched after tool_search / skill_view must see the load."""
+
+    from agentos.engine.tool_batch import resolve_tool_concurrency
+
+    assert _stock_measure()["concurrency"] == {
+        TOOL_SEARCH_NAME: ["exclusive", False],
+        "skill_view": ["exclusive", False],
+    }
+    search = get_default_registry().get(TOOL_SEARCH_NAME)
+    assert search is not None
+    assert resolve_tool_concurrency(search.spec, {}).mode == "exclusive"
+
+
+def test_disabled_tools_clear_a_stale_surface() -> None:
+    registry = _registry()
+    assert DeferredToolSurface.build(registry, _ctx()) is not None
+    assert deferred_tool_names(SESSION)
+
+    runner = TurnRunner(
+        provider_selector=None,
+        tool_registry=registry,
+        session_manager=object(),
+        config=SimpleNamespace(tools=ToolsConfig(enabled=False)),
+    )
+    defs, handler = runner._build_tools(_ctx())
+
+    assert defs == [] and handler is None
+    assert deferred_tool_names(SESSION) == []
+    tools, deferred_names = prompt_tool_names(defs, SESSION)
+    assert (tools, deferred_names) == ([], [])
+
+
+def test_agentos_context_honours_defer_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    from typer.testing import CliRunner
+
+    from agentos.cli import context_cmd
+
+    def tool_count(value: str) -> int:
+        monkeypatch.setenv("AGENTOS_GATEWAY_TOOLS__DEFER_LOADING", value)
+        result = CliRunner().invoke(context_cmd.app, ["--json"])
+        assert result.exit_code == 0, result.output
+        # Debug logs share stdout under the test runner; the JSON is the last line.
+        json_line = [row for row in result.output.splitlines() if row.startswith("{")][-1]
+        payload = json.loads(json_line)
+        return next(s["items"] for s in payload["sections"] if s["name"] == "tools")
+
+    ctx = ToolContext()
+    registry = get_default_registry()
+    assert tool_count("false") == len(registry.request_tool_definitions(ctx, defer_loading=False))
+    assert tool_count("true") == len(registry.request_tool_definitions(ctx))
+    assert tool_count("false") > tool_count("true")

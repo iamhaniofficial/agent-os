@@ -823,8 +823,9 @@ def create_skill_tools(loader: SkillLoader) -> None:
 
     @tool(
         name="skill_view",
-        concurrency="parallel",
-        read_only=True,
+        # Not read-only: reading a skill loads the deferred tools it requires,
+        # so it runs alone and a tool call batched after it sees the load.
+        concurrency="exclusive",
         description=(
             "Read a skill's SKILL.md content by name. A large skill comes back as its "
             "opening sections plus an index of the rest — pass section to read one of "

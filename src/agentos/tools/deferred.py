@@ -72,7 +72,9 @@ LOADED_STATE_PROVIDER = "portable"
 #: ``exec_command`` and skills — none of that may depend on a search first.
 #:
 #: Deferred: tools a typical turn does not touch and whose absence the model
-#: can always repair with one ``tool_search`` call.
+#: can always repair with one ``tool_search`` call. 31 names; ``create_pptx`` is
+#: also hidden unless allowed, so a stock gateway defers 30 and its request
+#: drops from 63 to 34 schemas. ``test_deferred_tools`` pins these numbers.
 DEFERRED_BUILTIN_TOOLS: frozenset[str] = frozenset(
     {
         # Audio generation. Every one is reached through a bundled studio

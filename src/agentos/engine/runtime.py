@@ -4031,6 +4031,14 @@ class TurnRunner:
     ) -> tuple[list, ToolHandler | None]:
         """Build tool definitions and handler from registry, filtered by ToolContext."""
         tools_config = getattr(self._config, "tools", None)
+        if (tools_config is not None and not getattr(tools_config, "enabled", True)) or (
+            self._tool_registry is None
+        ):
+            # No tools this turn: drop a deferred-tool surface left by an
+            # earlier one, or the prompt would still advertise tool_search.
+            from agentos.tools.deferred import forget_surface
+
+            forget_surface(ctx.session_key if ctx is not None else None)
         if tools_config is not None and not getattr(tools_config, "enabled", True):
             if metadata is not None:
                 metadata["tool_profile"] = "disabled"

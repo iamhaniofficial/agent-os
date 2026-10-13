@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
@@ -268,3 +269,67 @@ async def test_turn_runner_loads_mid_turn_and_a_restarted_runner_keeps_it() -> N
     assert voice_results and "spoke hello" in voice_results[0].result
     # Same order on the next turn, so the request prefix does not reshuffle.
     assert second.tool_names_per_call[0] == turn1_call2
+
+
+async def test_a_deferred_tool_batched_after_tool_search_sees_the_load() -> None:
+    """[tool_search, voice_maker] in one response: the search runs alone first."""
+
+    ran: list[str] = []
+
+    async def voice_maker(text: str) -> str:
+        ran.append(text)
+        return "audio.mp3"
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="voice_maker",
+            description="Make speech.",
+            parameters={"text": {"type": "string"}},
+            required=["text"],
+            defer_loading=True,
+            concurrency="parallel",
+        ),
+        voice_maker,
+    )
+    search = get_default_registry().get(TOOL_SEARCH_NAME)
+    assert search is not None
+    real_search = search.handler
+
+    async def slow_search(**kwargs: Any) -> str:
+        # Yield first, as a real search can (hooks, budget, persistence): a
+        # call running beside it would then reach the guard before the load.
+        await asyncio.sleep(0.02)
+        return await real_search(**kwargs)
+
+    registry.register(search.spec, slow_search)
+    ctx = ToolContext(session_key=SESSION)
+    surface = DeferredToolSurface.build(registry, ctx)
+    assert surface is not None
+    handler = surface.guard(build_tool_handler(registry, ctx))
+    batch = [
+        ProviderToolUseStart(tool_use_id="a", tool_name=TOOL_SEARCH_NAME),
+        ProviderToolUseEnd(
+            tool_use_id="a", tool_name=TOOL_SEARCH_NAME, arguments={"names": ["voice_maker"]}
+        ),
+        ProviderToolUseStart(tool_use_id="b", tool_name="voice_maker"),
+        ProviderToolUseEnd(tool_use_id="b", tool_name="voice_maker", arguments={"text": "hi"}),
+        ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1),
+    ]
+    provider = _SequenceProvider([batch, _TEXT])
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=surface.tool_definitions(),
+        tool_handler=handler,
+        tool_registry=registry,
+    )
+    bind_agent_tools(handler, agent)
+
+    events = [event async for event in agent.run_turn("say hi")]
+
+    assert ran == ["hi"]
+    voice = [
+        e for e in events if type(e).__name__ == "ToolResultEvent" and e.tool_name == "voice_maker"
+    ]
+    assert voice and not voice[0].is_error

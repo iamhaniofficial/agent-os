@@ -930,7 +930,7 @@ class Agent:
         try:
             value = int(self.config.max_safe_tool_concurrency)
         except (TypeError, ValueError):
-            return 6
+            return 8
         return max(1, value)
 
     def _write_turn_call_log(self, kind: str, **payload: Any) -> None:

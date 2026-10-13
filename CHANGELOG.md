@@ -30,18 +30,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `ChatConfig.parallel_tool_calls = False` maps to OpenAI
   `parallel_tool_calls` / Anthropic `disable_parallel_tool_use`. Existing tool
   payloads are unchanged. (#3648)
-- Deferred tool loading. A request no longer carries every tool schema: 30
+- Deferred tool loading. A request no longer carries every tool schema: 31
   rarely used builtins (audio generation, git helpers, project and skill
-  administration, `browser`, `x_search`, `http_request`, ...) are listed by
-  name in a new `tool_search` tool instead, and the model loads the ones a task
-  needs; they stay loaded for the rest of the session, including after a
-  restart, and a reset starts lean again. `skill_view` loads the tools a skill
-  lists in `requires_tools`, and calling a deferred tool before loading it
-  returns an error that says how to load it. A stock request drops from 63 to
-  34 tool schemas (about 16k characters, ~4k tokens, less per call). Policy
-  still applies, and a surface narrowed by an allowlist defers nothing.
-  `[tools] defer_loading = false` sends every tool again; `agentos context`
-  reports the deferred count.
+  administration, `browser`, `x_search`, `http_request`, ...) are marked
+  deferred and listed by name in a new `tool_search` tool instead, and the model
+  loads the ones a task needs; they stay loaded for the rest of the session,
+  including after a restart, and a reset starts lean again. `skill_view` loads
+  the tools a skill lists in `requires_tools`, and calling a deferred tool
+  before loading it returns an error that says how to load it. On a stock
+  gateway 30 of them are deferred (`create_pptx` is hidden unless allowed), so
+  a request drops from 63 to 34 tool schemas (about 16k characters, ~4k tokens,
+  less per call). Policy still applies, and a surface narrowed by an allowlist
+  defers nothing. `[tools] defer_loading = false` sends every tool again;
+  `agentos context` honours it and reports the deferred count. (#3648)
 
 ### Changed
 - Anthropic prompt cache now covers the whole conversation, not only the
@@ -66,9 +67,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   returns its denial without holding up the others. What needs approval is
   unchanged. The model still receives the results in the order it asked for
   them. Which tools may run side by side is now declared on each tool
-  (`concurrency` = `parallel` / `keyed` / `exclusive`, plus `read_only` and
-  `requires_approval`) instead of a hard-coded list of names in the engine; a
-  tool that declares nothing, MCP tools included, still runs alone. Up to 8
+  (`concurrency` = `parallel` / `keyed` / `exclusive`) instead of a hard-coded
+  list of names in the engine; a tool that declares nothing, MCP tools
+  included, still runs alone. Tools also declare `read_only` and
+  `requires_approval` for upcoming use; nothing reads those two yet. Up to 8
   parallel calls run at once (was 6).
 - Engine: the conversation is now an append-only transcript, so consecutive
   provider requests share a byte-identical prefix and prompt caches keep
