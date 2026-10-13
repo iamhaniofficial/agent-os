@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -32,21 +33,27 @@ def _stable_hash(value: Any) -> str:
 
 
 _MESSAGE_HASH_MEMO_MAX = 4096
-# id(message) -> (message, hash). Sealed transcript messages are immutable and
-# repeat in every request of a session, so each is hashed once instead of once
-# per provider call (the full re-hash made a long tool loop quadratic). The
-# message is held so its id cannot be reused while the entry lives.
-_message_hash_memo: OrderedDict[int, tuple[Message, str]] = OrderedDict()
+# id(message) -> (weak reference, hash). Sealed transcript messages are
+# immutable and repeat in every request of a session, so each is hashed once
+# instead of once per provider call (the full re-hash made a long tool loop
+# quadratic). Only a weak reference is kept: the memo never holds a message
+# (or its large tool results) alive, and a dead reference -- whose id may be
+# reused -- is a miss.
+_message_hash_memo: OrderedDict[int, tuple[weakref.ref[Message], str]] = OrderedDict()
 
 
 def _message_hash(message: Message) -> str:
     key = id(message)
     cached = _message_hash_memo.get(key)
-    if cached is not None and cached[0] is message:
+    if cached is not None and cached[0]() is message:
         _message_hash_memo.move_to_end(key)
         return cached[1]
     digest = _stable_hash(message)
-    _message_hash_memo[key] = (message, digest)
+    try:
+        reference = weakref.ref(message)
+    except TypeError:  # pragma: no cover - Message always supports weakrefs
+        return digest
+    _message_hash_memo[key] = (reference, digest)
     if len(_message_hash_memo) > _MESSAGE_HASH_MEMO_MAX:
         _message_hash_memo.popitem(last=False)
     return digest

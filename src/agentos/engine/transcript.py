@@ -62,6 +62,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import weakref
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -934,20 +935,21 @@ class MessageSizeCache:
     Sealed messages are immutable, so their serialized size is computed once
     per turn instead of once per provider request (the old estimate dumped
     the whole request every call, which made a long tool loop quadratic).
+    Holds a weak reference per entry, never the message itself.
     """
 
     def __init__(self, jsonable: Callable[[Any], Any]) -> None:
         self._jsonable = jsonable
-        self._sizes: dict[int, tuple[Message, int]] = {}
+        self._sizes: dict[int, tuple[weakref.ref[Message], int]] = {}
 
     def size(self, message: Message) -> int:
         cached = self._sizes.get(id(message))
-        if cached is not None and cached[0] is message:
+        if cached is not None and cached[0]() is message:
             return cached[1]
         chars = len(
             json.dumps(self._jsonable(message), ensure_ascii=False, sort_keys=True, default=str)
         )
-        self._sizes[id(message)] = (message, chars)
+        self._sizes[id(message)] = (weakref.ref(message), chars)
         return chars
 
     def messages_chars(self, messages: Sequence[Message]) -> int:

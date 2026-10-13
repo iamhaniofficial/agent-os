@@ -328,3 +328,24 @@ def test_prompt_state_hashes_each_sealed_message_once(monkeypatch) -> None:
     # newly entered the prefix -- not all 50 again.
     assert len(hashed) == 48 + 2
     assert second.messages_prefix_item_hashes[:48] == first.messages_prefix_item_hashes
+
+
+def test_prompt_state_memo_does_not_keep_messages_alive() -> None:
+    """The process-wide memo holds hashes and weak references, not messages."""
+    import gc
+    import weakref
+
+    monitor = CacheBreakMonitor()
+    big = Message(role="user", content="r" * 200_000)
+    probe = weakref.ref(big)
+    monitor.record_prompt_state(
+        messages=[big, Message(role="assistant", content="a"), Message(role="user", content="q")],
+        tools=None,
+        config=ChatConfig(system="s"),
+        model="m",
+    )
+
+    del big
+    gc.collect()
+
+    assert probe() is None
