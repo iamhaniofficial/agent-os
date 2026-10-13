@@ -542,7 +542,7 @@ async def test_stream_consumer_stage_snapshot(
     if case.expected_done_present:
         assert any(isinstance(e, DoneEvent) for e in yielded)
 
-    # In-turn compaction observation: persist call count + system-prompt refresh count.
+    # In-turn compaction observation: persist call count; no system-prompt refresh.
     sm = runner._session_manager
     assert isinstance(sm, _RecordingSessionManager)
     persist_calls = [c for c in sm.calls if c[0] == "persist"]
@@ -550,9 +550,6 @@ async def test_stream_consumer_stage_snapshot(
         f"{case_id}: persist call count diverged "
         f"({len(persist_calls)} vs {case.expected_compaction_persist_calls})"
     )
-    expected_prompt_refresh_calls = (
-        case.expected_compaction_persist_calls
-        if case.expected_prompt_refresh_calls is None
-        else case.expected_prompt_refresh_calls
-    )
-    assert len(_MAILBOX.refresh_prompt_calls) == expected_prompt_refresh_calls
+    # The system prompt is never rebuilt on compaction (the summary is a
+    # message), so it stays byte-identical across it.
+    assert _MAILBOX.refresh_prompt_calls == []

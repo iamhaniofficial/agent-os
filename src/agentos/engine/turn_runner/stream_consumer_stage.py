@@ -135,32 +135,6 @@ class MemorySnapshotRefreshPort(Protocol):
 
 
 @runtime_checkable
-class SystemPromptRefreshPort(Protocol):
-    """Rebuild + apply the cacheable system-prompt base after compaction.
-
-    Wraps the ``_assemble_prompt(...)`` call + the tuple-vs-str extract
-    + ``agent.refresh_system_prompt(refreshed_prompt)``.
-
-    Compaction refresh: the post-compaction prompt rebuild MUST extract the
-    cacheable base (not the full ``(base, dynamic_suffix)`` tuple) --
-    feeding the tuple directly into ``agent.refresh_system_prompt``
-    would smuggle volatile bytes into ``ChatConfig.system`` and raise
-    ``ValidationError`` on the next turn. The adapter handles the
-    extract; the stage cannot bypass it.
-    """
-
-    def refresh_system_prompt(
-        self,
-        *,
-        agent: Agent,
-        agent_id: str,
-        tool_defs: list[Any],
-        session_key: str,
-        bootstrap_context_mode: str | None,
-    ) -> None: ...
-
-
-@runtime_checkable
 class MemorySyncNotifyPort(Protocol):
     """Notify ``sync_manager.notify_message(byte_count)`` post-stream.
 
@@ -726,12 +700,10 @@ class _CompactionHandler:
         *,
         persist: CompactionPersistPort,
         memory_snapshot: MemorySnapshotRefreshPort,
-        system_prompt: SystemPromptRefreshPort,
         compaction_hooks: tuple[CompactionHook, ...] = (),
     ) -> None:
         self._persist = persist
         self._memory_snapshot = memory_snapshot
-        self._system_prompt = system_prompt
         self._compaction_hooks = compaction_hooks
 
     async def handle(
@@ -799,13 +771,11 @@ class _CompactionHandler:
             session_key=inp.session_key,
             private_memory_allowed=inp.private_memory_allowed,
         )
-        self._system_prompt.refresh_system_prompt(
-            agent=inp.agent,
-            agent_id=inp.agent_id,
-            tool_defs=inp.tool_defs,
-            session_key=inp.session_key,
-            bootstrap_context_mode=inp.bootstrap_context_mode,
-        )
+        # No system-prompt rebuild: the compaction summary is a message, not
+        # a prompt section, so the system prompt (and its cache) stays
+        # byte-identical across a compaction. Rebuilding it here used
+        # ``_assemble_prompt`` without the per-turn pipeline steps and sent
+        # the next request without its Skills / Local Toolchain sections.
         await self._fire_after_compact(
             state,
             {
@@ -847,8 +817,7 @@ class StreamConsumerStage:
        stage owns the lifetime of the consumer loop.
     2. Per ``CompactionEvent``, conditionally:
        a. ``CompactionPersistPort.persist_and_notify``.
-       b. ``MemorySnapshotRefreshPort.refresh_snapshot``.
-       c. ``SystemPromptRefreshPort.refresh_system_prompt``.
+       b. ``MemorySnapshotRefreshPort.refresh_snapshot`` (next turn).
     3. Post-stream: ``MemorySyncNotifyPort.notify_message_bytes`` -- one
        call after the loop exits cleanly.
 
@@ -877,7 +846,6 @@ class StreamConsumerStage:
         agent_run: AgentRunPort,
         compaction_persist: CompactionPersistPort,
         memory_snapshot_refresh: MemorySnapshotRefreshPort,
-        system_prompt_refresh: SystemPromptRefreshPort,
         memory_sync_notify: MemorySyncNotifyPort,
         warning_transformer: WarningTransformer,
         compaction_hooks: tuple[CompactionHook, ...] = (),
@@ -895,7 +863,6 @@ class StreamConsumerStage:
         self._compaction_handler = _CompactionHandler(
             persist=compaction_persist,
             memory_snapshot=memory_snapshot_refresh,
-            system_prompt=system_prompt_refresh,
             compaction_hooks=compaction_hooks,
         )
 

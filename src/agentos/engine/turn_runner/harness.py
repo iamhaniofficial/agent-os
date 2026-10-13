@@ -55,7 +55,6 @@ from agentos.engine.turn_runner.stream_consumer_stage import (
     CompactionPersistPort,
     MemorySnapshotRefreshPort,
     MemorySyncNotifyPort,
-    SystemPromptRefreshPort,
 )
 from agentos.engine.turn_runner.turn_finalizer_stage import (
     CostRollupResult,
@@ -810,38 +809,6 @@ class _TurnRunnerMemorySnapshotRefreshAdapter(MemorySnapshotRefreshPort):
                 memory_md=runner._load_memory_md(workspace),
                 daily_notes={},  # dropped before injection; see runtime.py
             )
-
-
-class _TurnRunnerSystemPromptRefreshAdapter(SystemPromptRefreshPort):
-    """Rebuild + apply the cacheable system-prompt base after compaction.
-
-    Compaction refresh: extracts the cacheable base from the
-    ``(base, dynamic_suffix)`` tuple returned by ``_assemble_prompt``
-    (when applicable) before invoking ``agent.refresh_system_prompt``.
-    Feeding the tuple directly into ``ChatConfig.system`` would smuggle
-    volatile bytes and raise ``ValidationError`` on the next turn.
-    """
-
-    def __init__(self, runner: TurnRunner) -> None:
-        self._runner = runner
-
-    def refresh_system_prompt(
-        self,
-        *,
-        agent: Agent,
-        agent_id: str,
-        tool_defs: list[Any],
-        session_key: str,
-        bootstrap_context_mode: str | None,
-    ) -> None:
-        assembled = self._runner._assemble_prompt(
-            agent_id,
-            tool_defs,
-            session_key=session_key,
-            bootstrap_context_mode=bootstrap_context_mode,
-        )
-        refreshed_prompt = assembled[0] if isinstance(assembled, tuple) else assembled
-        agent.refresh_system_prompt(refreshed_prompt)
 
 
 class _TurnRunnerMemorySyncNotifyAdapter(MemorySyncNotifyPort):
