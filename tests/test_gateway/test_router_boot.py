@@ -69,6 +69,25 @@ def test_build_task_runtime_run_kwargs_forwards_fresh_user_session() -> None:
     kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
 
     assert kwargs["fresh_user_session"] is True
+    assert "persisted_user_message_id" not in kwargs
+
+
+def test_build_task_runtime_run_kwargs_forwards_the_persisted_user_row() -> None:
+    run = SimpleNamespace(
+        agent_id="main",
+        attachments=[],
+        input_provenance=None,
+        run_kind="session_turn",
+        no_memory_capture=False,
+        fresh_user_session=False,
+        ingress_pipeline_steps=(),
+        semantic_message=None,
+        persisted_user_message_id="msg-follow-up",
+    )
+
+    kwargs = build_task_runtime_run_kwargs(run, tool_context=object(), model="model")
+
+    assert kwargs["persisted_user_message_id"] == "msg-follow-up"
 
 
 def test_gateway_stream_timeouts_allow_long_silent_agent_work() -> None:

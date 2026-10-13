@@ -617,3 +617,160 @@ async def test_fork_points_the_record_at_the_child_copy_of_its_input_row(
         "question\n\n[Runtime context for this turn]\nx",
         "answer",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Follow-ups queued while a turn runs (sessions.send persists them at once)
+# ---------------------------------------------------------------------------
+
+
+class _FollowUpProvider:
+    """Answers each turn with text; during turn 1 a follow-up is persisted,
+    the way ``sessions.send`` appends the user row before the queued run."""
+
+    provider_name = "test"
+
+    def __init__(self, manager: SessionManager) -> None:
+        self.model = "test/model"
+        self.manager = manager
+        self.requests: list[list[Message]] = []
+        self.follow_up_id: str | None = None
+
+    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
+        self.requests.append(list(messages))
+        return self._stream(len(self.requests))
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            row = await self.manager.append_message(KEY, "user", "follow-up while busy")
+            self.follow_up_id = row.message_id
+        yield ProviderText(text=f"answer {call_number}")
+        yield ProviderDone(stop_reason="end_turn", input_tokens=10, output_tokens=1)
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+@pytest.mark.asyncio
+async def test_queued_follow_up_is_replayed_once_after_the_turn_it_interrupted(
+    manager: SessionManager,
+    tmp_path: Path,
+) -> None:
+    provider = _FollowUpProvider(manager)
+    runner = TurnRunner(
+        provider_selector=_Selector(provider),  # type: ignore[arg-type]
+        tool_registry=ToolRegistry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            agentos_router=AgentOSRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(caller_kind=CallerKind.WEB, workspace_dir=str(tmp_path))
+    await manager.create(KEY)
+    first_row = await manager.append_message(KEY, "user", "first question")
+
+    _ = [
+        event
+        async for event in runner.run(
+            "first question",
+            KEY,
+            tool_context=tool_context,
+            persisted_user_message_id=first_row.message_id,
+            no_memory_capture=True,
+        )
+    ]
+    # Transcript order is U1, U2 (queued mid-turn), A1.
+    rows = await manager.get_transcript(KEY)
+    assert [row.content for row in rows[:2]] == ["first question", "follow-up while busy"]
+    assert rows[2].role == "assistant"
+    assert provider.follow_up_id is not None
+
+    _ = [
+        event
+        async for event in runner.run(
+            "follow-up while busy",
+            KEY,
+            tool_context=tool_context,
+            persisted_user_message_id=provider.follow_up_id,
+            no_memory_capture=True,
+        )
+    ]
+    _ = [
+        event
+        async for event in runner.run(
+            "third",
+            KEY,
+            tool_context=tool_context,
+            persisted_user_message_id=(
+                await manager.append_message(KEY, "user", "third")
+            ).message_id,
+            no_memory_capture=True,
+        )
+    ]
+
+    def _texts(messages: list[Message]) -> list[str]:
+        out = []
+        for message in messages:
+            text = (
+                message.content
+                if isinstance(message.content, str)
+                else "".join(getattr(block, "text", "") for block in message.content)
+            )
+            out.append(f"{message.role}:{text.split(chr(10))[0]}")
+        return out
+
+    second = provider.requests[1]
+    assert _texts(second) == [
+        "user:first question",
+        "assistant:answer 1",
+        "user:follow-up while busy",
+    ]
+    third = provider.requests[2]
+    assert _texts(third) == [
+        "user:first question",
+        "assistant:answer 1",
+        "user:follow-up while busy",
+        "assistant:answer 2",
+        "user:third",
+    ]
+    # The second turn's request is still a byte-identical prefix of the third.
+    assert third[: len(second)] == second
+
+
+def test_loader_orders_a_follow_up_after_the_turn_it_interrupted() -> None:
+    user_one = _row("user", "U1")
+    follow_up = _row("user", "U2")
+    reply = _row(
+        "assistant",
+        "A1",
+        provider_messages=encode_transcript_record(
+            TranscriptRecord(
+                messages=[
+                    Message(role="user", content="U1\n\n[Runtime context for this turn]\nt"),
+                    Message(role="assistant", content="A1"),
+                ],
+                input_entry_id=user_one.message_id,
+            )
+        ),
+    )
+
+    without_id = build_history_from_transcript([user_one, follow_up, reply])
+    with_id = build_history_from_transcript(
+        [user_one, follow_up, reply], current_input_id=follow_up.message_id
+    )
+
+    # Without the id the follow-up is the trailing user row (the runtime trims it).
+    assert [m.content for m in without_id.messages] == [
+        "U1\n\n[Runtime context for this turn]\nt",
+        "A1",
+        "U2",
+    ]
+    assert without_id.last_entry_was_user is True
+    assert without_id.last_user_entry is follow_up
+    # With the id it is the turn's input, out of the history.
+    assert [m.content for m in with_id.messages] == [
+        "U1\n\n[Runtime context for this turn]\nt",
+        "A1",
+    ]
+    assert with_id.input_entry is follow_up

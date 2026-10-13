@@ -31,7 +31,7 @@ NEVER terminates. Always returns ``StageOutcome.success(...)``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from agentos.engine.agent import Agent
@@ -65,6 +65,7 @@ class HistoryLoaderPort(Protocol):
         agent: Agent,
         session_key: str,
         trim_last_user: bool,
+        input_message_id: str | None = None,
     ) -> str | None: ...
 
 
@@ -108,6 +109,8 @@ class CompactionAndHistoryStageInput:
     session_key: str
     agent_id: str
     history_has_persisted_user: bool
+    # The persisted user row this turn answers, when the caller knows it.
+    input_message_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -164,10 +167,14 @@ class CompactionAndHistoryStage:
         from agentos.engine.turn_runner.outcome import StageOutcome
 
         # 1. Load history (transcript + structured/legacy messages + durable summary).
+        load_kwargs: dict[str, Any] = {}
+        if inp.input_message_id:
+            load_kwargs["input_message_id"] = inp.input_message_id
         compaction_summary_context = await self._history_loader.load(
             agent=inp.agent,
             session_key=inp.session_key,
             trim_last_user=inp.history_has_persisted_user,
+            **load_kwargs,
         )
 
         # 2. Prepend compaction summary context to request_context_prompt (pure).

@@ -589,7 +589,15 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
         agent: Agent,
         session_key: str,
         trim_last_user: bool,
+        input_message_id: str | None = None,
     ) -> str | None:
+        if input_message_id:
+            return await self._runner._load_history(
+                agent,
+                session_key,
+                trim_last_user=trim_last_user,
+                input_message_id=input_message_id,
+            )
         return await self._runner._load_history(
             agent,
             session_key,

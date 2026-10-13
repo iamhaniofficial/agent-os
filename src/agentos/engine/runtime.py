@@ -2536,6 +2536,7 @@ class TurnRunner:
         no_memory_capture: bool = False,
         ingress_pipeline_steps: list[PipelineStepRecord] | None = None,
         router_control_replay_depth: int = 0,
+        persisted_user_message_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn with full orchestration.
 
@@ -2598,6 +2599,7 @@ class TurnRunner:
                     no_memory_capture=no_memory_capture,
                     ingress_pipeline_steps=ingress_pipeline_steps,
                     router_control_replay_depth=router_control_replay_depth,
+                    persisted_user_message_id=persisted_user_message_id,
                 ):
                     yield event
             finally:
@@ -2638,6 +2640,7 @@ class TurnRunner:
                         no_memory_capture=no_memory_capture,
                         ingress_pipeline_steps=ingress_pipeline_steps,
                         router_control_replay_depth=router_control_replay_depth,
+                        persisted_user_message_id=persisted_user_message_id,
                     ):
                         yield event
                 finally:
@@ -2672,6 +2675,7 @@ class TurnRunner:
         no_memory_capture: bool = False,
         ingress_pipeline_steps: list[PipelineStepRecord] | None = None,
         router_control_replay_depth: int = 0,
+        persisted_user_message_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         # Observability: bracket turn setup + stream loop with monotonic clock
         # so latency_ms reflects the full turn.
@@ -2999,6 +3003,10 @@ class TurnRunner:
                     session_key=session_key,
                     agent_id=agent_id,
                     history_has_persisted_user=history_has_persisted_user,
+                    input_message_id=(
+                        persisted_user_message_id
+                        or getattr(input_out.persisted_entry, "message_id", None)
+                    ),
                 )
             )
             ch_out = ch_outcome.require_output()
@@ -5443,8 +5451,17 @@ class TurnRunner:
         session_key: str,
         *,
         trim_last_user: bool = True,
+        input_message_id: str | None = None,
     ) -> str | None:
-        """Load existing transcript as agent history."""
+        """Load existing transcript as agent history.
+
+        *input_message_id* names the persisted user row this turn answers
+        (``sessions.send`` / the input stage persist it before the run). It is
+        taken out of the history wherever it sits -- a follow-up queued while
+        the previous turn ran is persisted before that turn's reply -- and
+        recorded as the turn's input. Without it the trailing user row is
+        trimmed, as before.
+        """
         if self._session_manager is None:
             return None
 
@@ -5467,16 +5484,23 @@ class TurnRunner:
             summary_marker=_CONTEXT_SUMMARY_MARKER,
             strip_summary_marker=_strip_context_summary_marker,
             legacy_migrate=legacy_migration_for(agent),
+            current_input_id=input_message_id,
         )
         history = loaded.messages
         summary_markers.extend(loaded.summary_markers)
+        input_entry: Any = loaded.input_entry
         # Strip the caller-appended user turn only when the transcript really
         # ended on a user entry; an assistant entry that reconstructs into
         # assistant + user(tool_result) must keep its tool_result tail.
-        input_entry: Any = None
-        if trim_last_user and loaded.last_entry_was_user and history and history[-1].role == "user":
+        if (
+            input_entry is None
+            and trim_last_user
+            and loaded.last_entry_was_user
+            and history
+            and history[-1].role == "user"
+        ):
             history.pop()
-            input_entry = transcript[-1] if transcript else None
+            input_entry = loaded.last_user_entry
         remember_input = getattr(agent, "set_transcript_input_entry_id", None)
         if callable(remember_input):
             input_entry_id = getattr(input_entry, "message_id", None)

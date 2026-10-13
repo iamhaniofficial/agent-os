@@ -337,6 +337,10 @@ class LoadedTranscript:
     reset_entry_id: int | None = None
     structured_entries: int = 0
     legacy_entries: int = 0
+    # The persisted user row of the turn being loaded (``current_input_id``).
+    input_entry: Any = None
+    # The row the trailing user message came from (when it is the last one).
+    last_user_entry: Any = None
 
 
 def build_history_from_transcript(
@@ -347,6 +351,7 @@ def build_history_from_transcript(
     summary_marker: str | None = None,
     strip_summary_marker: Callable[[str], str] = lambda content: content,
     legacy_migrate: Callable[[list[Message]], list[Message]] | None = None,
+    current_input_id: str | None = None,
 ) -> LoadedTranscript:
     """Rebuild provider messages from persisted transcript rows.
 
@@ -354,6 +359,15 @@ def build_history_from_transcript(
     through the legacy reconstruction and *legacy_migrate*. A record that
     names its turn's persisted user row (``input_entry_id``) replaces that row,
     because the record already starts with the turn's input message.
+
+    User rows persisted *between* a record's input row and the record's own
+    row are follow-ups queued while that turn ran (``sessions.send`` persists
+    them at once). They are replayed after the record, where the model met
+    them, not before it.
+
+    *current_input_id* names the persisted user row of the turn being loaded:
+    it is left out of the history (the agent appends it itself) and returned
+    as :attr:`LoadedTranscript.input_entry`, wherever it sits.
     """
     records: dict[int, TranscriptRecord] = {}
     start = 0
@@ -371,12 +385,40 @@ def build_history_from_transcript(
         for index, record in records.items()
         if index >= start and record.input_entry_id
     }
+    position_by_id = {
+        getattr(entry, "message_id", None): index for index, entry in enumerate(entries)
+    }
+    # Follow-ups queued during a turn: user rows between its input row and its
+    # record row move to just after the record.
+    deferred_after: dict[int, list[int]] = {}
+    deferred: set[int] = set()
+    for record_index, record in records.items():
+        if record_index < start or not record.input_entry_id:
+            continue
+        input_index = position_by_id.get(record.input_entry_id)
+        if input_index is None or input_index >= record_index:
+            continue
+        for index in range(max(input_index + 1, start), record_index):
+            entry = entries[index]
+            if (
+                index in deferred
+                or getattr(entry, "role", None) != "user"
+                or getattr(entry, "message_id", None) in covered_input_ids
+            ):
+                continue
+            deferred.add(index)
+            deferred_after.setdefault(record_index, []).append(index)
 
     loaded = LoadedTranscript()
-    for index in range(start, len(entries)):
+
+    def _emit(index: int) -> None:
         entry = entries[index]
         role = getattr(entry, "role", None)
         raw_content = getattr(entry, "content", None) or ""
+        message_id = getattr(entry, "message_id", None)
+        if current_input_id is not None and message_id == current_input_id:
+            loaded.input_entry = entry
+            return
         if (
             role == "system"
             and summary_marker
@@ -384,9 +426,9 @@ def build_history_from_transcript(
             and raw_content.startswith(summary_marker)
         ):
             loaded.summary_markers.append(strip_summary_marker(raw_content))
-            continue
+            return
         if role not in ("user", "assistant"):
-            continue
+            return
         record = records.get(index)
         if record is not None:
             if record.mode == "reset":
@@ -397,10 +439,21 @@ def build_history_from_transcript(
                 loaded.messages.extend(record.messages)
             loaded.structured_entries += 1
             loaded.last_entry_was_user = False
-            continue
-        if role == "user" and getattr(entry, "message_id", None) in covered_input_ids:
+            for follow_up in deferred_after.get(index, ()):
+                _emit_row(follow_up)
+            return
+        if role == "user" and message_id in covered_input_ids:
             loaded.last_entry_was_user = True
-            continue
+            return
+        _emit_row(index)
+
+    def _emit_row(index: int) -> None:
+        entry = entries[index]
+        role = getattr(entry, "role", None)
+        raw_content = getattr(entry, "content", None) or ""
+        if current_input_id is not None and getattr(entry, "message_id", None) == current_input_id:
+            loaded.input_entry = entry
+            return
         if raw_content and role == "user":
             content: Any = unpack_user(raw_content)
         elif raw_content and role == "assistant":
@@ -408,7 +461,7 @@ def build_history_from_transcript(
         else:
             content = raw_content
         rebuilt = reconstruct_messages_from_entry(
-            role,
+            str(role),
             content,
             getattr(entry, "tool_calls", None),
             getattr(entry, "reasoning_content", None),
@@ -419,6 +472,17 @@ def build_history_from_transcript(
                 rebuilt = legacy_migrate(rebuilt)
             loaded.messages.extend(rebuilt)
         loaded.last_entry_was_user = role == "user"
+        loaded.last_user_entry = entry if role == "user" else None
+
+    for index in range(start, len(entries)):
+        if index in deferred:
+            continue
+        _emit(index)
+    if current_input_id is not None and loaded.input_entry is None:
+        # A current input row that predates a reset is still this turn's input.
+        for entry in entries[:start]:
+            if getattr(entry, "message_id", None) == current_input_id:
+                loaded.input_entry = entry
     return loaded
 
 
