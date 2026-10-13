@@ -220,8 +220,23 @@ class CacheBreakMonitor:
         session_key: str,
         snapshot: PromptStateSnapshot,
         cache_read_tokens: int,
+        *,
+        usage_reported: bool = True,
     ) -> CacheBreakReport:
+        """Compare this response's cache reads with the session's baseline.
+
+        ``usage_reported=False`` (the response carried no usage, all-zero
+        usage, or no cache-read figure) means the cache reads are unknown, not
+        zero: no break is concluded and the baseline is left as it was, so the
+        next response that does report usage is compared with the last real one.
+        """
         current_tokens = max(0, int(cache_read_tokens or 0))
+        if not usage_reported:
+            return CacheBreakReport(
+                break_detected=False,
+                reason="cache_usage_unreported",
+                current_cache_read_tokens=current_tokens,
+            )
         previous = self._baselines.get(session_key)
         reset_pending = getattr(previous, "reset_pending", False)
         self._baselines[session_key] = _CacheBaseline(
@@ -319,11 +334,14 @@ def check_response_for_cache_break(
     session_key: str,
     snapshot: PromptStateSnapshot,
     cache_read_tokens: int,
+    *,
+    usage_reported: bool = True,
 ) -> CacheBreakReport:
     return default_cache_break_monitor.check_response_for_cache_break(
         session_key,
         snapshot,
         cache_read_tokens,
+        usage_reported=usage_reported,
     )
 
 

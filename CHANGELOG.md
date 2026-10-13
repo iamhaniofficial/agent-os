@@ -57,6 +57,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (connect 12 s, write 30 s, read = the request timeout; env
   `AGENTOS_LLM_STREAM_CONNECT_TIMEOUT_SECONDS` /
   `AGENTOS_LLM_STREAM_WRITE_TIMEOUT_SECONDS`). (#3648)
+- Claude through OpenCAP now caches the conversation, not only the system
+  prompt and tools: the last user or tool message carries a rolling
+  `cache_control` marker, so each turn reads the previous turn's history
+  from cache instead of re-writing it. Which OpenAI-compatible gateways get
+  Anthropic cache hints is a small table (OpenRouter: request-level
+  `cache_control`, as before; OpenCAP: the rolling marker); api.openai.com,
+  DeepSeek, Gemini, Zhipu and local servers get none. (#3648)
 - OpenAI (api.openai.com): requests carry a `prompt_cache_key` derived from
   the model, system prompt and tools, so turns sharing a prefix are routed to
   the same cache. Not sent to other OpenAI-compatible upstreams. (#3648)
@@ -119,6 +126,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   sessions (canonical `agent:<id>:subagent:<run>` keys included) skip it.
 
 ### Fixed
+- OpenAI-compatible usage split across chunks: OpenCAP sends the cache detail
+  on the finish chunk and a trailing billing chunk without it (sometimes all
+  zeros, sometimes after an `"estimated": true` chunk); only the last chunk
+  was kept, so turns recorded input or cached tokens as 0 and the cache-break
+  monitor logged false `prompt_cache.break_detected` warnings. Usage chunks
+  are now merged (a zero or estimated value never replaces a real one), and
+  the monitor skips responses whose usage carried no cache figure instead of
+  reading them as a cache break. (#3648)
 - Anthropic extended thinking: every thinking delta of a response was joined
   into one block with only the last signature, and `redacted_thinking` blocks
   were dropped, so replaying a multi-block response was a signature mismatch.

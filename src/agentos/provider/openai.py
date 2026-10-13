@@ -8,6 +8,7 @@ import os
 import re
 import sys
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -392,6 +393,61 @@ def _usage_fields(usage: Mapping[str, Any] | None) -> tuple[int, int, int, int, 
     )
 
 
+def _usage_reports_cache_reads(usage: Mapping[str, Any]) -> bool:
+    prompt_details = usage.get("prompt_tokens_details")
+    if isinstance(prompt_details, Mapping) and "cached_tokens" in prompt_details:
+        return True
+    return "prompt_cache_hit_tokens" in usage
+
+
+class _UsageAccumulator:
+    """Merge every usage object a stream carries into one set of counts.
+
+    Gateways split usage across chunks: OpenCAP puts the cache detail
+    (``prompt_tokens_details.cached_tokens`` / ``cache_write_tokens``) on the
+    finish chunk and then sends a trailing billing chunk with only
+    ``prompt_tokens`` / ``completion_tokens`` / ``cost``, sometimes all zeros,
+    and sometimes leads with an ``"estimated": true`` chunk. Keeping only the
+    last chunk recorded cached=0 (or input=0) for a fully cached request.
+
+    Per field, a later non-zero value wins; a zero or missing one never
+    overwrites a non-zero value; a value from an ``estimated`` chunk never
+    overwrites a real one.
+    """
+
+    def __init__(self) -> None:
+        self._values: list[float] = [0, 0, 0, 0, 0, 0.0]
+        self._estimated = [False] * 6
+        #: Whether any real usage object reported cache reads at all; ``False``
+        #: means "unknown", not "zero cache hits".
+        self.cache_reads_reported = False
+
+    def add(self, usage: Mapping[str, Any] | None) -> None:
+        if not isinstance(usage, Mapping) or not usage:
+            return
+        estimated = bool(usage.get("estimated"))
+        if not estimated and _usage_reports_cache_reads(usage):
+            self.cache_reads_reported = True
+        for index, value in enumerate(_usage_fields(usage)):
+            if not value:
+                continue
+            if estimated and self._values[index] and not self._estimated[index]:
+                continue
+            self._values[index] = value
+            self._estimated[index] = estimated
+
+    def fields(self) -> tuple[int, int, int, int, int, float]:
+        values = self._values
+        return (
+            int(values[0]),
+            int(values[1]),
+            int(values[2]),
+            int(values[3]),
+            int(values[4]),
+            float(values[5]),
+        )
+
+
 def _provider_billed_cost(provider_kind: str, raw_billed_cost: float) -> tuple[float, str]:
     """Return trusted provider-billed cost and its source marker."""
     if provider_kind == "openrouter" and raw_billed_cost > 0.0:
@@ -647,17 +703,133 @@ def _openrouter_model_is_anthropic(model: str) -> bool:
     return model.strip().lower().startswith("anthropic/")
 
 
+@dataclass(frozen=True)
+class _AnthropicCacheGateway:
+    """An OpenAI-compatible gateway that forwards cache hints to Anthropic.
+
+    ``style`` says which hint it understands for Claude models:
+
+    - ``"top_level"``: a request-level ``cache_control`` that the gateway turns
+      into Anthropic's automatic caching, whose breakpoint advances with the
+      conversation (OpenRouter).
+    - ``"rolling_block"``: an explicit ``cache_control`` on the last content
+      part of the last user / tool message, moved forward every request, the
+      same rolling marker the Anthropic provider places. Used where the
+      gateway already caches the system prompt and tools on its own (OpenCAP:
+      live captures show ~90% hits on them with no hints), so only the
+      conversation tail needs a marker and the gateway's own markers plus
+      ours stay within Anthropic's limit of four.
+    """
+
+    name: str
+    provider_kinds: frozenset[str]
+    hosts: frozenset[str]
+    model_prefixes: tuple[str, ...]
+    model_substrings: tuple[str, ...]
+    style: str
+
+    def serves(self, provider_kind: str, base_url: str, model: str) -> bool:
+        host = (httpx.URL(base_url).host or "").lower() if base_url else ""
+        if provider_kind not in self.provider_kinds and host not in self.hosts:
+            return False
+        model_l = model.strip().lower()
+        return model_l.startswith(self.model_prefixes) or any(
+            part in model_l for part in self.model_substrings
+        )
+
+
+#: Gateways known to forward cache hints to Anthropic. Add a row to support
+#: another one; every upstream not listed here (api.openai.com, DeepSeek,
+#: Gemini-compatible, Zhipu, local servers) gets no Anthropic-style hints.
+_ANTHROPIC_CACHE_GATEWAYS: tuple[_AnthropicCacheGateway, ...] = (
+    _AnthropicCacheGateway(
+        name="openrouter",
+        provider_kinds=frozenset({"openrouter"}),
+        hosts=frozenset({"openrouter.ai"}),
+        model_prefixes=("anthropic/", "~anthropic/"),
+        model_substrings=(),
+        style="top_level",
+    ),
+    _AnthropicCacheGateway(
+        name="opencap",
+        provider_kinds=frozenset({"opencap"}),
+        hosts=frozenset({"gw.capminal.ai"}),
+        model_prefixes=(),
+        model_substrings=("claude",),
+        style="rolling_block",
+    ),
+)
+
+
+def _anthropic_cache_gateway(
+    *, provider_kind: str, base_url: str, model: str, cfg: ChatConfig
+) -> _AnthropicCacheGateway | None:
+    if cfg.cache_mode not in {"auto", "on"}:
+        return None
+    for gateway in _ANTHROPIC_CACHE_GATEWAYS:
+        if gateway.serves(provider_kind, base_url, model):
+            return gateway
+    return None
+
+
 def _openrouter_anthropic_should_use_top_level_cache(
     *,
     provider_kind: str,
     model: str,
     cfg: ChatConfig,
+    base_url: str = "",
 ) -> bool:
-    return (
-        provider_kind == "openrouter"
-        and cfg.cache_mode in {"auto", "on"}
-        and _openrouter_model_is_anthropic(model)
+    gateway = _anthropic_cache_gateway(
+        provider_kind=provider_kind, base_url=base_url, model=model, cfg=cfg
     )
+    return gateway is not None and gateway.style == "top_level"
+
+
+#: Anthropic accepts at most this many ``cache_control`` markers per request.
+_MAX_CACHE_BREAKPOINTS = 4
+
+
+def _count_cache_markers(value: Any) -> int:
+    if isinstance(value, list):
+        return sum(_count_cache_markers(item) for item in value)
+    if isinstance(value, dict):
+        own = 1 if value.get("cache_control") else 0
+        return own + sum(_count_cache_markers(v) for k, v in value.items() if k != "cache_control")
+    return 0
+
+
+def _mark_rolling_cache_breakpoint(openai_messages: list[dict[str, Any]]) -> bool:
+    """Put ``cache_control`` on the last text part of the last user/tool message.
+
+    A string content becomes one text part carrying the marker (the same
+    prompt for the gateway's Anthropic translation). Returns whether a marker
+    was placed; nothing is placed past Anthropic's limit of four.
+    """
+    if _count_cache_markers(openai_messages) >= _MAX_CACHE_BREAKPOINTS:
+        return False
+    for message in reversed(openai_messages):
+        role = message.get("role")
+        if role == "assistant":
+            # Cache the prefix up to the newest *input*; an assistant tail
+            # (prefill) is not something the next request repeats.
+            continue
+        if role not in {"user", "tool"}:
+            return False
+        content = message.get("content")
+        if isinstance(content, str):
+            if not content:
+                return False
+            message["content"] = [
+                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+            ]
+            return True
+        if isinstance(content, list):
+            for part in reversed(content):
+                if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+                    part["cache_control"] = {"type": "ephemeral"}
+                    return True
+        return False
+    return False
 
 
 def _stable_json_hash(value: Any) -> str:
@@ -1060,8 +1232,17 @@ class OpenAIProvider:
                 provider_kind=self._provider_kind,
                 model=self._model,
                 cfg=cfg,
+                base_url=self._base_url,
             ):
                 payload["cache_control"] = {"type": "ephemeral"}
+        cache_gateway = _anthropic_cache_gateway(
+            provider_kind=self._provider_kind,
+            base_url=self._base_url,
+            model=self._model,
+            cfg=cfg,
+        )
+        if cache_gateway is not None and cache_gateway.style == "rolling_block":
+            _mark_rolling_cache_breakpoint(openai_messages)
         if _should_send_temperature(
             self._provider_kind,
             self._base_url,
@@ -1211,6 +1392,7 @@ class OpenAIProvider:
         pending_calls: dict[int, dict[str, Any]] = {}
         reasoning_parts: list[str] = []
         reasoning_details: list[dict[str, Any]] = []
+        usage_acc = _UsageAccumulator()
         saw_done_marker = False
         idle_timeout = resolve_stream_idle_timeout(cfg.stream_idle_timeout)
         assistant_text_parts: list[str] = []
@@ -1342,8 +1524,10 @@ class OpenAIProvider:
                     if chunk_model:
                         actual_model = chunk_model
 
-                    # Usage may appear in the final chunk
+                    # Usage may appear in the final chunk, or be split across
+                    # several (see _UsageAccumulator).
                     if chunk.get("usage"):
+                        usage_acc.add(chunk["usage"])
                         (
                             input_tokens,
                             output_tokens,
@@ -1351,7 +1535,7 @@ class OpenAIProvider:
                             cached_tokens,
                             cache_write_tokens,
                             raw_billed_cost,
-                        ) = _usage_fields(chunk["usage"])
+                        ) = usage_acc.fields()
                         billed_cost, cost_source = _provider_billed_cost(
                             self._provider_kind,
                             raw_billed_cost,
@@ -1537,6 +1721,7 @@ class OpenAIProvider:
                     model=actual_model,
                     cost_source=cost_source,
                     reasoning_details=reasoning_details or None,
+                    cache_usage_reported=usage_acc.cache_reads_reported,
                 )
 
         except StreamIdleTimeoutError as exc:
@@ -1628,6 +1813,10 @@ class OpenAIProvider:
             cache_write_tokens,
             raw_billed_cost,
         ) = _usage_fields(data.get("usage"))
+        raw_usage = data.get("usage")
+        cache_usage_reported = isinstance(raw_usage, Mapping) and _usage_reports_cache_reads(
+            raw_usage
+        )
         billed_cost, cost_source = _provider_billed_cost(self._provider_kind, raw_billed_cost)
         stop_reason: str | None = None
         assistant_text_parts: list[str] = []
@@ -1709,6 +1898,7 @@ class OpenAIProvider:
             model=actual_model,
             cost_source=cost_source,
             reasoning_details=message_reasoning_details or None,
+            cache_usage_reported=cache_usage_reported,
         )
 
     async def list_models(self) -> list[ModelInfo]:
