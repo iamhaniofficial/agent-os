@@ -129,12 +129,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   back to a deterministic digest and logs its error type. A compaction that
   would take less than 10% off the request is not applied -- no durable
   rewrite, one `compaction.declined` log line, the request goes out as is,
-  and the turn does not retry it at about the same size. Manual `/compact`
+  and the turn does not retry it at about the same size; when the system
+  prompt and tools alone exceed the limit the reason is
+  `fixed_context_too_large`, with a hint that the ratio or window is set too
+  low. Manual `/compact`
   summarizes through the session's `LLMProvider` instead of raw HTTP. A durable checkpoint is
   recorded before any compaction rewrites stored rows; subagent and cron
   sessions (canonical `agent:<id>:subagent:<run>` keys included) skip it.
 
 ### Fixed
+- Engine: the request right after an in-turn compaction lost most of its
+  system prompt (the Skills and Local Toolchain sections, ~60% of it in a
+  live session) because the compaction rebuilt the prompt without the
+  per-turn pipeline steps; the next turn had the full prompt again, so the
+  prompt cache missed twice. The summary is a message now, so nothing in the
+  system prompt depends on compaction and the rebuild is gone: the system
+  prompt stays byte-identical across a compaction.
 - OpenAI-compatible usage split across chunks: OpenCAP sends the cache detail
   on the finish chunk and a trailing billing chunk without it (sometimes all
   zeros, sometimes after an `"estimated": true` chunk); only the last chunk

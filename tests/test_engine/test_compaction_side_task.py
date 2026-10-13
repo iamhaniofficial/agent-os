@@ -247,3 +247,82 @@ async def test_retry_after_a_thinking_only_attempt_shows_each_thinking_delta_onc
         "read the file",
     ]
     assert any(isinstance(event, DoneEvent) and event.text == "answer" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_fixed_context_over_the_limit_is_its_own_decline_reason() -> None:
+    from agentos.engine.compaction_service import CompactionService
+
+    calls: list[Any] = []
+
+    async def _summarizer(messages: list[Message], previous: str | None) -> tuple[str, str]:
+        calls.append(messages)
+        return "s", "llm"
+
+    messages = [
+        Message(role="user", content="old " + "x" * 8000),
+        Message(role="assistant", content="answer"),
+        Message(role="user", content="now"),
+    ]
+
+    def _tokens(items: Any) -> int:
+        return sum(len(str(m.content)) for m in items) // 4
+
+    with structlog.testing.capture_logs() as logs:
+        result = await CompactionService(provider=None, summarizer=_summarizer).compact(
+            messages,
+            turn_input_index=2,
+            # 30k tokens of system prompt + tools against a 1,000 x 0.85 limit.
+            estimated_tokens=_tokens(messages) + 30_000,
+            window_tokens=1_000,
+            message_tokens=_tokens,
+        )
+
+    assert result.status == "skipped"
+    assert result.reason == "fixed_context_too_large"
+    assert calls == []
+    (declined,) = [log for log in logs if log["event"] == "compaction.declined"]
+    assert declined["reason"] == "fixed_context_too_large"
+    assert "preflight_compact_ratio" in declined["hint"]
+    assert declined["fixed_tokens"] >= 30_000
+
+
+@pytest.mark.asyncio
+async def test_each_response_logs_estimate_against_provider_input_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agentos.engine.agent as agent_module
+
+    debug_events: list[dict[str, Any]] = []
+    real_logger = agent_module.logger
+
+    class _Logger:
+        def debug(self, event: str, **kwargs: Any) -> None:
+            debug_events.append({"event": event, **kwargs})
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_logger, name)
+
+    # Independent of the process-wide structlog level filter.
+    monkeypatch.setattr(agent_module, "logger", _Logger())
+
+    class _Provider:
+        provider_name = "fake"
+
+        def chat(self, messages, tools=None, config=None) -> AsyncIterator[Any]:
+            async def _stream() -> AsyncIterator[Any]:
+                yield ProviderText(text="ok")
+                yield ProviderDone(
+                    stop_reason="end_turn", input_tokens=1234, output_tokens=1, cached_tokens=7
+                )
+
+            return _stream()
+
+    agent = Agent(provider=_Provider(), config=AgentConfig())
+
+    _ = [event async for event in agent.run_turn("hello")]
+
+    (drift,) = [log for log in debug_events if log["event"] == "agent.context_estimate_vs_provider"]
+    assert drift["provider_input_tokens"] == 1234
+    assert drift["provider_cached_tokens"] == 7
+    assert drift["estimated_tokens"] > 0

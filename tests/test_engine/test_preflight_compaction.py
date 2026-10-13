@@ -32,6 +32,8 @@ from agentos.gateway.config import AgentOSRouterConfig, AttachmentsConfig, Gatew
 from agentos.provider import DoneEvent as ProviderDone
 from agentos.provider import Message
 from agentos.provider import TextDeltaEvent as ProviderText
+from agentos.provider import ToolUseEndEvent as ProviderToolUseEnd
+from agentos.provider import ToolUseStartEvent as ProviderToolUseStart
 from agentos.session.manager import SessionManager
 from agentos.session.storage import SessionStorage
 from agentos.tools.registry import ToolRegistry
@@ -327,3 +329,78 @@ async def test_checkpoint_failure_prevents_the_destructive_rewrite(
         session_key=KEY, status="checkpoint_failed", limit=5
     )
     assert failed
+
+
+class _ToolThenAnswerProvider(_Provider):
+    """Turn requests: a tool call first, then the answer. Records the system
+    prompt each turn request carried."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.systems: list[str] = []
+
+    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
+        system = str(getattr(config, "system", "") or "")
+        if system.startswith("You are a conversation compactor"):
+            self.summarizer_requests.append(list(messages))
+            return self._stream(SUMMARY)
+        self.turn_requests.append(list(messages))
+        self.systems.append(system)
+        return self._turn_stream(len(self.turn_requests))
+
+    async def _turn_stream(self, call: int) -> AsyncIterator[Any]:
+        if call == 1:
+            yield ProviderToolUseStart(tool_use_id="look-1", tool_name="lookup")
+            yield ProviderToolUseEnd(
+                tool_use_id="look-1", tool_name="lookup", arguments={"q": "logs"}
+            )
+            yield ProviderDone(stop_reason="tool_use", input_tokens=10, output_tokens=1)
+            return
+        yield ProviderText(text="answer")
+        yield ProviderDone(stop_reason="end_turn", input_tokens=10, output_tokens=1)
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_is_identical_across_a_mid_turn_compaction(
+    tmp_path: Path,
+    storages: list[SessionStorage],
+) -> None:
+    """The compaction summary is a message: the request after a compaction
+    carries exactly the system prompt the one before did (the old prompt
+    rebuild dropped the pipeline-added sections such as Skills)."""
+    from agentos.tools.registry import ToolSpec
+
+    manager = await _manager(tmp_path, storages)
+    provider = _ToolThenAnswerProvider()
+    _AUX_PROVIDER["provider"] = provider
+    # 200k window, ratio 0.1: the first request is under the 20k-token limit,
+    # the second one (with a 40k-char tool result) is over it.
+    runner = _runner(provider, manager, tmp_path, ratio=0.1, context_window=200_000)
+    registry = ToolRegistry()
+
+    async def lookup(q: str) -> str:
+        return "L" * 40_000
+
+    registry.register(
+        ToolSpec(
+            name="lookup",
+            description="Look something up",
+            parameters={
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": ["q"],
+            },
+        ),
+        lookup,
+    )
+    runner._tool_registry = registry
+    await _seed(manager, KEY, rounds=3)
+
+    events = await _turn(runner, manager, KEY, "check the logs", tmp_path)
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert len(provider.summarizer_requests) >= 1  # compacted between the two calls
+    assert str(provider.turn_requests[1][0].content).startswith("[Context summary]")
+    assert not str(provider.turn_requests[0][0].content).startswith("[Context summary]")
+    before, after = provider.systems
+    assert after == before

@@ -671,6 +671,23 @@ class CompactionService:
         folded_current = current[input_end:keep_from] if keep_from else []
         kept_current = current[:input_end] + current[keep_from:] if keep_from else current
         to_fold = prefix + folded_current
+        if not force and overhead > limit:
+            # System prompt + tools alone are over the limit: no compaction
+            # can help, and blaming the current turn would mislead.
+            return self._decline(
+                unchanged,
+                compaction_id,
+                "fixed_context_too_large",
+                tokens_before=estimated_tokens,
+                fixed_tokens=overhead,
+                limit_tokens=int(limit),
+                context_window_tokens=window_tokens,
+                hint=(
+                    "system prompt and tool definitions alone exceed the compaction "
+                    "limit; preflight_compact_ratio or the model context window is "
+                    "set too low"
+                ),
+            )
         if not force and overhead + message_tokens(kept_current) > limit:
             # Preflight: the kept current turn alone is over the limit (a
             # single huge tool result of this turn, say), so summarizing --

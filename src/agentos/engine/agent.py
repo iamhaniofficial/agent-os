@@ -181,7 +181,12 @@ _PROVIDER_REFUSAL_REPLY = "The model declined to respond to this request."
 # CompactionService outcomes that leave the transcript untouched because
 # compacting would not help this turn; not retried at the same size.
 _COMPACTION_DECLINE_REASONS = frozenset(
-    {"current_turn_too_large", "not_worth_compacting", "compaction_not_smaller"}
+    {
+        "fixed_context_too_large",
+        "current_turn_too_large",
+        "not_worth_compacting",
+        "compaction_not_smaller",
+    }
 )
 
 
@@ -1269,29 +1274,6 @@ class Agent:
     def state(self) -> AgentState:
         return self._state
 
-    def refresh_system_prompt(self, new_prompt: str) -> None:
-        """Update system prompt mid-turn (called after compaction to reflect fresh memory)."""
-        # Invariant: this mutates `_context.system_prompt`, but
-        # `chat_cfg.system` passed to the provider is snapshotted at
-        # turn-start (see run_turn below). Refreshes therefore only take
-        # effect on subsequent turns — never mid-turn — so memory_save
-        # cannot swap the system prompt under an in-flight provider call.
-        if self.config.system_prompt is not None:
-            self.config.system_prompt = new_prompt
-            if self._context is not None:
-                self._context.system_prompt = new_prompt
-            # cache_breakpoints carry the previous base's
-            # text and would mismatch the refreshed prompt on the next
-            # provider call (chat_cfg.system would be new_prompt while
-            # chat_cfg.cache_breakpoints[0]['text'] still pointed at the
-            # pre-compaction base). Re-anchor breakpoints on the new prompt.
-            # Callers (TurnRunner compaction-refresh) MUST pass only the
-            # cacheable base here — if ``_assemble_prompt`` returns a
-            # tuple, the dynamic suffix is dropped before this call so
-            # ``new_prompt`` is byte-identical to the next turn's base.
-            if self.config.cache_breakpoints:
-                self.config.cache_breakpoints = [{"text": new_prompt, "cache": "true"}]
-
     def clear_history(self) -> None:
         self._history = []
 
@@ -1845,9 +1827,8 @@ class Agent:
                         turn_messages = overflow_outcome.messages
                         sealed_len = len(turn_messages)
                         turn_input_index = overflow_outcome.turn_input_index
-                        # The stream consumer persists the compaction and
-                        # refreshes the system prompt while handling this event,
-                        # so the request below is rebuilt after it.
+                        # The stream consumer persists the compaction while
+                        # handling this event; the system prompt is unchanged.
                         yield CompactionEvent(
                             compaction_id=overflow_outcome.compaction_id,
                             summary=overflow_outcome.summary,
@@ -1856,24 +1837,6 @@ class Agent:
                             removed_count=overflow_outcome.removed_count,
                         )
                         overflow_retries = 0  # reset on success
-                        # Read cache_breakpoints from the refreshed self.config
-                        # (re-anchored by refresh_system_prompt):
-                        # chat_cfg.cache_breakpoints still holds the
-                        # pre-compaction base text and would miss the cache.
-                        chat_cfg = chat_cfg.model_copy(
-                            update={
-                                "system": self._context.system_prompt,
-                                "cache_breakpoints": (
-                                    self._cache_breakpoints_without_runtime_context(
-                                        self.config.cache_breakpoints
-                                    )
-                                ),
-                                "provider_request_max_chars": (
-                                    self._provider_request_proof_max_chars()
-                                ),
-                            }
-                        )
-                        call_chat_cfg = chat_cfg
                         request_messages = self._provider_request_messages(
                             turn_messages,
                             finalization_message=(
@@ -2018,6 +1981,17 @@ class Agent:
                             elif isinstance(raw_ev, ProviderDoneEvent):
                                 provider_done_for_log = raw_ev
                                 _got_done_event = True
+                                # Make the estimator's drift visible: the
+                                # compaction trigger runs on this estimate.
+                                logger.debug(
+                                    "agent.context_estimate_vs_provider",
+                                    session_key=self._session_key,
+                                    call_id=call_id,
+                                    estimated_tokens=estimated_context_tokens,
+                                    provider_input_tokens=raw_ev.input_tokens,
+                                    provider_cached_tokens=raw_ev.cached_tokens,
+                                    provider_cache_write_tokens=raw_ev.cache_write_tokens,
+                                )
                                 iter_input_tokens = raw_ev.input_tokens
                                 iter_output_tokens = raw_ev.output_tokens
                                 iter_reasoning_tokens = raw_ev.reasoning_tokens

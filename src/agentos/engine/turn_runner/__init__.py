@@ -69,7 +69,6 @@ from agentos.engine.turn_runner.stream_consumer_stage import (
     MemorySyncNotifyPort,
     StreamConsumerStage,
     StreamConsumerStageInput,
-    SystemPromptRefreshPort,
     WarningTransformer,
 )
 from agentos.engine.turn_runner.turn_finalizer_stage import (
@@ -129,7 +128,6 @@ __all__ = [
     "StageOutcome",
     "StreamConsumerStage",
     "StreamConsumerStageInput",
-    "SystemPromptRefreshPort",
     "TimeoutBudgetPort",
     "ToolBuilderPort",
     "TranscriptAppendPort",
