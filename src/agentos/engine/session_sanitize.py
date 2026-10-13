@@ -22,7 +22,11 @@ from agentos.provider import (
     ContentBlockToolUse,
     Message,
 )
-from agentos.provider.types import ContentBlockDocument, ContentBlockImage
+from agentos.provider.types import (
+    ContentBlockDocument,
+    ContentBlockImage,
+    ContentBlockRedactedThinking,
+)
 
 _BLOCK_FIELDS: dict[str, set[str]] = {
     "text": {"type", "text"},
@@ -31,6 +35,7 @@ _BLOCK_FIELDS: dict[str, set[str]] = {
     "image": {"type", "source_type", "media_type", "data"},
     "document": {"type", "source_type", "media_type", "data", "title"},
     "thinking": {"type", "thinking", "signature"},
+    "redacted_thinking": {"type", "data"},
 }
 
 _BLOCK_MODELS: dict[str, type[BaseModel]] = {
@@ -40,6 +45,7 @@ _BLOCK_MODELS: dict[str, type[BaseModel]] = {
     "image": ContentBlockImage,
     "document": ContentBlockDocument,
     "thinking": ContentBlockThinking,
+    "redacted_thinking": ContentBlockRedactedThinking,
 }
 
 _HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX = "[historical_tool_argument_omitted]\n"
@@ -149,14 +155,22 @@ def project_historical_tool_payloads(
         ):
             reasoning_chars_removed += len(message.reasoning_content)
             next_reasoning = None
+        next_details = message.reasoning_details
+        if message.role == "assistant" and next_details and not preserve_reasoning_content:
+            next_details = None
 
-        if content_changed or next_reasoning != message.reasoning_content:
+        if (
+            content_changed
+            or next_reasoning != message.reasoning_content
+            or next_details is not message.reasoning_details
+        ):
             touched = True
             projected.append(
                 Message(
                     role=message.role,
                     content=next_content,
                     reasoning_content=next_reasoning,
+                    reasoning_details=next_details,
                 )
             )
         else:
@@ -201,6 +215,7 @@ def sanitize_session_messages(
                     role=message.role,
                     content=content,
                     reasoning_content=message.reasoning_content,
+                    reasoning_details=message.reasoning_details,
                 )
             )
         else:

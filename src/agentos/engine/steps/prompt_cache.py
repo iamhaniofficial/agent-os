@@ -65,6 +65,9 @@ async def apply_prompt_cache(ctx: TurnContext) -> TurnContext:
     log.debug("prompt_cache.applying")
     ctx.metadata["cache_enabled"] = True
     ctx.metadata["cache_mode"] = mode
+    ttl = getattr(cache_cfg, "ttl", None)
+    if ttl in {"5m", "1h"}:
+        ctx.metadata["cache_ttl"] = ttl
     _record_dual_track_key_metrics(ctx)
 
     if isinstance(ctx.system_prompt, tuple) and len(ctx.system_prompt) == 2:

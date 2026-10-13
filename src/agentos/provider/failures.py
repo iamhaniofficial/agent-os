@@ -176,6 +176,14 @@ def _names_a_missing_model(text: str) -> bool:
     return "model" in text and any(marker in text for marker in _MISSING_MARKERS)
 
 
+#: Stream-shape errors raised by ``provider/transport.py``. A stalled stream
+#: that showed nothing yet is a transport blip and is retried; a stream cut
+#: after partial output (or a tool stream the provider already retried) is
+#: surfaced, because retrying would duplicate what the caller already has.
+_STREAM_TRANSIENT_CODES = frozenset({"stream_idle_timeout"})
+_STREAM_SURFACED_CODES = frozenset({"incomplete_tool_stream", "stream_interrupted_after_output"})
+
+
 def classify_provider_error(
     provider_name: str,
     status_code: int | None,
@@ -186,6 +194,11 @@ def classify_provider_error(
 
     provider = (provider_name or "").lower()
     text = _joined(status_code, raw_code, message)
+    normalized_code = (raw_code or "").strip().lower()
+    if normalized_code in _STREAM_TRANSIENT_CODES:
+        return ProviderFailureKind.TRANSPORT_TRANSIENT
+    if normalized_code in _STREAM_SURFACED_CODES:
+        return ProviderFailureKind.MALFORMED_RESPONSE
 
     if _is_context_overflow(text):
         return ProviderFailureKind.CONTEXT_OVERFLOW

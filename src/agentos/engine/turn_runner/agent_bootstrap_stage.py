@@ -388,6 +388,7 @@ class AgentBootstrapStage:
             cache_breakpoints=inp.cache_breakpoints,
             request_context_prompt=inp.request_context_prompt,
             cache_mode=inp.turn.metadata.get("cache_mode", "off"),
+            cache_ttl=inp.turn.metadata.get("cache_ttl"),
             skills_context_prompt=inp.turn.metadata.get("skills_context_prompt"),
             model_id=inp.resolved_model,
             workspace_dir=inp.turn.metadata.get("bootstrap_workspace_dir") or None,

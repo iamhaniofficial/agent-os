@@ -635,7 +635,28 @@ simultaneous sessions.
 For Ollama models that do not reliably support native tool calls, set
 `tools.enabled = false` in the config file to run in plain-text mode. Keep it
 enabled for tool-capable cloud models such as `glm-5.2:cloud`; the Ollama
-provider preserves native tool-call history between turns.
+provider preserves native tool-call history between turns. Ollama is sent the
+agent's context window as `num_ctx` (its own default is a few thousand tokens
+and silently drops the start of a long prompt); set `AGENTOS_OLLAMA_NUM_CTX`
+to override it, e.g. to fit a smaller GPU.
+
+Prompt caching is controlled by `[prompt_cache]`: `mode` (`auto`, `on`,
+`off`) and `ttl`. With `ttl = "1h"` Anthropic keeps the cached system prompt
+and tool list for an hour instead of five minutes; a cache write then costs
+2x the input price instead of 1.25x, which pays off when a session pauses
+longer than five minutes between requests:
+
+```sh
+agentos config set prompt_cache.ttl 1h
+```
+
+Model streams have their own timeouts, read from the environment:
+`AGENTOS_LLM_STREAM_CONNECT_TIMEOUT_SECONDS` (default 12),
+`AGENTOS_LLM_STREAM_WRITE_TIMEOUT_SECONDS` (default 30) and
+`AGENTOS_LLM_STREAM_IDLE_TIMEOUT_SECONDS` (default 120; `0` turns it off). The
+idle timeout starts once the model has begun streaming and ends a stream that
+then goes silent with a retriable error, instead of waiting for the much
+longer per-iteration timeout.
 
 More detail:
 
