@@ -16,6 +16,7 @@ from agentos.engine import (
     ErrorEvent,
     RunHeartbeatEvent,
     SubagentSpec,
+    TextDeltaEvent,
     ToolCall,
     ToolResult,
     WarningEvent,
@@ -1090,13 +1091,248 @@ async def test_inline_overflow_still_triggers_for_large_live_provider_request(
         ),
         tool_definitions=[large_tool],
     )
+    agent.set_history(
+        [
+            Message(role="user", content="earlier question"),
+            Message(role="assistant", content="earlier answer"),
+        ]
+    )
     monkeypatch.setattr(agent_module, "compact_context", _compact)
 
     events = [event async for event in agent.run_turn("hello")]
 
     assert any(isinstance(event, DoneEvent) for event in events)
     assert len(provider.calls) == 1
+    # The check runs before the call, over the history the request carries;
+    # this turn's input is not folded into the compaction.
     assert len(compact_requests) == 1
+    assert [entry["content"] for entry in compact_requests[0].entries] == [
+        "earlier question",
+        "earlier answer",
+    ]
+
+
+class _TextThenToolProvider:
+    """Streams visible text plus a tool call, then a plain final answer."""
+
+    provider_name = "fake"
+
+    def __init__(self, *, tool_rounds: int = 1) -> None:
+        self.tool_rounds = tool_rounds
+        self.calls: list[list[Message]] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.calls.append(list(messages))
+        return self._stream(len(self.calls))
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number > self.tool_rounds:
+            yield ProviderText(text="done")
+            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+            return
+        yield ProviderText(text=f"reply-{call_number}")
+        tool_use_id = f"read-{call_number}"
+        yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="exec_command")
+        yield ProviderToolUseEnd(
+            tool_use_id=tool_use_id,
+            tool_name="exec_command",
+            arguments={"command": f"printf round-{call_number}"},
+        )
+        yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+async def _ok_tool(call: Any) -> ToolResult:
+    return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="ok")
+
+
+_LARGE_HISTORY = [
+    Message(role="user", content="old question " + ("h" * 8000)),
+    Message(role="assistant", content="old answer " + ("a" * 8000)),
+]
+
+
+def _overflowing_agent(provider: Any, *, max_overflow_retries: int, **config: Any) -> Agent:
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            context_window_tokens=2000,
+            context_overflow_threshold=0.5,
+            max_provider_retries=0,
+            max_overflow_retries=max_overflow_retries,
+            max_iterations=10,
+            **config,
+        ),
+        tool_handler=_ok_tool,
+    )
+    agent.set_history(list(_LARGE_HISTORY))
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_failed_overflow_compaction_never_replays_a_streamed_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3644: the overflow check used to run after the response had streamed.
+
+    A failed compaction then re-called the provider for the same iteration, so
+    the consumer saw the first reply's text and tool_use twice.
+    """
+    compact_calls: list[int] = []
+
+    async def _failing_compact(request: Any) -> CompactionResult:
+        compact_calls.append(len(request.entries))
+        raise RuntimeError("summarizer unavailable")
+
+    monkeypatch.setattr("agentos.engine.agent.compact_context", _failing_compact)
+    provider = _TextThenToolProvider(tool_rounds=1)
+    agent = _overflowing_agent(provider, max_overflow_retries=2)
+
+    events = [event async for event in agent.run_turn("read the file")]
+
+    texts = [event.text for event in events if isinstance(event, TextDeltaEvent)]
+    tool_starts = [event for event in events if getattr(event, "kind", None) == "tool_use_start"]
+    assert len(provider.calls) == 2
+    assert texts == ["reply-1", "done"]
+    assert len(tool_starts) == 1
+    assert len(compact_calls) == 2
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert "done" in done.text
+
+
+@pytest.mark.asyncio
+async def test_overflow_compaction_runs_before_the_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentos.engine.types import CompactionEvent
+
+    async def _effective_compact(request: Any) -> CompactionResult:
+        return CompactionResult(
+            summary="short summary",
+            kept_entries=[],
+            removed_count=len(request.entries),
+            chunks_processed=1,
+        )
+
+    prompt_states: list[list[Message]] = []
+
+    def _record_prompt_state(*, messages: list[Message], **_kwargs: Any) -> None:
+        prompt_states.append(list(messages))
+        return None
+
+    monkeypatch.setattr("agentos.engine.agent.compact_context", _effective_compact)
+    monkeypatch.setattr("agentos.engine.agent.record_prompt_state", _record_prompt_state)
+    monkeypatch.setattr("agentos.engine.agent.notify_compaction", lambda *_a, **_k: None)
+    provider = _TextThenToolProvider(tool_rounds=0)
+    agent = _overflowing_agent(provider, max_overflow_retries=2)
+    agent._session_key = "agent:main:preflight"
+
+    events = [event async for event in agent.run_turn("read the file")]
+
+    assert len(provider.calls) == 1
+    sent = [m.content for m in provider.calls[0] if isinstance(m.content, str)]
+    assert sent[:2] == ["[Context summary]\nshort summary", "Understood. Continuing from summary."]
+    assert sent[-1].startswith("read the file")
+    assert not any("h" * 8000 in content for content in sent)
+    # The cache-break monitor's baseline is the compacted request that was sent.
+    assert prompt_states == [provider.calls[0]]
+    compaction_index = _event_index(events, lambda event: isinstance(event, CompactionEvent))
+    text_index = _event_index(events, lambda event: isinstance(event, TextDeltaEvent))
+    assert compaction_index < text_index
+    compaction = events[compaction_index]
+    assert compaction.removed_count == 2
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == ["done"]
+
+
+@pytest.mark.asyncio
+async def test_overflow_compaction_keeps_unseen_tool_results_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_requests: list[Any] = []
+
+    async def _effective_compact(request: Any) -> CompactionResult:
+        compact_requests.append(request)
+        return CompactionResult(
+            summary="short summary",
+            kept_entries=[],
+            removed_count=len(request.entries),
+            chunks_processed=1,
+        )
+
+    monkeypatch.setattr("agentos.engine.agent.compact_context", _effective_compact)
+    provider = _TextThenToolProvider(tool_rounds=1)
+    # Only the second call overflows: the first sees the small history alone.
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            context_window_tokens=2000,
+            context_overflow_threshold=0.5,
+            max_provider_retries=0,
+            max_overflow_retries=2,
+        ),
+        tool_handler=_big_tool,
+    )
+    agent.set_history([Message(role="user", content="q"), Message(role="assistant", content="a")])
+
+    events = [event async for event in agent.run_turn("read the file")]
+
+    assert len(provider.calls) == 2
+    assert len(compact_requests) == 1
+    # Compaction covered what the first request carried, not the new tool turn.
+    assert [entry["content"] for entry in compact_requests[0].entries] == [
+        "q",
+        "a",
+        "read the file",
+    ]
+    second = provider.calls[1]
+    tool_results = [
+        block
+        for message in second
+        if isinstance(message.content, list)
+        for block in message.content
+        if getattr(block, "type", None) == "tool_result"
+    ]
+    # Still a structured tool_result, not the 200-char text flattening.
+    assert [block.tool_use_id for block in tool_results] == ["read-1"]
+    assert "r" * 1000 in str(tool_results[0].content)
+    assert any(isinstance(event, DoneEvent) for event in events)
+
+
+async def _big_tool(call: Any) -> ToolResult:
+    return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="r" * 6000)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("max_overflow_retries", "expected_calls"), [(0, 0), (1, 1)])
+async def test_exhausted_overflow_retries_stop_before_the_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+    max_overflow_retries: int,
+    expected_calls: int,
+) -> None:
+    async def _failing_compact(request: Any) -> CompactionResult:
+        raise RuntimeError("summarizer unavailable")
+
+    monkeypatch.setattr("agentos.engine.agent.compact_context", _failing_compact)
+    provider = _TextThenToolProvider(tool_rounds=3)
+    agent = _overflowing_agent(provider, max_overflow_retries=max_overflow_retries)
+
+    events = [event async for event in agent.run_turn("read the file")]
+
+    assert len(provider.calls) == expected_calls
+    error_index = _event_index(events, lambda event: isinstance(event, ErrorEvent))
+    assert events[error_index].code == "compaction_failed"
+    # Nothing streams after the terminal error, and nothing streamed twice.
+    assert not any(isinstance(event, TextDeltaEvent) for event in events[error_index:])
+    texts = [event.text for event in events if isinstance(event, TextDeltaEvent)]
+    assert texts == [f"reply-{n}" for n in range(1, expected_calls + 1)]
 
 
 @pytest.mark.asyncio

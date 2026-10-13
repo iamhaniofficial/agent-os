@@ -1894,6 +1894,11 @@ class Agent:
         # caches from messages[0].
         request_context_insert_index = len(turn_messages)
         runtime_context_insert_index = len(turn_messages)
+        # How many leading turn_messages a provider request has already carried.
+        # Preflight compaction only folds these into the summary: this turn's
+        # input and anything appended after the last call (the reply and its
+        # tool results) reach the provider intact.
+        provider_seen_message_count = len(turn_messages)
         if extra_messages:
             turn_messages.extend(extra_messages)
         # Only append text message if non-empty (multimodal may use extra_messages instead)
@@ -2302,6 +2307,107 @@ class Agent:
                         break
 
                     call_chat_cfg = chat_cfg
+
+                    # Check overflow against the live provider request before it
+                    # is sent, not after it streamed: once text or tool_use
+                    # events are out, re-calling the provider replays them to
+                    # the stream consumer (#3644).
+                    estimated_context_tokens = self._estimate_live_request_tokens(
+                        request_messages,
+                        tools=provider_tools_for_call,
+                        config=call_chat_cfg,
+                    )
+                    overflow_outcome = await self._preflight_context_overflow(
+                        turn_messages,
+                        estimated_context_tokens,
+                        seen_message_count=provider_seen_message_count,
+                        request_context_insert_index=request_context_insert_index,
+                        runtime_context_insert_index=runtime_context_insert_index,
+                    )
+                    if overflow_outcome is None:
+                        if overflow_retries >= self.config.max_overflow_retries:
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = self._context_overflow_error()
+                            yield terminal_error
+                            break
+                        # The estimate is a heuristic: send the request as is.
+                        # A real provider overflow takes the CONTEXT_OVERFLOW
+                        # branch below, and the next call checks again.
+                        overflow_retries += 1
+                        _log.warning(
+                            "compaction.preflight_failed",
+                            attempt=overflow_retries,
+                            max=self.config.max_overflow_retries,
+                            estimated_tokens=estimated_context_tokens,
+                        )
+                    elif overflow_outcome.compacted:
+                        # Lifetime counters keep feeding DoneEvent usage/cost
+                        # accounting for this turn.
+                        turn_messages = overflow_outcome.messages
+                        if overflow_outcome.request_context_insert_index is not None:
+                            request_context_insert_index = (
+                                overflow_outcome.request_context_insert_index
+                            )
+                        if overflow_outcome.runtime_context_insert_index is not None:
+                            runtime_context_insert_index = (
+                                overflow_outcome.runtime_context_insert_index
+                            )
+                        # The stream consumer persists the compaction and
+                        # refreshes the system prompt while handling this event,
+                        # so the request below is rebuilt after it.
+                        yield CompactionEvent(
+                            compaction_id=overflow_outcome.compaction_id,
+                            summary=overflow_outcome.summary,
+                            kept_entries=overflow_outcome.kept_entries,
+                            kept_count=len(overflow_outcome.messages),
+                            removed_count=overflow_outcome.removed_count,
+                        )
+                        overflow_retries = 0  # reset on success
+                        # Read cache_breakpoints from the refreshed self.config
+                        # (re-anchored by refresh_system_prompt):
+                        # chat_cfg.cache_breakpoints still holds the
+                        # pre-compaction base text and would miss the cache.
+                        chat_cfg = chat_cfg.model_copy(
+                            update={
+                                "system": self._context.system_prompt,
+                                "cache_breakpoints": (
+                                    self._cache_breakpoints_without_runtime_context(
+                                        self.config.cache_breakpoints
+                                    )
+                                ),
+                                "provider_request_max_chars": (
+                                    self._provider_request_proof_max_chars()
+                                ),
+                            }
+                        )
+                        call_chat_cfg = chat_cfg
+                        request_turn_messages = (
+                            [*turn_messages, max_iterations_finalization_message]
+                            if (
+                                max_iterations_finalization_pending
+                                and max_iterations_finalization_message is not None
+                            )
+                            else turn_messages
+                        )
+                        (
+                            request_messages,
+                            request_sanitize_result,
+                        ) = self._provider_request_messages_with_sanitize(
+                            request_turn_messages,
+                            request_context_message=request_context_message,
+                            request_context_insert_index=request_context_insert_index,
+                            runtime_context_message=runtime_context_message,
+                            runtime_context_insert_index=runtime_context_insert_index,
+                        )
+                        self._write_context_stage(
+                            "stream:context:compacted",
+                            request_messages,
+                            call_id=call_id,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            sanitize=request_sanitize_result,
+                        )
+                    provider_seen_message_count = len(turn_messages)
 
                     self._write_turn_call_log(
                         "llm_request",
@@ -3169,6 +3275,7 @@ class Agent:
                                 yield terminal_error
                                 break
                             turn_messages = overflow_outcome.messages
+                            provider_seen_message_count = len(turn_messages)
                             request_context_insert_index = next_request_context_insert_index
                             runtime_context_insert_index = next_runtime_context_insert_index
                             yield WarningEvent(
@@ -3359,77 +3466,6 @@ class Agent:
 
                 if iter_reasoning_content:
                     final_reasoning_parts.append(iter_reasoning_content)
-
-                # Check overflow against the live provider request, not
-                # cumulative billable usage for the whole turn.
-                estimated_context_tokens = self._estimate_live_request_tokens(
-                    request_messages,
-                    tools=provider_tools_for_call,
-                    config=call_chat_cfg,
-                )
-                overflow_outcome = await self._check_context_overflow(
-                    turn_messages,
-                    estimated_context_tokens,
-                    request_context_insert_index=request_context_insert_index,
-                    runtime_context_insert_index=runtime_context_insert_index,
-                )
-                if overflow_outcome is None:
-                    if overflow_retries >= self.config.max_overflow_retries:
-                        yield self._transition(AgentState.ERROR)
-                        terminal_error = self._context_overflow_error()
-                        yield terminal_error
-                        break
-                    overflow_retries += 1
-                    _log.warning(
-                        "compaction.retry",
-                        attempt=overflow_retries,
-                        max=self.config.max_overflow_retries,
-                    )
-                    continue  # retry the tool loop iteration
-                if overflow_outcome.compacted:
-                    # Compaction happened — replace message list. Lifetime
-                    # counters keep feeding DoneEvent usage/cost accounting for
-                    # this turn.
-                    turn_messages = overflow_outcome.messages
-                    if overflow_outcome.request_context_insert_index is not None:
-                        request_context_insert_index = overflow_outcome.request_context_insert_index
-                    if overflow_outcome.runtime_context_insert_index is not None:
-                        runtime_context_insert_index = overflow_outcome.runtime_context_insert_index
-                    yield CompactionEvent(
-                        compaction_id=overflow_outcome.compaction_id,
-                        summary=overflow_outcome.summary,
-                        kept_entries=overflow_outcome.kept_entries,
-                        kept_count=len(overflow_outcome.messages),
-                        removed_count=overflow_outcome.removed_count,
-                    )
-                    overflow_retries = 0  # reset on success
-                    # Rebuild chat_cfg so next LLM call uses refreshed system
-                    # prompt. Read cache_breakpoints from the
-                    # refreshed self.config (re-anchored by
-                    # refresh_system_prompt) — chat_cfg.cache_breakpoints
-                    # would still hold pre-compaction base text and miss the
-                    # cache on the next provider call.
-                    chat_cfg = ChatConfig(
-                        max_tokens=chat_cfg.max_tokens,
-                        temperature=chat_cfg.temperature,
-                        system=self._context.system_prompt,
-                        thinking=thinking_enabled,
-                        thinking_budget_tokens=thinking_budget,
-                        timeout=chat_cfg.timeout,
-                        stop_sequences=chat_cfg.stop_sequences,
-                        cache_breakpoints=self._cache_breakpoints_without_runtime_context(
-                            self.config.cache_breakpoints
-                        ),
-                        cache_mode=chat_cfg.cache_mode,
-                        model_capabilities=self.config.model_capabilities,
-                        thinking_level=(
-                            self.config.thinking
-                            if isinstance(self.config.thinking, ThinkingLevel)
-                            else None
-                        ),
-                        provider_request_max_chars=(self._provider_request_proof_max_chars()),
-                        tool_choice=chat_cfg.tool_choice,
-                    )
 
                 assembled_text = "".join(assistant_text_parts)
                 visible_text = strip_synthetic_tool_call_suffix(
@@ -4422,6 +4458,76 @@ class Agent:
 
         estimated_chars = len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
         return max(1, estimated_chars // 4)
+
+    async def _preflight_context_overflow(
+        self,
+        turn_messages: list[Message],
+        estimated_context_tokens: int,
+        *,
+        seen_message_count: int,
+        request_context_insert_index: int | None,
+        runtime_context_insert_index: int | None,
+    ) -> CompactionOutcome | None:
+        """Compact before a provider call when the live request is over threshold.
+
+        Only the leading ``seen_message_count`` messages, which an earlier
+        request already carried (or the history the turn started from), are
+        compacted. Compaction flattens messages to text, so the messages added
+        since (this turn's input, the latest reply and its tool results) are
+        kept verbatim after the compacted prefix: the model sees them in full
+        before they can be summarized.
+
+        Returns an uncompacted outcome when the request is under the threshold
+        or there is nothing to compact, and ``None`` when compaction failed.
+        """
+        unchanged = CompactionOutcome(
+            messages=turn_messages,
+            request_context_insert_index=request_context_insert_index,
+            runtime_context_insert_index=runtime_context_insert_index,
+        )
+        threshold = self.config.context_overflow_threshold * self.config.context_window_tokens
+        if estimated_context_tokens <= threshold:
+            return unchanged
+        split = max(0, min(seen_message_count, len(turn_messages)))
+        if split == 0:
+            return unchanged
+        prefix = turn_messages[:split]
+        tail = turn_messages[split:]
+
+        def _clip(index: int | None) -> int | None:
+            return None if index is None else min(index, split)
+
+        outcome = await self._check_context_overflow(
+            prefix,
+            estimated_context_tokens,
+            request_context_insert_index=_clip(request_context_insert_index),
+            runtime_context_insert_index=_clip(runtime_context_insert_index),
+        )
+        if outcome is None:
+            return None
+        if not outcome.compacted or (outcome.removed_count == 0 and not outcome.summary):
+            return unchanged
+
+        def _restore(adjusted: int | None, original: int | None) -> int | None:
+            if original is None or original <= split:
+                return adjusted
+            base = adjusted if adjusted is not None else len(outcome.messages)
+            return base + (original - split)
+
+        return CompactionOutcome(
+            messages=[*outcome.messages, *tail],
+            compacted=True,
+            summary=outcome.summary,
+            kept_entries=outcome.kept_entries,
+            removed_count=outcome.removed_count,
+            compaction_id=outcome.compaction_id,
+            request_context_insert_index=_restore(
+                outcome.request_context_insert_index, request_context_insert_index
+            ),
+            runtime_context_insert_index=_restore(
+                outcome.runtime_context_insert_index, runtime_context_insert_index
+            ),
+        )
 
     async def _check_context_overflow(
         self,
