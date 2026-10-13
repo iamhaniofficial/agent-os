@@ -60,6 +60,7 @@ that take none, an opt-in drop on load) -- never a storage one.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -777,6 +778,93 @@ def latest_context_block_present(
             continue
         return block in text
     return False
+
+
+# ``## <title>`` sections the dynamic prompt suffix is built from (extra
+# context keys, pipeline blocks). Only these titles split a request-context
+# block, so a markdown heading inside recalled text never does.
+REQUEST_CONTEXT_SECTION_TITLES: frozenset[str] = frozenset(
+    {
+        "Memory Context",
+        "Internal Event Mode",
+        "Subagent Task Protocol",
+        "Project Knowledge",
+        "Router Control",
+        "Channel Rendering",
+        "Plan Mode (Active)",
+        "Skills",
+        "Recent Notes",
+        "Workspace Files (injected)",
+    }
+)
+_REQUEST_CONTEXT_INTRO = (
+    "This request-scoped context is not a user request and is not transcript history.\n"
+    "Use it only when it is relevant to the current user request."
+)
+_SECTION_GONE = "[No longer applies from this turn on.]"
+_SECTION_LINE = re.compile(r"(?m)^## (.+?)[ \t]*$")
+
+
+def split_context_sections(text: str) -> list[tuple[str, str]]:
+    """Split request context into ``(title, section text)`` pairs.
+
+    Text before the first known ``## <title>`` (durable summaries, subagent
+    grounding) is one section with title ``""``.
+    """
+    starts = [
+        match
+        for match in _SECTION_LINE.finditer(text)
+        if match.group(1) in REQUEST_CONTEXT_SECTION_TITLES
+        and (match.start() == 0 or text[max(0, match.start() - 2) : match.start()] == "\n\n")
+    ]
+    sections: list[tuple[str, str]] = []
+    lead = text[: starts[0].start()] if starts else text
+    if lead.strip():
+        sections.append(("", lead.strip()))
+    for index, match in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+        body = text[match.start() : end].strip()
+        if body:
+            sections.append((match.group(1), body))
+    return sections
+
+
+def _request_context_sections_in(message: Message) -> list[tuple[str, str]]:
+    text = message_text(message)
+    start = text.find(REQUEST_CONTEXT_HEADER)
+    if start < 0:
+        return []
+    end = text.find(f"\n\n{RUNTIME_CONTEXT_HEADER}", start)
+    block = text[start : end if end >= 0 else len(text)]
+    block = block[len(REQUEST_CONTEXT_HEADER) :].lstrip("\n")
+    if block.startswith(_REQUEST_CONTEXT_INTRO):
+        block = block[len(_REQUEST_CONTEXT_INTRO) :].lstrip("\n")
+    return split_context_sections(block)
+
+
+def request_context_delta(history: Sequence[Message], request_context: str | None) -> str | None:
+    """The request-context block this turn must carry, section by section.
+
+    Every turn's block is persisted with that turn (append-only), so only the
+    ``## <title>`` sections that changed since their latest copy in *history*
+    are sent again; a section present before and gone now gets a one-line
+    "no longer applies" marker. ``None`` when nothing changed.
+    """
+    current = split_context_sections(request_context.strip()) if request_context else []
+    latest: dict[str, str] = {}
+    for message in reversed(history):
+        if message.role != "user":
+            continue
+        for title, body in _request_context_sections_in(message):
+            latest.setdefault(title, body)
+    current_titles = {title for title, _ in current}
+    changed = [body for title, body in current if latest.get(title) != body]
+    for title, body in latest.items():
+        if title and title not in current_titles and not body.endswith(_SECTION_GONE):
+            changed.append(f"## {title}\n\n{_SECTION_GONE}")
+    if not changed:
+        return None
+    return f"{REQUEST_CONTEXT_HEADER}\n{_REQUEST_CONTEXT_INTRO}\n\n" + "\n\n".join(changed)
 
 
 def append_context_blocks(message: Message, blocks: Sequence[str]) -> Message:

@@ -61,7 +61,6 @@ from agentos.engine.transcript import (
     INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX as _INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX,
 )
 from agentos.engine.transcript import (
-    REQUEST_CONTEXT_HEADER,
     RUNTIME_CONTEXT_HEADER,
     SKILLS_CONTEXT_HEADER,
     MessageSizeCache,
@@ -70,6 +69,7 @@ from agentos.engine.transcript import (
     encode_transcript_record,
     latest_context_block_present,
     persistable_messages,
+    request_context_delta,
     seal_window,
 )
 from agentos.engine.transcript import (
@@ -1371,10 +1371,10 @@ class Agent:
             history, header=SKILLS_CONTEXT_HEADER, block=skills_block
         ):
             context_blocks.append(skills_block)
-        request_block = self._request_context_block(self.config.request_context_prompt)
-        if request_block is not None and not latest_context_block_present(
-            history, header=REQUEST_CONTEXT_HEADER, block=request_block
-        ):
+        # Request context is diffed per ``## <title>`` section: only sections
+        # that changed since their latest copy in the transcript ride along.
+        request_block = request_context_delta(history, self.config.request_context_prompt)
+        if request_block is not None:
             context_blocks.append(request_block)
         context_blocks.append(runtime_context)
         last_user_index = next(
@@ -3519,18 +3519,6 @@ class Agent:
             f"Time zone / location hint: {tz_name}",
             "Use this runtime context for questions about the current date, time, or local "
             "time zone. Do not treat it as a user request.",
-        ]
-        return "\n".join(lines)
-
-    @staticmethod
-    def _request_context_block(request_context: str | None) -> str | None:
-        if not request_context or not request_context.strip():
-            return None
-        lines = [
-            REQUEST_CONTEXT_HEADER,
-            "This request-scoped context is not a user request and is not transcript history.",
-            "Use it only when it is relevant to the current user request.",
-            request_context.strip(),
         ]
         return "\n".join(lines)
 

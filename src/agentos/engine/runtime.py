@@ -198,6 +198,11 @@ _ROUTER_PREV_ASSISTANT_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_TURNS: Final[int] = 4
 _CONTEXT_SUMMARY_MARKER: Final[str] = "[Context Summary]"
+# Extra-context keys whose value is fixed for the life of a session (or changes
+# only on an explicit edit); rendered into the cached system prompt.
+_SESSION_FROZEN_EXTRA_CONTEXT_KEYS: Final[frozenset[str]] = frozenset(
+    {"Project Knowledge", "Subagent Task Protocol"}
+)
 _COMPACTION_SUMMARY_CONTEXT_HEADER: Final[str] = "[Compacted Session Summaries]"
 _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS: Final[int] = 16_000
 _DEFAULT_PREFLIGHT_COMPACT_RATIO: Final[float] = 0.85
@@ -4531,33 +4536,58 @@ class TurnRunner:
             channels_enabled=channels_enabled,
             unattended_context=unattended_context,
         )
-        # daily_notes, workspace_files, and extra_context are per-turn /
-        # per-day volatile content. Keeping them in the cacheable base
-        # invalidates the prompt-cache prefix every time any of them
-        # changes (every day for daily_notes, every workspace edit for
-        # workspace_files, every tool_context shift for extra_context).
-        # Render them into the dynamic suffix instead so the base hash
-        # stays stable across those rotations.
-        dynamic_blocks: list[str] = []
-        volatile_block = self._render_volatile_block(
+        # Session-frozen content -- workspace files (snapshotted per session),
+        # daily notes, project knowledge, the subagent protocol and the
+        # router-control block (config) -- joins the cached system prompt: it
+        # does not change from one request to the next, and carrying it with
+        # every user turn would re-append tens of KB into the append-only
+        # transcript. Only genuinely per-turn keys (memory recall, internal
+        # event mode, ...) ride in the dynamic suffix, which the agent sends
+        # as section-diffed trailing context of the user turn.
+        frozen_extra = {
+            key: value
+            for key, value in (extra_context or {}).items()
+            if key in _SESSION_FROZEN_EXTRA_CONTEXT_KEYS
+        }
+        turn_extra = {
+            key: value
+            for key, value in (extra_context or {}).items()
+            if key not in _SESSION_FROZEN_EXTRA_CONTEXT_KEYS
+        }
+        wrap_untrusted_workspace = getattr(
+            getattr(self._config, "safety", None),
+            "wrap_untrusted_workspace",
+            True,
+        )
+        frozen_blocks: list[str] = []
+        frozen_block = self._render_volatile_block(
             daily_notes=daily,
             workspace_files=workspace_files,
-            extra_context=extra_context,
+            extra_context=frozen_extra,
             prompt_mode=prompt_mode,
-            wrap_untrusted_workspace=getattr(
-                getattr(self._config, "safety", None),
-                "wrap_untrusted_workspace",
-                True,
-            ),
+            wrap_untrusted_workspace=wrap_untrusted_workspace,
         )
-        if volatile_block:
-            dynamic_blocks.append(volatile_block)
+        if frozen_block:
+            frozen_blocks.append(frozen_block)
         if tool_defs and any(getattr(td, "name", "") == "router_control" for td in tool_defs):
             router_block = render_router_control_prompt_block(
                 getattr(self._config, "agentos_router", None)
             )
             if router_block:
-                dynamic_blocks.append(f"## Router Control\n\n{router_block}")
+                frozen_blocks.append(f"## Router Control\n\n{router_block}")
+        if frozen_blocks:
+            base_prompt = "\n\n".join([base_prompt, *frozen_blocks])
+
+        dynamic_blocks: list[str] = []
+        volatile_block = self._render_volatile_block(
+            daily_notes=None,
+            workspace_files=None,
+            extra_context=turn_extra,
+            prompt_mode=prompt_mode,
+            wrap_untrusted_workspace=wrap_untrusted_workspace,
+        )
+        if volatile_block:
+            dynamic_blocks.append(volatile_block)
 
         if dynamic_blocks:
             return base_prompt, "\n\n".join(dynamic_blocks)
