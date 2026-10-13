@@ -219,9 +219,13 @@ def test_former_allowlist_members_are_registered_parallel() -> None:
     declared = _declared_concurrency_by_tool()
     missing = sorted(_FORMER_ALLOWLIST - set(declared))
     assert missing == []
-    assert {name: declared[name] for name in _FORMER_ALLOWLIST} == dict.fromkeys(
-        _FORMER_ALLOWLIST, "parallel"
+    # skill_view left the parallel set on purpose: it loads the deferred tools a
+    # skill requires, so a call batched after it must wait for that load.
+    still_parallel = _FORMER_ALLOWLIST - {"skill_view"}
+    assert {name: declared[name] for name in still_parallel} == dict.fromkeys(
+        still_parallel, "parallel"
     )
+    assert declared["skill_view"] == "exclusive"
     assert declared["sessions_send"] == "keyed"
     assert declared["sessions_spawn"] == "keyed"
     for name in ("exec_command", "write_file", "edit_file", "apply_patch", "http_request"):

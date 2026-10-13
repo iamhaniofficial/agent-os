@@ -469,8 +469,9 @@ malformed or repetitive tool calls terminate predictably.
 ### Deferred tools
 
 By default a request carries only the tools a typical turn needs. The long tail
-(audio generation, git helpers, project and skill administration, `browser`,
-`x_search`, `http_request`, and a few more) is listed by name in the
+— 31 builtins: audio generation, git helpers, project and skill administration,
+`browser`, `x_search`, `http_request`, and a few more; 30 of them on a stock
+gateway, where `create_pptx` is hidden anyway — is listed by name in the
 `tool_search` tool instead; the model calls `tool_search` to load the ones a
 task needs, and they stay loaded for the rest of the session (a reset starts
 lean again). Reading a skill with `skill_view` also loads the tools that skill

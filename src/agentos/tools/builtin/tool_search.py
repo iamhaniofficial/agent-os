@@ -3,7 +3,9 @@
 The request only carries the tools a typical turn needs; the rest are listed by
 name in this tool's description (see :mod:`agentos.tools.deferred`). Calling it
 loads the matches, so they are on the next request and every one after it for
-the rest of the session.
+the rest of the session. On a stock gateway it stands in for 30 tools (31 are
+marked deferred; ``create_pptx`` is hidden unless allowed), taking a request
+from 63 to 34 tool schemas.
 """
 
 from __future__ import annotations
@@ -46,6 +48,9 @@ from agentos.tools.types import ToolError, current_tool_context
         },
     },
     required=[],
+    # It changes the session's tool list, so it runs alone: a deferred tool
+    # called in the same batch waits for the load instead of racing it.
+    concurrency="exclusive",
     # Shown only when something is deferred: the turn runner adds it to the
     # request together with the catalog of what it can load.
     exposed_by_default=False,
