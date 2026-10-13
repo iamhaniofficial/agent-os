@@ -18,6 +18,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   default; `[sessions] suggest_next = false` turns it off.
 
 ### Fixed
+- MCP: two servers exposing a tool with the same name no longer overwrite
+  each other. The first server to connect (config order at startup) keeps
+  `mcp_<tool>`; the later one is registered as `mcp_<server>_<tool>` and the
+  gateway logs which server got the long name. `mcp.status` now returns a
+  `toolMap` from registered name to the server's tool name. A result the
+  server flagged `isError` reaches the model as a failed tool result quoting
+  the server's text instead of looking like success, and a timeout is an
+  error too. MCP output is now wrapped in the `<untrusted>` envelope and
+  budgeted as external content, like `web_fetch` (#3645).
 - Desktop and web console: code blocks in chat were washed out on the light
   theme. The shared markdown renderer always loads highlight.js's
   `github-dark` token colors, so on the light theme's white panel plain code

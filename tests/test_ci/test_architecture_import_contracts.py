@@ -112,6 +112,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("gateway", "trading"),
     ("identity", "safety"),
     ("identity", "session"),
+    # MCP tool output is server-authored; discovery wraps it in the shared
+    # untrusted envelope. safety is side-effect-free and imports nothing back.
+    ("mcp", "safety"),
     ("mcp", "tools"),
     ("memory", "agents"),
     ("memory", "compat"),
