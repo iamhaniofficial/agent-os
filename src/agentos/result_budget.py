@@ -45,6 +45,13 @@ EXTERNAL_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# Tools discovered from a configured MCP server are registered under this
+# prefix (``agentos.mcp.discovery``). Their output is authored by that server,
+# so it is external content however the server is reached. The spec carries
+# ``result_budget_class="external"`` too; the prefix covers the call sites that
+# only have a tool name to go on (provider-request compaction).
+MCP_TOOL_PREFIX = "mcp_"
+
 CONTROL_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "sessions_yield",
@@ -464,7 +471,7 @@ def resolve_budget_class(tool_name: str, explicit: Any = None) -> ToolResultBudg
             pass
     if tool_name in CONTROL_TOOL_NAMES:
         return ToolResultBudgetClass.CONTROL
-    if tool_name in EXTERNAL_TOOL_NAMES:
+    if tool_name in EXTERNAL_TOOL_NAMES or tool_name.startswith(MCP_TOOL_PREFIX):
         return ToolResultBudgetClass.EXTERNAL
     return ToolResultBudgetClass.UNKNOWN
 

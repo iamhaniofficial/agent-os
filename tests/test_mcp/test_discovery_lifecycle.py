@@ -112,7 +112,7 @@ async def test_disconnect_unregisters_tools_owned_by_server(
 
 
 @pytest.mark.asyncio
-async def test_disconnect_older_server_preserves_newer_same_named_tool(
+async def test_disconnect_older_server_keeps_newer_servers_prefixed_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agentos.mcp import discovery
@@ -134,14 +134,22 @@ async def test_disconnect_older_server_preserves_newer_same_named_tool(
     older_registration = registry.get("mcp_lookup")
     assert older_registration is not None
     older_handler = older_registration.handler
-    await discovery.discover_and_register(newer_config, registry, owner="newer")
-    newer_registration = registry.get("mcp_lookup")
+    assert await discovery.discover_and_register(newer_config, registry, owner="newer") == [
+        "mcp_newer_lookup"
+    ]
+    # The second server did not replace the first one's tool.
+    still_short = registry.get("mcp_lookup")
+    assert still_short is not None
+    assert still_short.handler is older_handler
+    newer_registration = registry.get("mcp_newer_lookup")
     assert newer_registration is not None
     newer_handler = newer_registration.handler
 
-    assert newer_handler is not older_handler
     assert await discovery.disconnect_and_unregister("older", registry) == 1
-    registered = registry.get("mcp_lookup")
+    assert registry.get("mcp_lookup") is None
+    # A name never moves under a running session: the newer server keeps the
+    # name it was registered with.
+    registered = registry.get("mcp_newer_lookup")
     assert registered is not None
     assert registered.handler is newer_handler
     assert older_client.closed is True
@@ -149,7 +157,7 @@ async def test_disconnect_older_server_preserves_newer_same_named_tool(
 
 
 @pytest.mark.asyncio
-async def test_disconnect_newer_server_restores_older_same_named_tool(
+async def test_disconnect_newer_server_leaves_older_short_named_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agentos.mcp import discovery
@@ -174,6 +182,7 @@ async def test_disconnect_newer_server_restores_older_same_named_tool(
     await discovery.discover_and_register(newer_config, registry, owner="newer")
 
     assert await discovery.disconnect_and_unregister("newer", registry) == 1
+    assert registry.get("mcp_newer_lookup") is None
     registered = registry.get("mcp_lookup")
     assert registered is not None
     assert registered.handler is older_handler

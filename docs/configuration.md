@@ -833,6 +833,33 @@ a valid MCP target. The check runs against the address the socket actually
 dials, so a short-TTL DNS name cannot answer safely for the check and with the
 metadata address for the connection.
 
+### MCP tool names and results
+
+Each tool a server exposes is registered for the agent as `mcp_<tool>`, so a
+server's `search` tool is `mcp_search`. That short name is what tool
+allowlists and denylists refer to.
+
+When two servers expose a tool with the same name, the first one to connect
+keeps the short name and the later one is registered as
+`mcp_<server>_<tool>` instead of replacing it. Servers connect at startup in
+the order they appear in `[[mcp.servers]]`, so the first configured server
+wins. `<server>` is the server's `name` lowercased with every run of characters
+outside `[a-z0-9_]` turned into `_` (`Linear-Prod.v2` becomes
+`linear_prod_v2`); if two server names reduce to the same text, a `_2`, `_3`
+suffix keeps them apart. The gateway logs `mcp.tool_name_collision` naming the
+server that got the long name, and the `mcp.status` RPC lists each connected
+server's `tools` plus a `toolMap` from registered name to the server's own tool
+name. A server connected later (after OAuth, or from the MCP screen) takes
+whichever names are free at that moment.
+
+When a server marks a result as an error (`isError`), the call comes back to
+the model as a failed tool result whose message quotes the server's error text
+(capped). A call that exceeds `tool_timeout_seconds` fails the same way.
+
+Output from an MCP tool is written by the server, not by AgentOS, so it is
+handled like `web_fetch` output: wrapped in an `<untrusted source='mcp:<server>/<tool>'>`
+envelope and counted against the external-content result budget.
+
 OAuth access and refresh tokens are not written to `config.toml`. AgentOS keeps
 them in a server-scoped JSON file under the configured state directory with
 file mode `0600` inside a `0700` directory on POSIX systems. On Windows, the
