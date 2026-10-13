@@ -1929,6 +1929,7 @@ class Agent:
                 self.config.cache_breakpoints
             ),
             cache_mode=self.config.cache_mode,
+            cache_ttl=self.config.cache_ttl,
             model_capabilities=self.config.model_capabilities,
             thinking_level=(
                 self.config.thinking if isinstance(self.config.thinking, ThinkingLevel) else None

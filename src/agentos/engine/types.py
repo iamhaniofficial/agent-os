@@ -325,6 +325,8 @@ class AgentConfig:
     # Prompt caching breakpoints (list of {"text": ..., "cache": "true"})
     cache_breakpoints: list[dict[str, str]] | None = None
     cache_mode: Literal["off", "auto", "on"] = "off"
+    # Prompt-cache TTL for the stable prefix (``[prompt_cache] ttl``).
+    cache_ttl: Literal["5m", "1h"] | None = None
     # Per-turn volatile request context injected after persisted history
     # and before the current user turn. It is not persisted to history.
     request_context_prompt: str | None = None

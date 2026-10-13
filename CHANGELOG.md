@@ -16,8 +16,59 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   exchange. Errored or aborted turns get none and cost no call, and answers
   are cached per reply so clients sharing a session share one call. On by
   default; `[sessions] suggest_next = false` turns it off.
+- Prompt caching: `[prompt_cache] ttl = "1h"` (env `AGENTOS_CACHE_TTL`) keeps
+  Anthropic's cached system prompt and tool list for an hour instead of five
+  minutes. Default unchanged (`5m`). (#3648)
+- Ollama: the agent's context window is sent as `options.num_ctx` (Ollama's
+  default of a few thousand tokens silently dropped the start of long
+  prompts; `AGENTOS_OLLAMA_NUM_CTX` overrides it), and `think` is sent when
+  thinking is on for a model that supports it (Qwen 3, DeepSeek R1 / V3.1,
+  gpt-oss with a level, Magistral). (#3648)
+- Tool contract: tools can opt into `strict` (Anthropic `strict`, OpenAI
+  `function.strict`) and set `additionalProperties`; `ToolChoice` is a typed,
+  provider-neutral tool choice translated per provider, and
+  `ChatConfig.parallel_tool_calls = False` maps to OpenAI
+  `parallel_tool_calls` / Anthropic `disable_parallel_tool_use`. Existing tool
+  payloads are unchanged. (#3648)
+
+### Changed
+- Anthropic prompt cache now covers the whole conversation, not only the
+  system prompt: breakpoints on the system prompt, the last tool definition
+  and a rolling one on the last block of the last user message (at most four),
+  so every tool-loop iteration reads the previous iteration's prefix from
+  cache instead of paying for the full history again. `cache_mode = "off"`
+  now sends no cache markers at all on this path. (#3648)
+- Providers keep one pooled HTTP connection per provider instead of opening a
+  new client (TCP + TLS handshake) for every request, and use split timeouts
+  (connect 12 s, write 30 s, read = the request timeout; env
+  `AGENTOS_LLM_STREAM_CONNECT_TIMEOUT_SECONDS` /
+  `AGENTOS_LLM_STREAM_WRITE_TIMEOUT_SECONDS`). (#3648)
+- OpenAI (api.openai.com): requests carry a `prompt_cache_key` derived from
+  the model, system prompt and tools, so turns sharing a prefix are routed to
+  the same cache. Not sent to other OpenAI-compatible upstreams. (#3648)
 
 ### Fixed
+- Anthropic extended thinking: every thinking delta of a response was joined
+  into one block with only the last signature, and `redacted_thinking` blocks
+  were dropped, so replaying a multi-block response was a signature mismatch.
+  Each `thinking` / `redacted_thinking` block is now kept with its own
+  signature or data (`DoneEvent.thinking_blocks`) and replayed unmodified, in
+  order. Stored single-block thinking still loads. (#3648)
+- OpenRouter reasoning: `reasoning_details` were parsed for display but never
+  sent back, so Claude, GPT, Gemini and GLM via OpenRouter lost their
+  reasoning (and signatures) across tool calls. They are now merged per block
+  (`DoneEvent.reasoning_details`) and re-sent verbatim on the assistant
+  message. (#3648)
+- A model stream that went silent after it had started hung until the
+  per-iteration timeout (30 min by default). It now ends after 120 s without
+  data (`AGENTOS_LLM_STREAM_IDLE_TIMEOUT_SECONDS`, `0` disables) with a
+  retriable `stream_idle_timeout` error; the watchdog starts at the first
+  streamed event, so a slow first token is not affected. (#3648)
+- A stream cut in the middle of a tool call's arguments ended the turn with
+  an incomplete tool call (Anthropic) or ran the call with truncated
+  arguments (OpenAI-compatible). The provider now retries such a stream once,
+  transparently, as long as no text was streamed yet; otherwise it reports
+  the interruption instead of retrying and duplicating output. (#3648)
 - Providers: a 429 that said `Retry-After: 2` failed over to another model at
   once -- losing the prompt cache and changing the cost -- and three of them
   marked the primary provider down for a minute. The providers threw the

@@ -433,6 +433,12 @@ class PromptCacheConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENTOS_CACHE_")
 
     mode: Literal["off", "auto", "on"] = "auto"
+    # Lifetime of the cached stable prefix (system prompt and tools) on
+    # providers with explicit cache breakpoints (Anthropic). "1h" costs 2x the
+    # base input price per cache write instead of 1.25x and pays off when a
+    # session pauses longer than 5 minutes between requests.
+    # Env: AGENTOS_CACHE_TTL.
+    ttl: Literal["5m", "1h"] = "5m"
 
     def __init__(self, **data: Any) -> None:
         # Surface the legacy ``AGENTOS_CACHE_ENABLED`` env var to the
