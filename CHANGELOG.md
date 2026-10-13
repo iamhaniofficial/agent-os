@@ -31,19 +31,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `ChatConfig.parallel_tool_calls = False` maps to OpenAI
   `parallel_tool_calls` / Anthropic `disable_parallel_tool_use`. Existing tool
   payloads are unchanged. (#3648)
-- Deferred tool loading. A request no longer carries every tool schema: 31
-  rarely used builtins (audio generation, git helpers, project and skill
-  administration, `browser`, `x_search`, `http_request`, ...) are marked
-  deferred and listed by name in a new `tool_search` tool instead, and the model
-  loads the ones a task needs; they stay loaded for the rest of the session,
+- Deferred tool loading. A request no longer carries every tool schema: 24
+  rarely used builtins (audio generation, project and skill administration,
+  `browser`, `x_search`, `http_request`, ...) are marked deferred. The system
+  prompt lists them by name with a one-line summary under "Tools that must be
+  loaded first", the new `tool_search` tool lists them too, and the model loads
+  the ones a task needs; they stay loaded for the rest of the session,
   including after a restart, and a reset starts lean again. `skill_view` loads
-  the tools a skill lists in `requires_tools`, and calling a deferred tool
-  before loading it returns an error that says how to load it. On a stock
-  gateway 30 of them are deferred (`create_pptx` is hidden unless allowed), so
-  a request drops from 63 to 34 tool schemas (about 16k characters, ~4k tokens,
-  less per call). Policy still applies, and a surface narrowed by an allowlist
-  defers nothing. `[tools] defer_loading = false` sends every tool again;
-  `agentos context` honours it and reports the deferred count. (#3648)
+  the tools a skill lists in `requires_tools` and says so, and calling a
+  deferred tool before loading it returns an error that says how to load it.
+  On a stock gateway a request drops from 63 to 40 tool schemas (about 14k
+  characters less, ~12k net of the longer prompt, ~3k tokens per call). The
+  spreadsheet/document builders and git tools stay loaded: deferred, the model
+  took the shell instead. Policy still applies, and a surface narrowed by an
+  allowlist defers nothing. `[tools] defer_loading = false` sends every tool
+  again; `agentos context` honours it and reports the deferred count, also in
+  `--json`. (#3648)
 
 ### Changed
 - Anthropic prompt cache now covers the whole conversation, not only the

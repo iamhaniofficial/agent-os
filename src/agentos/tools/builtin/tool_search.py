@@ -3,9 +3,8 @@
 The request only carries the tools a typical turn needs; the rest are listed by
 name in this tool's description (see :mod:`agentos.tools.deferred`). Calling it
 loads the matches, so they are on the next request and every one after it for
-the rest of the session. On a stock gateway it stands in for 30 tools (31 are
-marked deferred; ``create_pptx`` is hidden unless allowed), taking a request
-from 63 to 34 tool schemas.
+the rest of the session. On a stock gateway it stands in for 24 tools, taking
+a request from 63 to 40 tool schemas.
 """
 
 from __future__ import annotations
@@ -21,12 +20,14 @@ from agentos.tools.types import ToolError, current_tool_context
 @tool(
     name=TOOL_SEARCH_NAME,
     description=(
-        "Load tools that are installed but not sent with every request. The "
-        "deferred tools are listed below by name; their parameters are not shown "
-        "until they are loaded. Call this with the names you need (or keywords "
-        "for what you want to do) before calling one of them; the matches are "
-        "loaded for the rest of the session and you can call them on your next "
-        "step. Calling a listed tool without loading it first fails."
+        "Before using the shell or a skill script to make audio, drive a "
+        "browser, search X, send raw HTTP requests, or manage projects or skills, "
+        "check the list below and load the matching tool. These tools are "
+        "installed but not sent with every request, so their parameters are "
+        "hidden until loaded. Call this "
+        "with the names you need (or keywords for what you want to do); the "
+        "matches are loaded for the rest of the session and you can call them on "
+        "your next step. Calling a listed tool without loading it first fails."
     ),
     params={
         "query": {
