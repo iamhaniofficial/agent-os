@@ -871,3 +871,44 @@ def test_loader_orders_a_follow_up_after_the_turn_it_interrupted() -> None:
         "A1",
     ]
     assert with_id.input_entry is follow_up
+
+
+@pytest.mark.asyncio
+async def test_archived_and_forked_rows_keep_their_structured_record(
+    manager: SessionManager,
+) -> None:
+    await manager.create(KEY)
+    user_row = await manager.append_message(KEY, "user", "question")
+    record = encode_transcript_record(
+        TranscriptRecord(
+            messages=[
+                Message(role="user", content="question"),
+                Message(role="assistant", content="answer"),
+            ],
+            input_entry_id=user_row.message_id,
+        )
+    )
+    await manager.append_message(KEY, "assistant", "answer", provider_messages=record)
+    await manager.append_message(KEY, "user", "next")
+    # Archive the first turn under a summary, keep the last row.
+    await manager.persist_compaction_result(
+        KEY,
+        "summary of the first turn",
+        [{"role": "user", "content": "next"}],
+        compaction_id="cmp-archive",
+    )
+
+    canonical = await manager.get_canonical_transcript(KEY)
+    archived_reply = next(row for row in canonical if row.content == "answer")
+    assert archived_reply.provider_messages == record
+    node = await manager.get_session(KEY)
+    compacted = await manager.storage.get_compacted_transcript_entries(
+        session_id=node.session_id, compaction_id="cmp-archive"
+    )
+    assert [row.provider_messages for row in compacted if row.role == "assistant"] == [record]
+
+    child_key = "agent:main:webchat:append-only-archive-fork"
+    await manager.branch(KEY, child_key, fork_transcript=True)
+    child_canonical = await manager.get_canonical_transcript(child_key)
+    forked_reply = next(row for row in child_canonical if row.content == "answer")
+    assert forked_reply.provider_messages == record

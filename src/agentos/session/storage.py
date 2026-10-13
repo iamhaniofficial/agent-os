@@ -1451,7 +1451,8 @@ class SessionStorage:
                 provenance_source_session_key,
                 provenance_source_channel,
                 provenance_source_tool,
-                schema_version
+                schema_version,
+                provider_messages
             FROM compacted_transcript_entries
             WHERE session_id = ?
             UNION ALL
@@ -1473,7 +1474,8 @@ class SessionStorage:
                 provenance_source_session_key,
                 provenance_source_channel,
                 provenance_source_tool,
-                schema_version
+                schema_version,
+                provider_messages
             FROM transcript_entries
             WHERE session_id = ?
             ORDER BY created_at ASC, id ASC
@@ -1517,7 +1519,8 @@ class SessionStorage:
                 provenance_source_channel,
                 provenance_source_tool,
                 archived_at,
-                schema_version
+                schema_version,
+                provider_messages
             )
             SELECT
                 ?,
@@ -1540,7 +1543,8 @@ class SessionStorage:
                 provenance_source_channel,
                 provenance_source_tool,
                 archived_at,
-                schema_version
+                schema_version,
+                provider_messages
             FROM compacted_transcript_entries
             WHERE session_id = ?
             ORDER BY created_at ASC, original_entry_id ASC, id ASC
@@ -1857,7 +1861,8 @@ class SessionStorage:
                 provenance_source_session_key,
                 provenance_source_channel,
                 provenance_source_tool,
-                schema_version
+                schema_version,
+                provider_messages
             FROM compacted_transcript_entries
             WHERE session_id = ? AND compaction_id = ?
             ORDER BY created_at ASC, original_entry_id ASC, id ASC
