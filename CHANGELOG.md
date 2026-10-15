@@ -61,6 +61,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   longer holds the turn and is no longer cancelled: it finishes in the
   background and stands in on the session's next turn if that recall is late
   too. A timeout logs `memory.recall_timeout`.
+- The router's per-turn transcript read takes the newest 128 rows instead of
+  the whole transcript, falling back to the full read only when that window
+  lacks the last four user messages or an assistant reply; the result is the
+  same. On an 1,800-row session this drops the read from ~63 ms to ~8 ms.
 - Anthropic prompt cache now covers the whole conversation, not only the
   system prompt: breakpoints on the system prompt, the last tool definition
   and a rolling one on the last block of the last user message (at most four),

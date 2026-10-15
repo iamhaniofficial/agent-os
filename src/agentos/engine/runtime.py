@@ -203,6 +203,9 @@ _DEFAULT_LLM_TIMEOUT_SECONDS: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
 _ROUTER_PREV_ASSISTANT_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_TURNS: Final[int] = 4
+# Newest transcript rows read for the router context before falling back to
+# the whole transcript (only when the window lacks what the context needs).
+_ROUTER_CONTEXT_WINDOW_ENTRIES: Final[int] = 128
 _CONTEXT_SUMMARY_MARKER: Final[str] = "[Context Summary]"
 # Extra-context keys whose value is fixed for the life of a session (or changes
 # only on an explicit edit); rendered into the cached system prompt.
@@ -5031,9 +5034,34 @@ class TurnRunner:
         *,
         exclude_last_user: bool = False,
     ) -> dict[str, Any]:
-        """Return transcript context for the V4 router, excluding the current user turn."""
+        """Return transcript context for the V4 router, excluding the current user turn.
+
+        Reads the newest ``_ROUTER_CONTEXT_WINDOW_ENTRIES`` rows first: the
+        context only needs the last few user texts and the last assistant
+        text, and deserializing a long session's whole transcript on every
+        turn is the expensive part. When the window does not hold all of
+        that, the whole transcript is read as before, so the result is the
+        same either way.
+        """
         if self._session_manager is None:
             return {}
+        get_recent = getattr(type(self._session_manager), "get_recent_transcript", None)
+        if get_recent is not None:
+            try:
+                recent = list(
+                    await self._session_manager.get_recent_transcript(
+                        session_key, _ROUTER_CONTEXT_WINDOW_ENTRIES
+                    )
+                    or []
+                )
+            except Exception:  # noqa: BLE001 - fall back to the full read below
+                recent = None
+            if recent is not None:
+                context, complete = self._router_context_from_entries(
+                    recent, exclude_last_user=exclude_last_user
+                )
+                if complete or len(recent) < _ROUTER_CONTEXT_WINDOW_ENTRIES:
+                    return context
         get_transcript = getattr(self._session_manager, "get_transcript", None)
         if not callable(get_transcript):
             return {}
@@ -5044,7 +5072,23 @@ class TurnRunner:
         except Exception:  # noqa: BLE001 - router context must never block a turn
             log.debug("turn_runner.router_context_failed", session_key=session_key)
             return {}
-        entries = list(transcript or [])
+        context, _complete = self._router_context_from_entries(
+            list(transcript or []), exclude_last_user=exclude_last_user
+        )
+        return context
+
+    def _router_context_from_entries(
+        self,
+        entries: list[Any],
+        *,
+        exclude_last_user: bool,
+    ) -> tuple[dict[str, Any], bool]:
+        """Build the router context from ``entries`` (oldest first).
+
+        The flag says whether ``entries`` held everything the context can use
+        (a full set of recent user texts and an assistant text), i.e. whether
+        any older rows could still change the result.
+        """
         user_texts: list[str] = []
         for index, entry in enumerate(entries):
             if getattr(entry, "role", None) != "user":
@@ -5063,6 +5107,7 @@ class TurnRunner:
         context: dict[str, Any] = {}
         if user_texts:
             context["history_user_texts"] = user_texts[-_ROUTER_HISTORY_USER_MAX_TURNS:]
+        users_complete = len(user_texts) >= _ROUTER_HISTORY_USER_MAX_TURNS
 
         for entry in reversed(entries):
             if getattr(entry, "role", None) != "assistant":
@@ -5081,8 +5126,8 @@ class TurnRunner:
                 and token_count > 0
             ):
                 context["prev_assistant_usage"] = {"output_tokens": token_count}
-            return context
-        return context
+            return context, users_complete
+        return context, False
 
     def _resolve_prompt_config(self, turn: Any) -> tuple[str, list | None, str | None]:
         """Resolve final system prompt and cache breakpoints from pipeline output."""
