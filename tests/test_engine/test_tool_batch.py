@@ -394,29 +394,112 @@ async def test_pairing_survives_exception_timeout_and_batch_deadline() -> None:
     assert not outcomes[2].result.is_error
 
 
+class _FakeClock:
+    """The batch clock, moved only by the test."""
+
+    def __init__(self, now: float = 1_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _clocked_executor(
+    execute: Callable[[ToolCall], Awaitable[ToolResult]],
+    specs: dict[str, ToolSpec],
+    clock: _FakeClock,
+    *,
+    batch_seconds: float = 10.0,
+    **kwargs: Any,
+) -> ToolBatchExecutor:
+    # Every budget is long in real time (the per-tool ``wait_for`` uses the
+    # real loop clock), so only the fake clock can end the batch.
+    kwargs.setdefault("heartbeat_interval", 0.005)
+    return ToolBatchExecutor(
+        execute=execute,
+        project=_identity_project,
+        timeout_for=lambda _call: 30.0,
+        spec_for=specs.get,
+        deadline=clock() + batch_seconds,
+        iteration_timeout=batch_seconds,
+        clock=clock,
+        **kwargs,
+    )
+
+
 async def test_batch_deadline_times_out_running_and_queued_calls() -> None:
+    """The deadline passes while t0 runs: t0 is cancelled, queued t1 never starts.
+
+    Deterministic: the batch clock is fake and crosses the deadline only once
+    t0 is known to be running, and no real timer is short enough to fire.
+    """
+
     specs = {"hang": _spec("hang")}  # exclusive: t1 is still queued at the deadline
+    clock = _FakeClock()
+    started: list[str] = []
     cancelled: list[str] = []
+    t0_running = asyncio.Event()
 
     async def execute(call: ToolCall) -> ToolResult:
+        started.append(call.tool_use_id)
+        t0_running.set()
         try:
-            await asyncio.sleep(30)
+            await asyncio.Event().wait()
         except asyncio.CancelledError:
             cancelled.append(call.tool_use_id)
             raise
         return _ok(call)
 
-    executor = _executor(execute, specs, batch_seconds=0.05, tool_seconds=30)
-    events = await _drain(executor, [_call(0, "hang"), _call(1, "hang")])
+    async def _cross_deadline() -> None:
+        await t0_running.wait()
+        clock.now += 10.0
+
+    executor = _clocked_executor(execute, specs, clock)
+    crosser = asyncio.create_task(_cross_deadline())
+    events = await asyncio.wait_for(_drain(executor, [_call(0, "hang"), _call(1, "hang")]), 5.0)
+    await crosser
 
     assert _result_ids(events) == ["t0", "t1"]
+    assert started == ["t0"]
     assert cancelled == ["t0"]
     for outcome in executor.outcomes:
         assert outcome.result.is_error
-        # The per-tool timeout is capped by the batch deadline, so whichever
-        # fires first reports it; either way the call times out.
-        assert "timed out after" in outcome.result.content
-    assert executor.outcomes[1].result.content.endswith("timed out after 0.05s")
+        assert outcome.result.content.endswith("timed out after 10.0s")
+
+
+async def test_queued_call_is_not_started_once_the_batch_deadline_has_passed() -> None:
+    """Regression for the windows-latest flake.
+
+    t0 ends on its own exactly at the batch deadline (its timeout is capped to
+    the batch's remaining time, so both expire together). That frees the gate
+    and admits t1 before the batch loop sees the deadline; t1 must time out
+    unstarted rather than run a tool the batch has already given up on.
+    """
+
+    specs = {"hang": _spec("hang")}
+    clock = _FakeClock()
+    started: list[str] = []
+
+    async def execute(call: ToolCall) -> ToolResult:
+        started.append(call.tool_use_id)
+        if call.tool_use_id == "t0":
+            clock.now += 10.0  # the deadline passes while t0 is running
+            return ToolResult(
+                tool_use_id=call.tool_use_id,
+                tool_name=call.tool_name,
+                content="Tool 'hang' timed out after 10.0s",
+                is_error=True,
+            )
+        return _ok(call)
+
+    executor = _clocked_executor(execute, specs, clock, heartbeat_interval=15.0)
+    events = await asyncio.wait_for(_drain(executor, [_call(0, "hang"), _call(1, "hang")]), 5.0)
+
+    assert started == ["t0"]
+    assert _result_ids(events) == ["t0", "t1"]
+    assert [o.result.tool_use_id for o in executor.outcomes] == ["t0", "t1"]
+    assert executor.outcomes[1].result.is_error
+    assert executor.outcomes[1].result.content.endswith("timed out after 10.0s")
 
 
 async def test_heartbeat_while_tools_run() -> None:

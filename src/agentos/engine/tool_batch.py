@@ -354,6 +354,12 @@ class ToolBatchExecutor:
             preflight = self.preflight_results.get(call.tool_use_id)
             if preflight is not None:
                 result = preflight
+            elif clock.remaining() <= 0:
+                # Admitted only because an earlier call's own timeout fired at
+                # the batch deadline: starting it now would run a tool the
+                # batch has already given up on. It times out unstarted, like
+                # every other call still queued at the deadline.
+                result = _timeout_result(call, self.iteration_timeout)
             else:
                 try:
                     result = await asyncio.wait_for(self.execute(call), timeout=tool_timeout)
