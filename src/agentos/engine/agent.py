@@ -11,7 +11,7 @@ import hashlib
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -300,6 +300,12 @@ def _pending_approval_payload(content: str) -> dict[str, Any] | None:
     if not isinstance(approval_id, str) or not approval_id:
         return None
     return payload
+
+
+async def _await_outside_slot(awaitable: Awaitable[Any]) -> Any:
+    """Identity wrapper for an inline approval wait, so timing can wrap it."""
+
+    return await awaitable
 
 
 async def _wait_for_pending_approval_resolution(
@@ -3072,6 +3078,7 @@ class Agent:
                     wait_for_approval=self.turn_timing.timed_approval(
                         _wait_for_pending_approval_resolution
                     ),
+                    outside_wait=self.turn_timing.timed_approval(_await_outside_slot),
                     artifact_event=lambda a: ArtifactEvent(**_artifact_event_kwargs(a)),
                     pending_warnings=self._pending_warnings,
                     preflight_results=preflight_tool_results,

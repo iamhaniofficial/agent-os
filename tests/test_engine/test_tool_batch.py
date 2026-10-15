@@ -871,3 +871,39 @@ async def test_agent_streams_first_result_before_batch_finishes() -> None:
 
 def test_default_max_tool_concurrency_is_eight() -> None:
     assert AgentConfig().max_safe_tool_concurrency == 8
+
+
+async def test_inline_approval_wait_goes_through_outside_wait_hook() -> None:
+    """An inline approval wait is handed to ``outside_wait`` so the turn can time it."""
+
+    specs = {"exec": _spec("exec")}
+    loop = asyncio.get_running_loop()
+    decision: asyncio.Future[bool] = loop.create_future()
+    seen: list[str] = []
+
+    async def outside_wait(awaitable):  # type: ignore[no-untyped-def]
+        seen.append("enter")
+        try:
+            return await awaitable
+        finally:
+            seen.append("exit")
+
+    async def execute(call: ToolCall) -> ToolResult:
+        approved = await wait_outside_tool_slot(decision)
+        seen.append("body")
+        return _ok(call, "ran" if approved else "denied")
+
+    executor = _executor(execute, specs)
+    executor.outside_wait = outside_wait
+
+    async def _consume() -> None:
+        async for _event in executor.run([_call(0, "exec")]):
+            pass
+
+    consumer = asyncio.create_task(_consume())
+    await _until(lambda: seen == ["enter"])
+    decision.set_result(True)
+    await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert seen == ["enter", "exit", "body"]
+    assert [o.result.content for o in executor.outcomes] == ["ran"]

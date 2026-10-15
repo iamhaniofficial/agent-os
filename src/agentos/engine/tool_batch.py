@@ -41,7 +41,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
@@ -226,6 +226,9 @@ class _Admission:
     # The running call's own timeout, so time spent queueing to be admitted
     # again does not count against it (a call is not timed while queued).
     timeout_scope: asyncio.Timeout | None = None
+    # Wraps the awaitable a call waits on outside its slot (an operator
+    # approval), so the turn's timing can count that wait.
+    outside_wait: Callable[[Awaitable[Any]], Awaitable[Any]] | None = None
 
     async def acquire(self) -> None:
         await self.slot.future
@@ -249,7 +252,10 @@ class _Admission:
         self.yielded = True
         self.release()
         try:
-            result = await awaitable
+            if self.outside_wait is not None:
+                result = cast(T, await self.outside_wait(awaitable))
+            else:
+                result = await awaitable
         except asyncio.CancelledError:
             # Nothing is held; the call's own cleanup releases nothing more.
             raise
@@ -359,6 +365,9 @@ class ToolBatchExecutor:
     approval_wait_timeout: float = 180.0
     pending_approval: Callable[[str], dict[str, Any] | None] = lambda _content: None
     wait_for_approval: Callable[..., Awaitable[Any]] | None = None
+    # Wraps an inline approval wait a tool does outside its slot (see
+    # ``agentos.tools.batch_slot``); used to time it like ``wait_for_approval``.
+    outside_wait: Callable[[Awaitable[Any]], Awaitable[Any]] | None = None
     artifact_event: Callable[[dict[str, Any]], ArtifactEvent] = lambda a: ArtifactEvent(**a)
     pending_warnings: list[WarningEvent] = field(default_factory=list)
     preflight_results: Mapping[str, ToolResult] = field(default_factory=dict)
@@ -468,6 +477,7 @@ class ToolBatchExecutor:
                     else None
                 ),
                 semaphore=None if exclusive else semaphore,
+                outside_wait=self.outside_wait,
             )
 
         async def _run_admitted(call: ToolCall, admission: _Admission) -> ToolResult:
