@@ -76,6 +76,7 @@ from agentos.engine.transcript import (
 from agentos.engine.transcript import (
     TOOL_ARGUMENT_PROJECTION_PREFIX as _TOOL_ARGUMENT_PROJECTION_PREFIX,
 )
+from agentos.engine.turn_timing import NULL_TURN_TIMING, TurnTiming
 from agentos.engine.verification_ledger import (
     VerificationLedger,
     build_verification_nudge,
@@ -696,6 +697,9 @@ class Agent:
       IDLE -> THINKING -> STREAMING -> [TOOL_CALLING -> THINKING -> ...] -> DONE
       Any step can transition to ERROR.
     """
+
+    #: Per-turn timing recorder; the runtime assigns a fresh one per turn.
+    turn_timing: TurnTiming = NULL_TURN_TIMING
 
     def __init__(
         self,
@@ -1880,10 +1884,12 @@ class Agent:
                             tools=provider_tools_for_call,
                             config=call_chat_cfg,
                         )
-                        async for raw_ev in self._stream_provider_events_with_deadline(
-                            raw_stream,
-                            loop=_loop,
-                            total_deadline=_total_deadline,
+                        async for raw_ev in self.turn_timing.provider_stream(
+                            self._stream_provider_events_with_deadline(
+                                raw_stream,
+                                loop=_loop,
+                                total_deadline=_total_deadline,
+                            )
                         ):
                             if isinstance(raw_ev, ProviderTextDelta):
                                 assistant_text_parts.append(raw_ev.text)
@@ -3040,7 +3046,9 @@ class Agent:
                     heartbeat_interval=self._tool_activity_heartbeat_interval(),
                     approval_wait_timeout=self._approval_wait_timeout(),
                     pending_approval=_pending_approval_payload,
-                    wait_for_approval=_wait_for_pending_approval_resolution,
+                    wait_for_approval=self.turn_timing.timed_approval(
+                        _wait_for_pending_approval_resolution
+                    ),
                     artifact_event=lambda a: ArtifactEvent(**_artifact_event_kwargs(a)),
                     pending_warnings=self._pending_warnings,
                     preflight_results=preflight_tool_results,
@@ -3048,7 +3056,9 @@ class Agent:
                     iteration=iterations,
                     clock=_loop.time,
                 )
-                async for event in tool_batch.run(tool_calls):
+                async for event in self.turn_timing.tool_batch(
+                    tool_batch.run(tool_calls), calls=len(tool_calls)
+                ):
                     yield event
                 tool_result_blocks = tool_batch.result_blocks()
                 executed_results = tool_batch.executed_results
