@@ -246,7 +246,7 @@ def _local_doctor(
 
 async def _probe(runtime: Any, agent_id: str) -> dict[str, Any]:
     try:
-        result = await asyncio.wait_for(runtime.doctor(agent_id), PROBE_TIMEOUT_S)
+        result = await asyncio.wait_for(runtime.doctor(agent_id, probe=True), PROBE_TIMEOUT_S)
     except TimeoutError:
         return {"probe": "error", "error": f"probe timed out after {int(PROBE_TIMEOUT_S)}s"}
     except Exception as exc:  # noqa: BLE001 - a failed probe is a doctor finding

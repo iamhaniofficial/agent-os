@@ -170,6 +170,8 @@ async def reap_stale_leases(config: Any) -> int:
         return 0
     if isinstance(result, int):
         return result
+    if isinstance(result, dict):
+        return len(result.get("terminated") or [])
     try:
         return len(result)  # type: ignore[arg-type]
     except TypeError:

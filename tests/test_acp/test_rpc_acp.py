@@ -58,7 +58,7 @@ class FakeManager:
         self.closed.append((session_key, False))
         return True
 
-    async def doctor(self, agent_id: str) -> dict[str, Any]:
+    async def doctor(self, agent_id: str, *, probe: bool = False) -> dict[str, Any]:
         return {"probe": "ok", "agent_id": agent_id}
 
 

@@ -217,7 +217,7 @@ class FakeRuntime:
     async def set_config_option(self, handle: AcpSessionHandle, key: str, value: Any) -> None:
         return None
 
-    async def doctor(self, agent_id: str) -> dict[str, Any]:
+    async def doctor(self, agent_id: str, *, probe: bool = False) -> dict[str, Any]:
         return {"agent_id": agent_id, "probe": "ok", "version": "9.9.9"}
 
 
@@ -354,7 +354,7 @@ def test_doctor_uses_gateway_payload(config_file: Path, online) -> None:
 
 def test_probe_timeout_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     class Slow:
-        async def doctor(self, agent_id: str) -> dict[str, Any]:
+        async def doctor(self, agent_id: str, *, probe: bool = False) -> dict[str, Any]:
             await asyncio.sleep(1)
             return {}
 

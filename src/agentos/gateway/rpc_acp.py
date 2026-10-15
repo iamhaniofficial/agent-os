@@ -143,7 +143,7 @@ async def _probe(manager: Any, agent_id: str) -> dict[str, Any]:
     if not callable(doctor):
         return {"probe": "error", "error": "runtime does not support doctor probes"}
     try:
-        result = await asyncio.wait_for(_maybe_await(doctor(agent_id)), PROBE_TIMEOUT_S)
+        result = await asyncio.wait_for(_maybe_await(doctor(agent_id, probe=True)), PROBE_TIMEOUT_S)
     except TimeoutError:
         return {"probe": "error", "error": f"probe timed out after {int(PROBE_TIMEOUT_S)}s"}
     except Exception as exc:  # noqa: BLE001 - report, do not fail the whole doctor

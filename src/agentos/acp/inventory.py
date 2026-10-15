@@ -178,6 +178,8 @@ def read_session_records(state_dir: Path) -> list[dict[str, Any]]:
     rows = _records_via_store(state_dir)
     if rows is None:
         rows = _records_from_disk(state_dir)
+    # Store records nest agent_id/status/mode/cwd/last_used_at under "handle".
+    rows = [{**r["handle"], **r} if isinstance(r.get("handle"), dict) else r for r in rows]
     rows.sort(key=lambda r: float(r.get("last_used_at") or r.get("created_at") or 0), reverse=True)
     return rows
 
