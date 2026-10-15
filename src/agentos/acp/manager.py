@@ -158,6 +158,35 @@ class AcpSessionManager:
         self._live = 0
         self._slot_cond: asyncio.Condition | None = None
         self._shutting_down = False
+        #: Set by the gateway wiring; ``None`` when the bridges are not built.
+        self.permission_bridge: Any = None
+        self.elicitation_bridge: Any = None
+
+    # ------------------------------------------------------- bridge binding
+
+    def bind_permissions(
+        self,
+        session_key: str,
+        *,
+        permission_mode: str | None = None,
+        requester_ctx: Any = None,
+        interactive: bool | None = None,
+    ) -> None:
+        """Tell the permission bridge which mode and operator surface this
+        session has (spawn-time ``ToolContext`` decides unattended vs not)."""
+        bind = getattr(self.permission_bridge, "bind_session", None)
+        if callable(bind):
+            bind(
+                session_key,
+                permission_mode=permission_mode,
+                requester_ctx=requester_ctx,
+                interactive=interactive,
+            )
+
+    def _forget_permissions(self, session_key: str) -> None:
+        forget = getattr(self.permission_bridge, "forget_session", None)
+        if callable(forget):
+            forget(session_key)
 
     # ------------------------------------------------------------ properties
 
@@ -570,6 +599,7 @@ class AcpSessionManager:
             await self._close_handle(state, discard=discard, reason=reason)
         await self.update_origin(session_key, closed=True)
         self._forget(state)
+        self._forget_permissions(session_key)
         return had_handle
 
     async def _live_handle(self, session_key: str) -> AcpSessionHandle:

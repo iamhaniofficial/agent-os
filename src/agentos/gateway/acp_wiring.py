@@ -104,7 +104,13 @@ def build_acp_manager(config: Any, *, session_manager: Any) -> AcpSessionManager
         "session_manager": session_manager,
     }
     permission_bridge = _build_bridge("permissions", "ApprovalQueuePermissionBridge", common)
-    elicitation_bridge = _build_bridge("elicitation", "ApprovalQueueElicitationBridge", common)
+    elicitation_candidates = dict(common)
+    is_unattended = getattr(permission_bridge, "is_unattended", None)
+    if callable(is_unattended):
+        elicitation_candidates["is_unattended"] = is_unattended
+    elicitation_bridge = _build_bridge(
+        "elicitation", "ApprovalQueueElicitationBridge", elicitation_candidates
+    )
     try:
         runtime_cls = importlib.import_module("agentos.acp.runtime").AcpRuntimeImpl
     except (ImportError, AttributeError) as exc:
@@ -135,7 +141,10 @@ def build_acp_manager(config: Any, *, session_manager: Any) -> AcpSessionManager
         )
     if permission_bridge is None:
         log.warning("acp.wiring.no_permission_bridge")
-    return AcpSessionManager(runtime, config=acp_cfg, session_manager=session_manager)
+    manager = AcpSessionManager(runtime, config=acp_cfg, session_manager=session_manager)
+    manager.permission_bridge = permission_bridge
+    manager.elicitation_bridge = elicitation_bridge
+    return manager
 
 
 async def reap_stale_leases(config: Any) -> int:

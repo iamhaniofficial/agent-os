@@ -381,6 +381,9 @@ async def spawn_acp_session(
         if worktree_info is not None:
             await _discard_worktree(worktree_info)
         raise
+    # The spawning turn's context decides whether an operator can answer the
+    # harness's permission prompts (cron / channel automation cannot).
+    manager.bind_permissions(session_key, requester_ctx=ctx)
     envelope = build_subagent_route_envelope(
         session_key=session_key,
         parent_session_key=parent_session_key,
