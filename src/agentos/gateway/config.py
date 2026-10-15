@@ -304,6 +304,12 @@ class TaskRuntimeConfig(BaseModel):
     # historical behaviour — used together with
     # ``stream_relay_coalesce_ms`` to enable batching.
     stream_relay_coalesce_chars: int = Field(default=0, ge=0)
+    # Run the independent reads before a turn's first model request (provider
+    # recall, project knowledge, deferred-tool hydrate, router context, the
+    # first-turn memory index warm) concurrently instead of one after another.
+    # The assembled prompt is the same either way; ``false`` restores the
+    # serial order.
+    concurrent_turn_setup: bool = True
 
     @field_validator("pending_overflow_policy")
     @classmethod
@@ -722,6 +728,11 @@ class MemoryConfig(BaseSettings):
     # External memory provider (Plan B). Disabled by default (name=None) — the
     # provider layer is never imported unless a provider is explicitly selected.
     provider: MemoryProviderSettings = Field(default_factory=MemoryProviderSettings)
+    # Hard deadline for the external provider's per-turn recall. A recall that
+    # misses it does not hold the turn: the turn goes on without it and the
+    # recall finishes in the background, standing in on the next turn if that
+    # one is late too.
+    recall_timeout_seconds: float = Field(default=1.5, gt=0)
 
 
 def _tier(

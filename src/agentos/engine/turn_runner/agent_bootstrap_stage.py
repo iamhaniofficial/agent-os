@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
     from agentos.engine.agent import Agent, ToolHandler
     from agentos.engine.turn_runner.outcome import StageOutcome
     from agentos.engine.types import AgentConfig, ThinkingLevel
@@ -192,6 +194,7 @@ class MemorySnapshotPort(Protocol):
         *,
         agent_id: str,
         session_key: str,
+        warmed: bool = False,
     ) -> _MemorySnapshotResult: ...
 
 @runtime_checkable
@@ -257,6 +260,10 @@ class AgentBootstrapStageInput:
     request_timeout: float | None
     max_provider_retries: int | None
     length_capped_continuations: int | None
+    # ``sync_manager.warm_session`` already started earlier in the turn (see
+    # ``pre_provider_io``). Awaited before the snapshot capture, which then
+    # skips its own warm. ``None`` warms here, as before.
+    pending_memory_warm: Awaitable[None] | None = None
 
 @dataclass(frozen=True)
 class AgentBootstrapStageOutput:
@@ -425,10 +432,18 @@ class AgentBootstrapStage:
         )
 
         # 5. Warm session and capture memory snapshot (async, dict-mutating)
-        memory = await self._memory_snapshot.warm_and_capture(
-            agent_id=inp.agent_id,
-            session_key=inp.session_key,
-        )
+        if inp.pending_memory_warm is not None:
+            await inp.pending_memory_warm
+            memory = await self._memory_snapshot.warm_and_capture(
+                agent_id=inp.agent_id,
+                session_key=inp.session_key,
+                warmed=True,
+            )
+        else:
+            memory = await self._memory_snapshot.warm_and_capture(
+                agent_id=inp.agent_id,
+                session_key=inp.session_key,
+            )
 
         # 7. Construct the Agent from the typed runtime parameters.
         agent = self._agent_factory.build(

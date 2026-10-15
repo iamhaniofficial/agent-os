@@ -912,6 +912,33 @@ Memory can combine Markdown-backed sources with SQLite keyword and semantic
 indexes. The exact memory shape depends on the configured provider and local
 embedding support.
 
+An external memory provider (`[memory.provider]`) is asked for recall before
+every turn. `[memory] recall_timeout_seconds` (default `1.5`) is a hard
+deadline on that recall: a slower recall does not hold the turn, which goes on
+without it and logs `memory.recall_timeout`. The late recall is not cancelled;
+it finishes in the background and its result stands in on the session's next
+turn if that turn's recall is late too.
+
+```toml
+[memory]
+recall_timeout_seconds = 1.5
+```
+
+### Turn setup concurrency
+
+Before a turn's first model request AgentOS reads several independent things:
+the memory-provider recall, the session's project knowledge, the deferred tools
+the session has loaded, the recent transcript for the router, and on the first
+turn of a session the memory index warm-up. `[task_runtime]
+concurrent_turn_setup` (default `true`) runs them concurrently and applies the
+results in the same order as before, so the prompt is byte-identical either
+way. Set it to `false` to go back to running them one after another.
+
+```toml
+[task_runtime]
+concurrent_turn_setup = true
+```
+
 Read: [`features/memory.md`](features/memory.md)
 
 ## Auxiliary Model

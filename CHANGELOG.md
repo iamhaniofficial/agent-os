@@ -49,6 +49,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `--json`. (#3648)
 
 ### Changed
+- Turn setup runs its independent reads concurrently: the external memory
+  provider's recall, the session's project knowledge, the deferred-tool
+  hydrate, the router's transcript read and the first-turn memory index warm
+  now overlap instead of running one after another before the first model
+  request. Results are applied in the old order, so the prompt is
+  byte-identical. `[task_runtime] concurrent_turn_setup = false` restores the
+  serial order.
+- Memory-provider recall has a hard deadline, `[memory]
+  recall_timeout_seconds` (default 1.5, was a fixed 3 s). A late recall no
+  longer holds the turn and is no longer cancelled: it finishes in the
+  background and stands in on the session's next turn if that recall is late
+  too. A timeout logs `memory.recall_timeout`.
 - Anthropic prompt cache now covers the whole conversation, not only the
   system prompt: breakpoints on the system prompt, the last tool definition
   and a rolling one on the last block of the last user message (at most four),
