@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+- ACP harness permission prompts and questions reach the operator through the
+  approval queue (`acp` and `acp_elicitation` namespaces) under
+  `[acp].permission_mode`; `approval.list` lists every namespace with a title
+  and `exec.approval.resolve` accepts a `payload` for form answers.
+
 ## [2026.10.13] - 2026-10-13
 
 ### Added
