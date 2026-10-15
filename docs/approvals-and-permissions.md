@@ -109,6 +109,45 @@ drops every grade recorded for that path.
 The Web UI also provides an approvals surface for reviewing pending actions
 outside the message scrollback.
 
+### Coding-Harness (ACP) Prompts
+
+Coding harnesses started with `sessions_spawn(runtime="acp")` (Claude Code,
+Codex, Gemini CLI, ...) ask for permission through the same approval queue,
+in two extra namespaces:
+
+| Namespace | What it is | Approve means | Deny / timeout means |
+| --- | --- | --- | --- |
+| `acp` | The harness wants to run a command, edit a file, fetch a URL, ... Shown as `"<harness> wants to <kind>: <title>"`, for example `Codex wants to run: git push`. | Allow this one call. | Reject this call; the harness carries on without it. |
+| `acp_elicitation` | The harness asks a question (a small form) or asks you to finish a step in the browser (a link). Shown as `"<harness> asks: <message>"` or `"<harness> asks you to open a link: <url>"`. | Answer: forms send their values as the resolve payload `{"content": {"<field>": <value>}}`; a link means "I finished the step". | Decline. |
+
+How a harness prompt is answered depends on `[acp].permission_mode`:
+
+| `permission_mode` | Behaviour |
+| --- | --- |
+| `ask` (default) | Every prompt waits in the approval queue for up to `[acp].approval_timeout_s` (default 900 s); no answer rejects it. |
+| `approve-reads` | Reads, searches, fetches and thinking are allowed without asking; anything else is asked as above. |
+| `approve-all` | Everything is allowed without asking. |
+| `deny-all` | Everything is rejected without asking. |
+
+A spawn may pick a stricter mode than the configured one, never a looser one.
+When nobody can answer (an unattended cron or channel run), `ask` follows
+`[acp].non_interactive_permissions`: `fail` (default) ends the harness turn
+with `ACP_PERMISSION_PROMPT_UNAVAILABLE`, `deny` rejects the prompt and lets
+the harness continue. Questions are always declined when nobody can answer.
+
+Choosing **Always** (or **Bypass**) on an `acp` prompt remembers the grant for
+that harness session only, per tool kind and, for commands, per program and
+subcommand (`git push`): it never changes the session's elevated mode and is
+forgotten when the harness session closes. Forms are asked at most three
+questions at a time, a secret field always on its own; answers are cleared from
+the queue as soon as the harness has them and are never logged. Questions time
+out after 15 minutes.
+
+Over RPC, `approval.list` lists pending approvals of every namespace with a
+readable `title` (`params.namespace` narrows it), and `exec.approval.resolve`
+(or `POST /api/approvals/resolve`) accepts an optional `payload` object for
+form answers.
+
 ## Sandbox Posture
 
 Inspect sandbox posture:

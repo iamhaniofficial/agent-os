@@ -266,6 +266,7 @@ class ServiceContainer:
     # over `memory_managers` (each manager's `.provider_manager`).
     memory_provider_managers: dict[str, Any] = field(default_factory=dict)
     task_runtime: Any = None
+    acp_manager: Any = None
     heartbeat_loop: Any = None
     heartbeat_watcher: Any = None
     log_retention_sweeper: Any = None
@@ -350,6 +351,14 @@ class ServiceContainer:
                 set_task_runtime(None)
             except Exception:
                 pass
+        if self.acp_manager is not None:
+            try:
+                from agentos.gateway.acp_wiring import stop_acp
+
+                await stop_acp(self.acp_manager)
+            except Exception:
+                pass
+            self.acp_manager = None
 
         # ── 2. Tear down memory tier through MemoryManager ──
         # In real boot, the legacy `memory_watchers` / `memory_stores` below
@@ -654,6 +663,24 @@ async def dispatch_task_runtime_turn(
     session = None
     if session_manager is not None and hasattr(session_manager, "get_session"):
         session = await session_manager.get_session(run.session_key)
+    if _is_acp_session_row(session):
+        # ACP coding-harness session: the turn runs in an external harness,
+        # streamed through the same event path. Silence is not failure, so no
+        # idle timeout; heartbeats keep the UI showing a live run.
+        from agentos.gateway.acp_dispatch import acp_turn_stream
+
+        await _emit_task_runtime_stream_events(
+            acp_turn_stream(run, session=session, config=config, session_manager=session_manager),
+            run.session_key,
+            event_emitter,
+            idle_timeout=None,
+            heartbeat_interval=_optional_positive_timeout(
+                config, "agent_stream_heartbeat_interval_seconds", 15.0
+            ),
+            stream_event_sink=getattr(run, "stream_event_sink", None),
+            show_thinking=bool(getattr(getattr(config, "control_ui", None), "show_thinking", True)),
+        )
+        return
     run_kwargs = build_task_runtime_run_kwargs(
         run,
         tool_context=tool_context,
@@ -713,6 +740,11 @@ async def dispatch_task_runtime_turn(
                         error=str(rb_exc),
                     )
         raise
+
+
+def _is_acp_session_row(session: Any) -> bool:
+    origin = getattr(session, "origin", None) if session is not None else None
+    return isinstance(origin, dict) and origin.get("kind") == "acp"
 
 
 def build_task_runtime_run_kwargs(
@@ -820,7 +852,7 @@ def _make_task_session_lifecycle_listener(
     event_emitter: Any,
 ) -> Any:
     async def _listener(event: TaskLifecycleEvent) -> None:
-        if event.run_kind == "subagent":
+        if event.run_kind in ("subagent", "acp"):
             return
         changed = await apply_task_lifecycle_to_session(
             event,
@@ -920,11 +952,18 @@ async def _emit_task_runtime_stream_events(
             code_text = str(code or "").lower()
             is_timeout = "timeout" in code_text or "stream idle" in error_message.lower()
             is_output_truncated = code_text == "provider_output_truncated"
+            is_cancelled = "cancelled" in code_text
             terminal_reason = (
-                "timeout" if is_timeout else "output_truncated" if is_output_truncated else "error"
+                "timeout"
+                if is_timeout
+                else "cancelled"
+                if is_cancelled
+                else "output_truncated"
+                if is_output_truncated
+                else "error"
             )
             terminal_payload = {
-                "status": "timeout" if is_timeout else "failed",
+                "status": "timeout" if is_timeout else "cancelled" if is_cancelled else "failed",
                 "terminal_reason": terminal_reason,
                 "error_class": code,
                 "error_message": error_message,
@@ -2427,6 +2466,15 @@ async def start_gateway_server(
     from agentos.tools.builtin.sessions import set_task_runtime
 
     set_task_runtime(task_runtime)
+
+    # ACP coding harnesses: reap processes a crashed gateway left behind and
+    # publish the session manager. Degrades to "ACP unavailable", never fails boot.
+    try:
+        from agentos.gateway.acp_wiring import start_acp
+
+        svc.acp_manager = await start_acp(config, session_manager=svc.session_manager)
+    except Exception:  # noqa: BLE001
+        log.warning("acp.boot_failed", exc_info=True)
 
     # Resolve HEARTBEAT.md path; instantiate Runner + Watcher;
     # start Watcher BEFORE the Loop so the first tick already sees any

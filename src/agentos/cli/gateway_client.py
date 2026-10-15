@@ -574,23 +574,22 @@ class GatewayClient:
         approved: bool,
         *,
         allow_always: bool = False,
+        payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Approve or deny a pending approval by id.
 
         ``allow_always`` populates the session-lifetime intent cache so the
-        same destructive intent doesn't prompt again.
+        same destructive intent doesn't prompt again. ``payload`` carries
+        answers for an ACP elicitation form (``{"content": {...}}``).
         """
-        return cast(
-            dict[str, Any],
-            await self._call(
-                "exec.approval.resolve",
-                {
-                    "id": approval_id,
-                    "approved": approved,
-                    "allowAlways": allow_always,
-                },
-            ),
-        )
+        params: dict[str, Any] = {
+            "id": approval_id,
+            "approved": approved,
+            "allowAlways": allow_always,
+        }
+        if payload is not None:
+            params["payload"] = payload
+        return cast(dict[str, Any], await self._call("exec.approval.resolve", params))
 
     async def send_message(
         self,

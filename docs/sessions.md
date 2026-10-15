@@ -160,6 +160,19 @@ with, not a membership boundary.
 - Existing databases migrate automatically on gateway start: old sessions
   come up project-less (`project_id` empty) and behave exactly as before.
 
+## ACP Harness Sessions
+
+When the agent delegates to an external coding harness with
+`sessions_spawn(runtime="acp", acp_agent="claude", ...)`, the child is a
+regular session whose key looks like `agent:main:acp:1a2b3c4d`. It shows up
+in `agentos sessions list`, keeps its own transcript and token/cost totals,
+and its final answer is pushed back to the parent with a `Stats:` line.
+`oneshot` children close after one turn; `persistent` ones accept
+`sessions_send` follow-ups (`steer` cancels the running turn first).
+`agentos acp sessions` lists the harness side (process, resume record),
+`agentos acp cancel <key>` stops a running turn and `agentos acp close
+<key>` ends the harness. See [`acp-agents.md`](acp-agents.md).
+
 ## Web UI Workflow
 
 The Web UI uses the same session system. In the control console, use the chat

@@ -90,6 +90,11 @@ TERMINAL_STATUSES = frozenset(
     }
 )
 
+#: Run kinds that are children of another session: they share the subagent
+#: reserved-slot budget and announce completion to the parent. ``acp`` is a
+#: coding-harness child spawned by ``sessions_spawn(runtime="acp")``.
+_CHILD_RUN_KINDS = frozenset({"subagent", "acp"})
+
 TaskStreamEventSink = Callable[[Any], Awaitable[None]]
 
 
@@ -978,9 +983,14 @@ class TaskRuntime:
             )
         except Exception as exc:  # noqa: BLE001 - runtime ledger records the class.
             terminal_reason = str(getattr(exc, "terminal_reason", None) or "error")
-            status = (
-                AgentTaskStatus.TIMEOUT if terminal_reason == "timeout" else AgentTaskStatus.FAILED
-            )
+            if terminal_reason == "timeout":
+                status = AgentTaskStatus.TIMEOUT
+            elif terminal_reason == "cancelled":
+                # An operator or agent cancel surfaced through the turn stream
+                # (ACP harness turns): not a failure, do not invite a retry.
+                status = AgentTaskStatus.CANCELLED
+            else:
+                status = AgentTaskStatus.FAILED
             await self._mark_terminal(
                 task,
                 status,
@@ -1092,7 +1102,7 @@ class TaskRuntime:
                 if rr and rr[0] == session_key:
                     rr.rotate(-1)
                 self._global_in_flight += 1
-                if task.run_kind == "subagent":
+                if task.run_kind in _CHILD_RUN_KINDS:
                     self._subagent_in_flight += 1
                 self._agent_in_flight[agent_id] = self._agent_in_flight.get(agent_id, 0) + 1
                 task.acquired_slot = True
@@ -1110,7 +1120,7 @@ class TaskRuntime:
         """Block subagent tasks until at least ``reserved_slots+1`` capacity
         is free, so non-subagent tasks always have a fair runway.
         """
-        if task.run_kind != "subagent" or self._subagent_reserved_slots <= 0:
+        if task.run_kind not in _CHILD_RUN_KINDS or self._subagent_reserved_slots <= 0:
             return
         cond = self._ensure_slot_cond()
         async with cond:
@@ -1121,7 +1131,7 @@ class TaskRuntime:
         async with self._state_lock:
             if task.acquired_slot:
                 self._global_in_flight = max(0, self._global_in_flight - 1)
-                if task.run_kind == "subagent":
+                if task.run_kind in _CHILD_RUN_KINDS:
                     self._subagent_in_flight = max(0, self._subagent_in_flight - 1)
                 agent_id = task.envelope.agent_id
                 new_count = max(0, self._agent_in_flight.get(agent_id, 0) - 1)
@@ -1441,7 +1451,7 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
     ) -> None:
-        if self._terminal_listener is None or task.run_kind != "subagent":
+        if self._terminal_listener is None or task.run_kind not in _CHILD_RUN_KINDS:
             return
         parent_session_key = task.envelope.metadata.get("parent_session_key")
         if not isinstance(parent_session_key, str) or not parent_session_key:

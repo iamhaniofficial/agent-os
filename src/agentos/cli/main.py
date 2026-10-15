@@ -93,6 +93,7 @@ _route_logs_to_stderr()
 load_env()
 warn_if_proxy_ignored()
 
+from agentos.cli.acp_cmd import app as acp_app  # noqa: E402
 from agentos.cli.agent_cmd import run_agent_command  # noqa: E402
 from agentos.cli.agents_cmd import agents_app  # noqa: E402
 from agentos.cli.auth_cmd import auth_app  # noqa: E402
@@ -131,6 +132,7 @@ app = typer.Typer(
 
 # ── Sub-apps ─────────────────────────────────────────────────────────────────
 
+app.add_typer(acp_app, name="acp")
 app.add_typer(auth_app, name="auth")
 app.add_typer(channels_app, name="channels")
 app.add_typer(agents_app, name="agents")

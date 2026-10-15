@@ -12,6 +12,8 @@ AgentOS. It covers:
   record.
 - The bundled skill descriptors under `src/agentos/skills/bundled/`, which
   include OpenClaw-derived MIT descriptors and AgentOS-original descriptors.
+- The ACP coding-harness consumer under `src/agentos/acp/`, whose harness
+  registry and runtime design are derived from OpenClaw's `acpx` (MIT).
 - The bundled pptx skill references the python-pptx and PptxGenJS libraries;
   AgentOS does not vendor those libraries, but the skill instructs the
   agent runtime to invoke them and is documented here for transparency.
@@ -120,7 +122,11 @@ license terms apply uniformly; the full license text is included in the
 - Copyright notice: Copyright (c) 2025 Peter Steinberger
 
 Note: the `sub-agent` descriptor retains OpenClaw upstream lineage and MIT
-attribution.
+attribution. Its current text is a rewrite whose structure (harness alias
+table, spawn / wait / steer flow, failure handling, raw-CLI fallback) follows
+OpenClaw's `acp-router` skill
+(`extensions/acpx/skills/acp-router/SKILL.md`, OpenClaw commit `c476ce6d`),
+adapted to AgentOS's `sessions_spawn(runtime="acp")` surface.
 
 The descriptor text instructs the agent runtime how to use built-in skill
 surfaces and external tools; AgentOS does not redistribute third-party CLIs
@@ -132,6 +138,59 @@ OpenClaw-derived bundled descriptor files.
 MIT License
 
 Copyright (c) 2025 Peter Steinberger
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## OpenClaw acpx-derived ACP coding-harness consumer
+
+- Components:
+  - `src/agentos/acp/registry.py` — the built-in harness table (agent ids,
+    aliases, launch argv, adapter package ranges, required CLIs) is derived
+    from the acpx agent registry (`dist/agent-registry-*.js`, acpx 0.19.4)
+    and OpenClaw's ACP agent docs.
+  - The design of `src/agentos/acp/` as a whole (runtime, process leases and
+    the orphan reaper, session store and resume rules, Codex home isolation,
+    permission and elicitation bridges, event projection) and the
+    `agentos acp` CLI follow OpenClaw's ACP runtime (`src/acp/`,
+    `packages/acp-core/`, `extensions/acpx/src/`, OpenClaw commit
+    `c476ce6d`). The Python code is a rewrite, not a copy; files that adapt
+    a specific upstream routine say so in a provenance comment.
+  - `docs/acp-agents.md` — the harness table and its upstream links follow
+    OpenClaw's `docs/tools/acp-agents-setup.md`.
+- Upstream projects: https://github.com/openclaw/openclaw and
+  https://github.com/openclaw/acpx
+- License: MIT (both)
+- Copyright notices: Copyright (c) 2026 OpenClaw Foundation (OpenClaw);
+  Copyright (c) 2025 OpenClaw Team (acpx)
+
+AgentOS does not redistribute OpenClaw or acpx. Harness adapters such as
+`@agentclientprotocol/claude-agent-acp` and `@agentclientprotocol/codex-acp`
+are downloaded by the user's own `npx` / `uvx` at run time and are not
+bundled. The upstream permission notice, identical for both projects apart
+from the copyright line above, is reproduced below.
+
+```
+MIT License
+
+Copyright (c) 2026 OpenClaw Foundation
+Copyright (c) 2025 OpenClaw Team
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

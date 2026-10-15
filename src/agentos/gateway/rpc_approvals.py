@@ -7,6 +7,7 @@ from typing import Any
 from agentos.application.approval_queue import get_approval_queue
 from agentos.application.approval_rpc import (
     approval_forget_rpc_payload,
+    approval_pending_rpc_payload,
     approval_request_rpc_payload,
     approval_resolve_rpc_payload,
     approval_settings_rpc_payload,
@@ -141,7 +142,20 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
         allow_always=allow_always,
         remember_intent=remember_intent,
         elevated_mode=elevated_mode,
+        payload=params.get("payload"),
     )
+
+
+@_d.method("approval.list")
+async def _handle_approval_list(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Pending approvals across namespaces (exec, plugin, acp, acp_elicitation).
+
+    ``params.namespace`` (optional) narrows the list to one namespace.
+    """
+    namespace = params.get("namespace") if isinstance(params, dict) else None
+    if namespace is not None and not isinstance(namespace, str):
+        raise ValueError("params.namespace must be a string")
+    return approval_pending_rpc_payload(get_approval_queue(), namespace)
 
 
 @_d.method("plugin.approval.request")

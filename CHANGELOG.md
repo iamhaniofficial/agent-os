@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- ACP coding harnesses. The agent can delegate coding work to Claude Code,
+  Codex, Gemini CLI, Cursor, GitHub Copilot, OpenCode and 20 more external
+  coding agents over the Agent Client Protocol:
+  `sessions_spawn(runtime="acp", acp_agent="claude", task=..., cwd=...)`
+  starts the harness as a child session (`agent:<id>:acp:<hex>`), streams
+  structured events, routes its permission prompts to the approval queue
+  (`[acp] permission_mode`: `ask`, `approve-reads`, `approve-all`,
+  `deny-all`), keeps resumable session records, and pushes the final answer
+  back to the parent with a `Stats:` line (runtime, tokens, USD cost when the
+  harness reports it). Harness processes hold leases and are reaped at
+  gateway start; Codex runs with its own trusted `CODEX_HOME`. New
+  `agentos acp list|doctor|run|sessions|cancel|close` commands (`run` drives
+  a harness by hand with no gateway), `acp.agents`, `acp.doctor`,
+  `acp.sessions`, `acp.cancel` and `acp.close` gateway RPC methods, an
+  `[acp]` config section, and `docs/acp-agents.md`. The `sub-agent` skill is
+  now a thin router onto this path (raw `codex exec` / `claude -p` only as a
+  fallback) with current CLI flags.
+- ACP runtime (`agentos.acp.runtime`): drives ACP harnesses over stdio in their own
+  process group with a lease file and a redacted stderr log, normalizes `session/update`
+  into `AcpEvent`s, resumes via `session/load`, enforces turn timeouts and the
+  cancel -> SIGTERM -> SIGKILL ladder, isolates `CODEX_HOME`, and reaps harnesses left
+  by an earlier gateway.
+- ACP harness permission prompts and questions reach the operator through the
+  approval queue (`acp` and `acp_elicitation` namespaces) under
+  `[acp].permission_mode`; `approval.list` lists every namespace with a title
+  and `exec.approval.resolve` accepts a `payload` for form answers.
+- ACP sessions: `sessions_spawn(runtime="acp")` hands a task to a coding harness
+  and pushes the result back to the parent with a `Stats:` line (runtime,
+  tokens, cost when the harness reports it); `sessions_send` follows up or
+  steers a persistent one, `subagents` lists and kills them, the new `acp`
+  tool inspects and controls them, `worktree=true` gives the harness its own
+  git worktree, and `[acp] allowed_cwds` lets it work outside the workspace.
+
 ## [2026.10.13] - 2026-10-13
 
 ### Added

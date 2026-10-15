@@ -389,6 +389,7 @@ Supported sections:
 | Configure messaging platforms | `agentos configure channels` |
 | Inspect current values | `agentos config get` |
 | Persist an advanced key | `agentos config set <key> <value> --config <path>` |
+| Delegate coding to Claude Code / Codex | `agentos acp doctor`, then `[acp]` (see below) |
 
 ## Provider Configuration
 
@@ -1099,6 +1100,61 @@ suggest_next_timeout_seconds = 15.0
 [auxiliary.tasks.suggest_next]
 model = "openai/gpt-4o-mini"         # or AGENTOS_SUGGEST_NEXT_MODEL
 ```
+
+## ACP Coding Harnesses
+
+`[acp]` controls how AgentOS drives external coding harnesses (Claude Code,
+Codex, Gemini CLI, Cursor, ...) over the Agent Client Protocol. The defaults
+work without any `[acp]` table; nothing starts until the agent spawns an ACP
+session or you run `agentos acp run`.
+
+```toml
+[acp]
+enabled = true
+default_agent = "claude"
+allowed_agents = ["*"]
+permission_mode = "ask"
+non_interactive_permissions = "fail"
+approval_timeout_s = 900
+turn_timeout_s = 0
+max_concurrent = 8
+# state_dir = "~/.agentos/state/acp"
+isolate_codex_home = true
+install_missing_adapters = true
+stream_delivery = "final_only"
+allowed_cwds = []
+
+[acp.agents.cursor]
+command = "agent"
+args = ["acp"]
+env = {}
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | `false` refuses ACP spawns and `agentos acp run`. |
+| `default_agent` | `"claude"` | Harness used when `sessions_spawn(runtime="acp")` names none. |
+| `allowed_agents` | `["*"]` | Harness ids the agent may launch; `*` = any. |
+| `permission_mode` | `"ask"` | Who answers harness permission prompts: `ask` (approval queue), `approve-reads`, `approve-all`, `deny-all`. |
+| `non_interactive_permissions` | `"fail"` | `ask` with nobody to answer: `fail` the turn or `deny` the request. |
+| `approval_timeout_s` | `900` | Seconds an `ask` prompt waits before it is rejected. |
+| `turn_timeout_s` | `0` | Wall-clock limit per harness turn; `0` = none. |
+| `max_concurrent` | `8` | Live harness sessions per gateway (1-64). |
+| `state_dir` | unset | Overrides `<state>/acp` (session records, leases, logs, Codex home, worktrees). |
+| `isolate_codex_home` | `true` | Give Codex its own `CODEX_HOME` with your login copied in and the session directory trusted. |
+| `install_missing_adapters` | `true` | Allow the `npx -y` / `uvx` adapter download on first use. |
+| `stream_delivery` | `"final_only"` | `final_only` sends the harness's answer once at the end; `live` streams text as it arrives. |
+| `agents.<id>.command` / `args` | unset | Replace the built-in launch command for that harness, or add a new harness id. |
+| `agents.<id>.env` | `{}` | Extra environment for that harness only. |
+| `allowed_cwds` | `[]` | Extra directories a harness may use as `cwd`; otherwise `cwd` must be inside the agent workspace or a managed worktree. |
+
+```sh
+agentos config set acp.permission_mode approve-reads
+agentos config set acp.default_agent codex
+agentos acp doctor
+```
+
+Changes apply after a gateway restart. Read: [`acp-agents.md`](acp-agents.md)
 
 ## Sandbox and Permissions
 

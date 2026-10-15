@@ -12,6 +12,7 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # It imports nothing from agentos, so these edges are leaves and cannot
     # participate in a cycle.
     ("application", "util"),
+    ("acp", "util"),
     ("channels", "util"),
     ("engine", "util"),
     ("gateway", "util"),
@@ -20,6 +21,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("sandbox", "util"),
     ("session", "util"),
     ("tools", "util"),
+    # The ACP permission/elicitation bridges queue operator prompts on the
+    # application ApprovalQueue (application does not import acp).
+    ("acp", "application"),
     ("agents", "gateway"),
     ("agents", "identity"),
     ("agents", "onboarding"),
@@ -29,6 +33,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("channels", "gateway"),
     ("channels", "session"),
     ("channels", "tools"),
+    # The ACP consumer (agentos.acp) depends only on stdlib + typing at its
+    # core; the CLI and the acp.* RPC read its registry and contract types.
+    ("cli", "acp"),
     ("cli", "agents"),
     ("cli", "compat"),
     ("cli", "contracts"),
@@ -83,9 +90,15 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # is pulled in until a surface actually asks for a listing.
     ("env_catalog.py", "onboarding"),
     ("env_catalog.py", "skills"),
+    ("gateway", "acp"),
     ("gateway", "agentos_router"),
     ("gateway", "compat"),
     ("onboarding", "agentos_router"),
+    # ACP coding-harness consumer: agentos.acp is a leaf (contract types,
+    # registry, session manager, projector, worktrees) that imports nothing
+    # else from agentos; the gateway dispatch/boot wiring and the spawn tools
+    # sit on top of it.
+    ("gateway", "acp"),
     ("gateway", "agents"),
     ("gateway", "application"),
     ("gateway", "chat"),
@@ -166,6 +179,7 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("skills", "provider"),
     ("skills", "safety"),
     ("skills", "tools"),
+    ("tools", "acp"),
     ("tools", "agents"),
     ("tools", "channels"),
     ("tools", "engine"),

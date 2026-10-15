@@ -119,21 +119,75 @@ def approval_resolve_rpc_payload(
     allow_always: bool = False,
     remember_intent: bool = False,
     elevated_mode: str | None = None,
+    payload: Any = None,
 ) -> dict[str, Any]:
-    """Resolve an approval and return its status payload."""
+    """Resolve an approval and return its status payload.
 
+    ``payload`` (a dict, optional) is answer data for the waiter -- ACP
+    elicitation forms send ``{"content": {...}}`` here. Anything that is not
+    a dict is ignored.
+    """
+
+    if payload is not None and not isinstance(payload, dict):
+        raise ValueError("params.payload must be an object")
     queue.resolve(
         approval_id,
         approved,
         allow_always=allow_always,
         remember_intent=remember_intent,
         elevated_mode=elevated_mode,
+        payload=payload,
     )
     return approval_status_rpc_payload(queue, approval_id, queue.get_settings().mode)
 
 
+def approval_display_title(namespace: str, params: dict[str, Any] | None) -> str:
+    """One readable line describing a pending approval, for any namespace.
+
+    ACP rows carry a precomputed ``displayTitle`` (``"Codex wants to run:
+    git push"``); exec and plugin rows are described from their own fields.
+    """
+
+    p = params if isinstance(params, dict) else {}
+    title = p.get("displayTitle")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    if namespace == "plugin":
+        plugin = str(p.get("pluginId") or "plugin")
+        return f"Plugin {plugin} requests permissions"
+    tool = str(p.get("toolName") or p.get("action_kind") or namespace or "tool")
+    command = p.get("command")
+    if not command and isinstance(p.get("argv"), list):
+        command = " ".join(str(part) for part in p["argv"])
+    return f"{tool}: {command}" if command else tool
+
+
+def approval_pending_rpc_payload(
+    queue: ApprovalQueue, namespace: str | None = None
+) -> dict[str, Any]:
+    """List pending approvals (optionally one namespace) with display titles."""
+
+    items = []
+    for entry in queue.list_pending(namespace or None):
+        params = entry.get("params") or {}
+        items.append(
+            {
+                "id": entry["id"],
+                "namespace": entry["namespace"],
+                "title": approval_display_title(str(entry["namespace"]), params),
+                "sessionKey": params.get("sessionKey") or params.get("session_key") or "",
+                "createdAt": entry.get("created_at"),
+                "expiresAt": entry.get("expires_at"),
+                "params": params,
+            }
+        )
+    return {"pending": items, "mode": queue.get_settings().mode}
+
+
 __all__ = [
+    "approval_display_title",
     "approval_forget_rpc_payload",
+    "approval_pending_rpc_payload",
     "approval_request_rpc_payload",
     "approval_resolve_rpc_payload",
     "approval_settings_rpc_payload",
