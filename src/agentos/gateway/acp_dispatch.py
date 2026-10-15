@@ -13,27 +13,43 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from typing import Any
 
 import structlog
 
+from agentos.acp import projector as _projected
 from agentos.acp.manager import AcpSessionManager, get_acp_manager, spec_from_origin
 from agentos.acp.projector import (
     COST_READING_KEY,
     HARNESS_COST_SOURCE,
     AcpProjector,
-    EngineEvent,
     cost_delta,
     error_event,
     last_turn_record,
     usage_update_fields,
 )
+from agentos.acp.projector import ErrorEvent as ProjectedError
 from agentos.acp.types import AcpError, AcpTurnError, AcpTurnResult
-from agentos.engine.types import ErrorEvent
+from agentos.engine import types as engine_types
 
-log = structlog.get_logger("agentos.acp.dispatch")
+log = structlog.get_logger("agentos.gateway.acp_dispatch")
+
+_ENGINE_EVENTS: dict[str, type] = {
+    "text_delta": engine_types.TextDeltaEvent,
+    "tool_use_start": engine_types.ToolUseStartEvent,
+    "tool_result": engine_types.ToolResultEvent,
+    "done": engine_types.DoneEvent,
+    "error": engine_types.ErrorEvent,
+}
+
+
+def to_engine_event(event: _projected.EngineEvent) -> Any:
+    """Turn a ``agentos.acp.projector`` record into the real engine event."""
+    return _ENGINE_EVENTS[event.kind](**dataclasses.asdict(event))
+
 
 _END = object()
 
@@ -143,17 +159,35 @@ async def acp_turn_stream(
     config: Any,
     session_manager: Any,
     manager: AcpSessionManager | None = None,
-) -> AsyncIterator[EngineEvent]:
+) -> AsyncIterator[Any]:
     """Run one harness turn for ``run`` and yield engine events."""
+    stream = _projected_turn_stream(
+        run, session=session, config=config, session_manager=session_manager, manager=manager
+    )
+    try:
+        async for event in stream:
+            yield to_engine_event(event)
+    finally:
+        await stream.aclose()
+
+
+async def _projected_turn_stream(
+    run: Any,
+    *,
+    session: Any,
+    config: Any,
+    session_manager: Any,
+    manager: AcpSessionManager | None = None,
+) -> AsyncGenerator[_projected.EngineEvent, None]:
     session_key = run.session_key
     acp_config = getattr(config, "acp", None)
     manager = manager or get_acp_manager()
     if acp_config is not None and getattr(acp_config, "enabled", True) is False:
-        yield ErrorEvent(message="ACP is disabled ([acp] enabled = false)", code="ACP_DISABLED")
+        yield ProjectedError(message="ACP is disabled ([acp] enabled = false)", code="ACP_DISABLED")
         return
     if manager is None or not manager.available:
         reason = manager.unavailable_reason if manager is not None else "not configured"
-        yield ErrorEvent(message=f"ACP unavailable: {reason}", code="ACP_UNAVAILABLE")
+        yield ProjectedError(message=f"ACP unavailable: {reason}", code="ACP_UNAVAILABLE")
         return
 
     origin = session_origin(session)
@@ -163,7 +197,7 @@ async def acp_turn_stream(
         yield error_event(exc)
         return
     if origin.get("closed"):
-        yield ErrorEvent(
+        yield ProjectedError(
             message=f"ACP session {session_key} was closed; spawn a new one",
             code="ACP_SESSION_CLOSED",
         )

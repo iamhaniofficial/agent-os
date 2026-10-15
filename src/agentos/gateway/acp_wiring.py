@@ -12,14 +12,38 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
+from pathlib import Path
 from typing import Any
 
 import structlog
 
 from agentos.acp.manager import AcpSessionManager, get_acp_manager, set_acp_manager
-from agentos.acp.spawn import acp_config_of, acp_state_dir
 
-log = structlog.get_logger("agentos.acp.wiring")
+log = structlog.get_logger("agentos.gateway.acp_wiring")
+
+
+def acp_config_of(gateway_config: Any) -> Any:
+    cfg = getattr(gateway_config, "acp", None) if gateway_config is not None else None
+    if cfg is None:
+        from agentos.gateway.config import AcpConfig
+
+        cfg = AcpConfig()
+    return cfg
+
+
+def acp_state_dir(gateway_config: Any) -> Path:
+    """``[acp].state_dir`` or ``<gateway state>/acp``."""
+    acp_cfg = acp_config_of(gateway_config)
+    override = getattr(acp_cfg, "state_dir", None)
+    if override:
+        return Path(os.path.expanduser(str(override)))
+    state = getattr(gateway_config, "state_dir", None) if gateway_config is not None else None
+    if state:
+        return Path(os.path.expanduser(str(state))) / "acp"
+    from agentos.paths import state_dir
+
+    return state_dir("acp")
 
 
 def _construct(factory: Any, candidates: dict[str, Any]) -> Any:

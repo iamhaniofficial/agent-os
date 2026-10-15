@@ -281,7 +281,7 @@ async def sessions_send(session_key: str, message: str, mode: str | None = None)
     if not message:
         raise SafeToolError("Message must not be empty")
     if is_acp_key(session_key):
-        from agentos.acp.spawn import send_to_acp_session
+        from agentos.tools.builtin.acp_spawn import send_to_acp_session
 
         return await send_to_acp_session(session_key, message, mode=mode or "followup")
 
@@ -432,7 +432,7 @@ async def sessions_spawn(
         raise ToolError("Task must not be empty")
     spawn_runtime = (runtime or "subagent").strip().lower()
     if spawn_runtime == "acp":
-        from agentos.acp.spawn import spawn_acp_session
+        from agentos.tools.builtin.acp_spawn import spawn_acp_session
 
         return await spawn_acp_session(
             task=task,

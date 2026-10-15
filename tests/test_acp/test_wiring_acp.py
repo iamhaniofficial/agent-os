@@ -9,8 +9,8 @@ from typing import Any
 import pytest
 from acp_s_fakes import FakeRuntime
 
-from agentos.acp import wiring
 from agentos.acp.manager import get_acp_manager, set_acp_manager
+from agentos.gateway import acp_wiring as wiring
 from agentos.gateway.config import AcpConfig, GatewayConfig
 
 

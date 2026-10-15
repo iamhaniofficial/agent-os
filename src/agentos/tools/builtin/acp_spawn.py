@@ -27,10 +27,11 @@ import structlog
 
 from agentos.acp.registry import get_harness, normalize_agent_id
 from agentos.acp.types import AcpAgentNotAllowedError, AcpError
+from agentos.gateway.acp_wiring import acp_config_of, acp_state_dir
 from agentos.session.keys import build_acp_session_key, is_acp_key, parse_agent_id
 from agentos.tools.types import SafeToolError, ToolError, current_tool_context
 
-log = structlog.get_logger("agentos.acp.spawn")
+log = structlog.get_logger("agentos.tools.acp_spawn")
 
 _VALID_MODES = ("persistent", "oneshot")
 _SEND_MODES = ("followup", "steer")
@@ -40,29 +41,6 @@ _SUPERSEDED_KEEP = 20
 # --------------------------------------------------------------------------
 # Config helpers
 # --------------------------------------------------------------------------
-
-
-def acp_config_of(gateway_config: Any) -> Any:
-    cfg = getattr(gateway_config, "acp", None) if gateway_config is not None else None
-    if cfg is None:
-        from agentos.gateway.config import AcpConfig
-
-        cfg = AcpConfig()
-    return cfg
-
-
-def acp_state_dir(gateway_config: Any) -> Path:
-    """``[acp].state_dir`` or ``<gateway state>/acp``."""
-    acp_cfg = acp_config_of(gateway_config)
-    override = getattr(acp_cfg, "state_dir", None)
-    if override:
-        return Path(os.path.expanduser(str(override)))
-    state = getattr(gateway_config, "state_dir", None) if gateway_config is not None else None
-    if state:
-        return Path(os.path.expanduser(str(state))) / "acp"
-    from agentos.paths import state_dir
-
-    return state_dir("acp")
 
 
 def launch_overrides(acp_config: Any) -> dict[str, list[str]]:
@@ -558,13 +536,6 @@ async def send_to_acp_session(
             "mode": send_mode,
         }
     )
-
-
-def is_superseded_task(origin: Mapping[str, Any] | None, task_id: str | None) -> bool:
-    """True when ``task_id`` was replaced by a steer (skip its announce)."""
-    if not task_id or not isinstance(origin, Mapping):
-        return False
-    return task_id in (origin.get("superseded_task_ids") or [])
 
 
 def row_is_acp(row: Any) -> bool:

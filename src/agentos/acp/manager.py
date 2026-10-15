@@ -733,6 +733,13 @@ class AcpSessionManager:
         log.info("acp.manager.shutdown", sessions=len(states))
 
 
+def is_superseded_task(origin: Mapping[str, Any] | None, task_id: str | None) -> bool:
+    """True when ``task_id`` was replaced by a steer (its announce is skipped)."""
+    if not task_id or not isinstance(origin, Mapping):
+        return False
+    return task_id in (origin.get("superseded_task_ids") or [])
+
+
 # --------------------------------------------------------------------------
 # Process-wide accessor (gateway boot sets it; tools and dispatch read it)
 # --------------------------------------------------------------------------

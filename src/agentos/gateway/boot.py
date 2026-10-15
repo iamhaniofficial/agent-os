@@ -353,7 +353,7 @@ class ServiceContainer:
                 pass
         if self.acp_manager is not None:
             try:
-                from agentos.acp.wiring import stop_acp
+                from agentos.gateway.acp_wiring import stop_acp
 
                 await stop_acp(self.acp_manager)
             except Exception:
@@ -667,7 +667,7 @@ async def dispatch_task_runtime_turn(
         # ACP coding-harness session: the turn runs in an external harness,
         # streamed through the same event path. Silence is not failure, so no
         # idle timeout; heartbeats keep the UI showing a live run.
-        from agentos.acp.dispatch import acp_turn_stream
+        from agentos.gateway.acp_dispatch import acp_turn_stream
 
         await _emit_task_runtime_stream_events(
             acp_turn_stream(run, session=session, config=config, session_manager=session_manager),
@@ -2463,7 +2463,7 @@ async def start_gateway_server(
     # ACP coding harnesses: reap processes a crashed gateway left behind and
     # publish the session manager. Degrades to "ACP unavailable", never fails boot.
     try:
-        from agentos.acp.wiring import start_acp
+        from agentos.gateway.acp_wiring import start_acp
 
         svc.acp_manager = await start_acp(config, session_manager=svc.session_manager)
     except Exception:  # noqa: BLE001

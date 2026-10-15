@@ -74,7 +74,7 @@ async def _authorized_session(session_key: str | None) -> Any:
 
 def _agents_payload() -> dict[str, Any]:
     from agentos.acp.registry import list_harnesses, resolve_launch
-    from agentos.acp.spawn import _agent_allowed, acp_config_of, launch_overrides
+    from agentos.tools.builtin.acp_spawn import _agent_allowed, acp_config_of, launch_overrides
 
     acp_cfg = acp_config_of(_gateway_config())
     overrides = launch_overrides(acp_cfg)
@@ -129,7 +129,7 @@ async def _sessions_payload() -> dict[str, Any]:
     ctx = current_tool_context.get()
     children: list[dict[str, Any]] = []
     if ctx is not None and ctx.session_key:
-        from agentos.acp.spawn import _list_children, row_is_acp
+        from agentos.tools.builtin.acp_spawn import _list_children, row_is_acp
 
         live_keys = {s["session_key"] for s in live}
         try:
@@ -212,7 +212,7 @@ async def acp(
             return json.dumps(await _sessions_payload())
         if action == "doctor":
             from agentos.acp.registry import normalize_agent_id
-            from agentos.acp.spawn import acp_config_of
+            from agentos.tools.builtin.acp_spawn import acp_config_of
 
             target = normalize_agent_id(
                 str(agent or getattr(acp_config_of(_gateway_config()), "default_agent", "") or "")

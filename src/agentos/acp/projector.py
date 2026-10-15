@@ -7,6 +7,12 @@ stream (``TextDeltaEvent``, ``ToolUseStartEvent``, ``ToolResultEvent``,
 ``DoneEvent``, ``ErrorEvent``), builds the transcript row the normal turn
 path would have written, and rolls harness usage into the session row.
 
+``agentos.acp`` stays a leaf package (the architecture import contract keeps
+it out of the engine/gateway cycle), so the projector emits ``Projected*``
+records whose fields mirror the engine event dataclasses one to one;
+``agentos.gateway.acp_dispatch.to_engine_event`` turns them into the real
+engine events.
+
 Shape borrowed from OpenClaw's ``acp-projector.ts`` (MIT, see
 ``THIRD_PARTY_NOTICES.md``): hidden-by-default thought/plan/status tags,
 ``final_only`` vs ``live`` delivery, an output cap with a tail marker.
@@ -17,18 +23,11 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import structlog
 
 from agentos.acp.types import AcpEvent, AcpTurnResult, AcpUsage
-from agentos.engine.types import (
-    DoneEvent,
-    ErrorEvent,
-    TextDeltaEvent,
-    ToolResultEvent,
-    ToolUseStartEvent,
-)
 
 log = structlog.get_logger("agentos.acp.projector")
 
@@ -41,6 +40,58 @@ MAX_TOOL_RESULT_CHARS = 4_000
 HARNESS_COST_SOURCE = "harness"
 
 StreamDelivery = Literal["final_only", "live"]
+
+
+# Field-for-field mirrors of ``agentos.engine.types`` events; ``kind`` matches
+# the engine event's ``kind`` discriminator.
+
+
+@dataclass(slots=True)
+class TextDeltaEvent:
+    kind: ClassVar[str] = "text_delta"
+    text: str = ""
+
+
+@dataclass(slots=True)
+class ToolUseStartEvent:
+    kind: ClassVar[str] = "tool_use_start"
+    tool_use_id: str = ""
+    tool_name: str = ""
+
+
+@dataclass(slots=True)
+class ToolResultEvent:
+    kind: ClassVar[str] = "tool_result"
+    tool_use_id: str = ""
+    tool_name: str = ""
+    result: str = ""
+    is_error: bool = False
+    arguments: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class DoneEvent:
+    kind: ClassVar[str] = "done"
+    text: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cached_tokens: int = 0
+    cache_write_tokens: int = 0
+    iterations: int = 0
+    cost_usd: float = 0.0
+    cost_source: str = "none"
+    model: str = ""
+    reasoning_content: str | None = None
+
+
+@dataclass(slots=True)
+class ErrorEvent:
+    kind: ClassVar[str] = "error"
+    message: str = ""
+    code: str = ""
+
+
 EngineEvent = TextDeltaEvent | ToolUseStartEvent | ToolResultEvent | DoneEvent | ErrorEvent
 
 

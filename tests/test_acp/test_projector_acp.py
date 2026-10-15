@@ -9,6 +9,10 @@ from agentos.acp.projector import (
     HARNESS_COST_SOURCE,
     MAX_ASSISTANT_TEXT_CHARS,
     AcpProjector,
+    DoneEvent,
+    TextDeltaEvent,
+    ToolResultEvent,
+    ToolUseStartEvent,
     cost_delta,
     error_event,
     format_stats,
@@ -17,7 +21,8 @@ from agentos.acp.projector import (
     usage_update_fields,
 )
 from agentos.acp.types import AcpEvent, AcpTurnResult, AcpTurnTimeoutError, AcpUsage
-from agentos.engine.types import DoneEvent, TextDeltaEvent, ToolResultEvent, ToolUseStartEvent
+from agentos.engine import types as engine_types
+from agentos.gateway.acp_dispatch import to_engine_event
 
 
 def _feed(projector: AcpProjector, *events: AcpEvent) -> list:
@@ -209,3 +214,26 @@ def test_error_event_carries_code() -> None:
     event = error_event(AcpTurnTimeoutError("ACP turn timed out after 5s"))
     assert event.code == "ACP_TURN_TIMEOUT"
     assert "timed out" in event.message
+
+
+def test_projected_records_map_one_to_one_onto_engine_events() -> None:
+    p = AcpProjector(stream_delivery="live")
+    projected = _feed(
+        p,
+        AcpEvent(kind="text_delta", text="hi"),
+        AcpEvent(kind="tool_call", tool_call_id="t", tool_kind="read", raw_input={"p": 1}),
+        AcpEvent(kind="tool_call_update", tool_call_id="t", status="completed"),
+    )
+    projected += p.final_events(AcpTurnResult(stop_reason="end_turn"), turn_cost=0.1)
+    projected.append(error_event(AcpTurnTimeoutError("late")))
+    engine = [to_engine_event(e) for e in projected]
+    assert [type(e) for e in engine] == [
+        engine_types.TextDeltaEvent,
+        engine_types.ToolUseStartEvent,
+        engine_types.ToolResultEvent,
+        engine_types.DoneEvent,
+        engine_types.ErrorEvent,
+    ]
+    assert [e.kind for e in engine] == [e.kind for e in projected]
+    assert engine[2].arguments == {"p": 1}
+    assert engine[3].cost_source == "harness" and engine[4].code == "ACP_TURN_TIMEOUT"

@@ -86,6 +86,11 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("gateway", "agentos_router"),
     ("gateway", "compat"),
     ("onboarding", "agentos_router"),
+    # ACP coding-harness consumer: agentos.acp is a leaf (contract types,
+    # registry, session manager, projector, worktrees) that imports nothing
+    # else from agentos; the gateway dispatch/boot wiring and the spawn tools
+    # sit on top of it.
+    ("gateway", "acp"),
     ("gateway", "agents"),
     ("gateway", "application"),
     ("gateway", "chat"),
@@ -166,6 +171,7 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("skills", "provider"),
     ("skills", "safety"),
     ("skills", "tools"),
+    ("tools", "acp"),
     ("tools", "agents"),
     ("tools", "channels"),
     ("tools", "engine"),

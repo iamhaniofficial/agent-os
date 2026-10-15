@@ -190,7 +190,7 @@ async def _is_superseded_acp_turn(
     origin = _origin_from_session(child)
     if origin.get("kind") != "acp":
         return False
-    from agentos.acp.spawn import is_superseded_task
+    from agentos.acp.manager import is_superseded_task
 
     return is_superseded_task(origin, event.task_id)
 
