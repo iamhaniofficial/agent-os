@@ -41,7 +41,7 @@ from agentos.sandbox.integration import (
 )
 from agentos.sandbox.policy import build_policy, select_level
 from agentos.sandbox.types import DenialReason, DenialResult, SandboxPolicy, SandboxRequest
-from agentos.tools.batch_slot import wait_outside_tool_slot
+from agentos.tools.batch_slot import wait_for_batch_turn, wait_outside_tool_slot
 from agentos.tools.builtin.artifacts import publish_inline_artifacts
 from agentos.tools.builtin.shell_policy import check_safe_bin
 from agentos.tools.env_passthrough import build_subprocess_env
@@ -886,6 +886,7 @@ async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
     execution_timeout_seconds=_DEFAULT_EXEC_TIMEOUT + _EXEC_TOOL_TIMEOUT_PADDING,
     execution_timeout_argument="timeout",
     execution_timeout_padding=_EXEC_TOOL_TIMEOUT_PADDING,
+    early_approval=True,
 )
 async def exec_command(
     command: str,
@@ -948,6 +949,11 @@ async def exec_command(
                     "exec_command", command, workdir, DenialReason.HUMAN_REJECTED, env=env
                 )
             return json.dumps(approval_response)
+
+    # This call may have been started early so its approval prompt could be
+    # raised alongside the others of the batch; run the command only once
+    # every earlier exclusive call has finished (``early_approval``).
+    await wait_for_batch_turn()
 
     # While the child runs, any new gateway connection that cannot prove it
     # is the operator's counts as this agent's (gateway.agent_surface).
@@ -1097,6 +1103,7 @@ async def _run_exec_subprocess(
         },
     },
     required=["command"],
+    early_approval=True,
 )
 async def background_process(
     command: str,
@@ -1154,6 +1161,9 @@ async def background_process(
                     "background_process", command, workdir, DenialReason.HUMAN_REJECTED
                 )
             return json.dumps(approval_response)
+
+    # As in exec_command: start the process only in this call's turn.
+    await wait_for_batch_turn()
 
     elevated_bypass = _elevated_mode() in ("on", "bypass", "full")
 

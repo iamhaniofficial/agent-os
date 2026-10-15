@@ -8,6 +8,15 @@ could not even ask for its own approval. :func:`wait_outside_tool_slot` frees
 the admission for the duration of such a wait and queues for it again before
 returning.
 
+Giving the slot back must not change what runs first. An ``exclusive`` call
+therefore runs its body only once every earlier ``exclusive`` call of the
+batch has finished, approved or not. A tool declared with
+``ToolSpec.early_approval`` may be started ahead of that turn so that its
+approval prompt is raised at once; such a tool calls
+:func:`wait_for_batch_turn` before it acts on anything, and that wait (like
+the re-admission after :func:`wait_outside_tool_slot`) only returns once the
+earlier calls have finished.
+
 This module has no engine imports so tools can use it without a cycle; the
 executor installs the current call's admission in :data:`current_admission`.
 """
@@ -26,6 +35,8 @@ class BatchAdmission(Protocol):
     def yielded(self) -> bool: ...
 
     async def wait_outside[T](self, awaitable: Awaitable[T]) -> T: ...
+
+    async def wait_turn(self) -> None: ...
 
 
 current_admission: ContextVar[BatchAdmission | None] = ContextVar(
@@ -51,3 +62,22 @@ async def wait_outside_tool_slot[T](awaitable: Awaitable[T]) -> T:
     if admission is None or admission.yielded:
         return await awaitable
     return await admission.wait_outside(awaitable)
+
+
+async def wait_for_batch_turn() -> None:
+    """Wait until every earlier ``exclusive`` call of this batch has finished.
+
+    For a tool declared with ``ToolSpec.early_approval``: the executor may
+    start such a call while an earlier call still waits for its approval, so
+    the tool must call this after its approval check and before it does
+    anything the earlier calls could depend on (run a command, write a file).
+    The call holds no batch admission while it waits and is admitted again
+    under its declared concurrency before this returns. Returns at once when
+    it is already the call's turn, for non-exclusive calls, and outside a
+    batch.
+    """
+
+    admission = current_admission.get()
+    if admission is None or admission.yielded:
+        return
+    await admission.wait_turn()
