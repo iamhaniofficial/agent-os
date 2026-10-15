@@ -80,12 +80,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `--json`. (#3648)
 
 ### Changed
-- Approvals: when several `exec` calls of one batch need approval on the Web
-  UI or the desktop app, all of them are now asked at once instead of each
-  one only after the previous answer. The wait for the operator no longer
-  holds the call's exclusive batch slot (the same applies to sandbox
-  approval prompts); once approved, the commands still run one at a time
-  and their results keep the order the model asked for them.
+- Approvals: when several `exec` / `background_process` calls of one batch
+  need approval on the Web UI or the desktop app, all of them are now asked
+  at once instead of each one only after the previous answer. The wait for
+  the operator no longer holds the call's exclusive batch slot (the same
+  applies to sandbox approval prompts). The commands still run one at a time
+  and in the order the model asked for them, whatever order the approvals
+  come back in: a later call gets ahead only as far as its own approval
+  prompt, so a command that needs no approval never runs before an earlier
+  one still waiting for the operator, and other exclusive tools wait for the
+  earlier calls as before. The call's own timeout does not run while it
+  queues to run after its approval, and a call whose batch ran out of time
+  meanwhile times out without running. (The CLI's approve-then-retry flow is
+  unchanged: each retry still runs as soon as its own approval is answered.)
 - Compaction trigger calibration: the request-size estimate (chars / 4)
   over-counted 1.6-2x against provider-reported input tokens, so compaction
   fired far too early. Per provider and model, a running ratio of reported

@@ -1600,9 +1600,8 @@ async def test_web_inline_approvals_of_one_batch_are_all_requested_at_once() -> 
     tool call. Holding the exclusive slot during that wait used to keep the
     second call from even asking until the operator answered the first.
     """
-    from agentos.engine.tool_batch import ToolBatchExecutor
+    from agentos.engine.tool_batch import ToolBatchExecutor, registry_spec_lookup
     from agentos.engine.types import ToolCall, ToolResult
-    from agentos.tools.types import ToolSpec
 
     queue = get_approval_queue()
     current_tool_context.set(
@@ -1632,7 +1631,8 @@ async def test_web_inline_approvals_of_one_batch_are_all_requested_at_once() -> 
         execute=execute,
         project=project,
         timeout_for=lambda _call: 30.0,
-        spec_for=lambda name: ToolSpec(name=name, description=name, parameters={}),
+        # exec's real spec: exclusive, and early_approval so it may ask ahead.
+        spec_for=registry_spec_lookup(None),
         deadline=loop.time() + 30.0,
         iteration_timeout=30.0,
     )
@@ -1659,3 +1659,42 @@ async def test_web_inline_approvals_of_one_batch_are_all_requested_at_once() -> 
 async def _drain_batch(executor, calls) -> None:
     async for _event in executor.run(calls):
         pass
+
+
+def test_shell_tools_declare_early_approval() -> None:
+    from agentos.tools.registry import get_default_registry
+
+    registry = get_default_registry()
+    for name in ("exec_command", "background_process"):
+        registered = registry.get(name)
+        assert registered is not None
+        assert registered.spec.concurrency == "exclusive"
+        assert registered.spec.early_approval is True
+
+
+@pytest.mark.asyncio
+async def test_exec_command_waits_for_its_batch_turn_before_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``early_approval`` lets the batch start exec ahead of earlier calls; it must
+    not run its command until they have finished."""
+
+    order: list[str] = []
+
+    async def fake_turn() -> None:
+        order.append("turn")
+
+    async def fake_run(*args: object, **kwargs: object) -> str:
+        order.append("run")
+        return "ran"
+
+    monkeypatch.setattr(shell, "wait_for_batch_turn", fake_turn)
+    monkeypatch.setattr(shell, "_run_exec_subprocess", fake_run)
+    monkeypatch.setattr(
+        shell,
+        "check_safe_bin",
+        lambda command: PolicyResult(allowed=True, reason="", needs_approval=False),
+    )
+
+    assert await shell.exec_command("echo hi") == "ran"
+    assert order == ["turn", "run"]
