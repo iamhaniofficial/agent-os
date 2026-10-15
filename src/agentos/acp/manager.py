@@ -491,6 +491,13 @@ class AcpSessionManager:
         state.epoch += 1
         await self._close_handle(state, discard=False, reason="oneshot_done")
         await self.update_origin(state.session_key, closed=True)
+        self._forget(state)
+
+    def _forget(self, state: _SessionState) -> None:
+        """Drop a closed session's in-memory state; the row origin remembers
+        ``closed`` so a later turn is still refused."""
+        if self._states.get(state.session_key) is state and state.handle is None:
+            del self._states[state.session_key]
 
     async def _close_handle(self, state: _SessionState, *, discard: bool, reason: str) -> None:
         handle = state.handle
@@ -562,6 +569,7 @@ class AcpSessionManager:
             log.warning("acp.manager.close_lock_timeout", session_key=session_key)
             await self._close_handle(state, discard=discard, reason=reason)
         await self.update_origin(session_key, closed=True)
+        self._forget(state)
         return had_handle
 
     async def _live_handle(self, session_key: str) -> AcpSessionHandle:
