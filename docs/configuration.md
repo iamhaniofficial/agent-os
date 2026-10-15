@@ -949,6 +949,38 @@ embedding support.
 
 Read: [`features/memory.md`](features/memory.md)
 
+## Context Compaction
+
+When a session's request nears the model's context window, the oldest history
+is folded into one summary exchange. The trigger is `preflight_compact_ratio`
+(default 0.85) of the context window, or the provider's request budget when
+that is tighter.
+
+```toml
+[compaction]
+summary_timeout_seconds = 45.0   # bound on the summary call (auxiliary task "compaction")
+proactive = true                 # compact between turns, in the background
+proactive_ratio = 0.70           # ...once the history reaches 70% of the trigger
+estimate_calibration = true      # scale the size estimate by what providers report
+```
+
+- **Proactive compaction.** After a turn ends with the history at
+  `proactive_ratio` of the trigger or more, AgentOS compacts the session in the
+  background, so the next turn does not wait for the summarizer. A turn that
+  starts first wins: the background result is dropped and the check runs again
+  when that turn ends. Subagent and cron sessions are never compacted this
+  way. The in-turn check stays as the safety net. `proactive = false` turns
+  the background job off.
+- **Estimate calibration.** The request size is estimated as characters / 4,
+  which over-counts against what providers bill. Per provider and model,
+  AgentOS keeps a running ratio of the provider's reported input tokens to its
+  own estimate and, after two calls, scales the estimate by it (clamped to
+  0.5-1.25), so compaction does not fire early. `estimate_calibration = false`
+  uses the raw estimate.
+- When the summarizer fails or times out, a deterministic digest bounded to an
+  eighth of the context window is used instead, so a compaction still shrinks
+  the history.
+
 ## Auxiliary Model
 
 Not every provider call belongs to a turn. Analysing a document the user

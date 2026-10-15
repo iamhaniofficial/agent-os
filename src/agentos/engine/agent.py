@@ -26,6 +26,7 @@ from agentos.engine.cache_break_monitor import (
     record_prompt_state,
 )
 from agentos.engine.compaction_service import CompactionService, auxiliary_chunk_summarizer
+from agentos.engine.estimate_calibration import EstimateCalibration
 from agentos.engine.fallback import FallbackPolicy, backoff_sleep, retry_after_delay
 from agentos.engine.history import limit_turns, repair_tool_pairing
 from agentos.engine.progress_watchdog import (
@@ -700,6 +701,12 @@ class Agent:
 
     #: Per-turn timing recorder; the runtime assigns a fresh one per turn.
     turn_timing: TurnTiming = NULL_TURN_TIMING
+    # Runtime-owned estimator calibration (set by the TurnRunner before the
+    # turn runs); ``None`` keeps the raw estimate. Last request's size minus
+    # its messages (system prompt, tools, config), for the between-turns
+    # proactive compaction check.
+    estimate_calibration: EstimateCalibration | None = None
+    _last_request_overhead_tokens: int | None = None
 
     def __init__(
         self,
@@ -1806,6 +1813,9 @@ class Agent:
                         tools=provider_tools_for_call,
                         config=call_chat_cfg,
                     )
+                    self._last_request_overhead_tokens = max(
+                        0, estimated_context_tokens - self._message_tokens(request_messages)
+                    )
                     overflow_outcome = await self._preflight_context_overflow(
                         turn_messages,
                         estimated_context_tokens,
@@ -1850,6 +1860,12 @@ class Agent:
                                 if max_iterations_finalization_pending
                                 else None
                             ),
+                        )
+                        # Calibrate against the request actually sent.
+                        estimated_context_tokens = self._estimate_live_request_tokens(
+                            request_messages,
+                            tools=provider_tools_for_call,
+                            config=call_chat_cfg,
                         )
                         self._write_context_stage(
                             "stream:context:compacted",
@@ -1990,7 +2006,11 @@ class Agent:
                                 provider_done_for_log = raw_ev
                                 _got_done_event = True
                                 # Make the estimator's drift visible: the
-                                # compaction trigger runs on this estimate.
+                                # compaction trigger runs on this estimate,
+                                # scaled by the calibration it feeds.
+                                calibration_factor = self._observe_estimate(
+                                    estimated_context_tokens, raw_ev.input_tokens
+                                )
                                 logger.debug(
                                     "agent.context_estimate_vs_provider",
                                     session_key=self._session_key,
@@ -1999,6 +2019,7 @@ class Agent:
                                     provider_input_tokens=raw_ev.input_tokens,
                                     provider_cached_tokens=raw_ev.cached_tokens,
                                     provider_cache_write_tokens=raw_ev.cache_write_tokens,
+                                    calibration_factor=calibration_factor,
                                 )
                                 iter_input_tokens = raw_ev.input_tokens
                                 iter_output_tokens = raw_ev.output_tokens
@@ -3786,6 +3807,30 @@ class Agent:
     def _message_tokens(self, messages: Sequence[Message]) -> int:
         return max(0, self._message_sizes.messages_chars(messages) // 4)
 
+    def _calibration_key(self) -> tuple[str, str]:
+        return str(getattr(self.provider, "provider_name", "") or ""), str(
+            self.config.model_id or ""
+        )
+
+    def estimate_scale(self) -> float:
+        """Calibration factor for this provider/model's estimates (1.0 = raw)."""
+        if self.estimate_calibration is None:
+            return 1.0
+        return self.estimate_calibration.factor(*self._calibration_key())
+
+    def _observe_estimate(self, estimated_tokens: int, provider_input_tokens: int) -> float:
+        """Feed one provider usage sample to the calibration; return the factor."""
+        if self.estimate_calibration is None:
+            return 1.0
+        provider, model = self._calibration_key()
+        self.estimate_calibration.observe(
+            provider,
+            model,
+            estimated_tokens=estimated_tokens,
+            provider_input_tokens=provider_input_tokens,
+        )
+        return round(self.estimate_calibration.factor(provider, model), 3)
+
     def _compaction_service(self, *, window_tokens: int | None = None) -> CompactionService:
         del window_tokens
         hint = getattr(self.config, "compaction_summary_model_hint", None) or ("", "")
@@ -3838,11 +3883,16 @@ class Agent:
 
         Returns an uncompacted outcome when the request is under the threshold
         or there is nothing to compact, and ``None`` when compaction failed.
+
+        The estimate (and every message-size estimate the service makes) is
+        scaled by the provider/model calibration factor, 1.0 until calibrated.
         """
+        scale = self.estimate_scale()
         return await self._check_context_overflow(
             turn_messages,
-            estimated_context_tokens,
+            max(1, int(estimated_context_tokens * scale)),
             turn_input_index=turn_input_index,
+            token_scale=scale,
         )
 
     async def _check_context_overflow(
@@ -3853,6 +3903,7 @@ class Agent:
         turn_input_index: int | None = None,
         compaction_window_tokens: int | None = None,
         force: bool = False,
+        token_scale: float = 1.0,
     ) -> CompactionOutcome | None:
         """Run the compaction service; ``None`` signals a failed compaction."""
         self._last_compaction_refusal_reason = None
@@ -3868,7 +3919,11 @@ class Agent:
             turn_input_index=input_index,
             estimated_tokens=estimated_context_tokens,
             window_tokens=window_tokens,
-            message_tokens=self._message_tokens,
+            message_tokens=(
+                self._message_tokens
+                if token_scale == 1.0
+                else lambda items: int(self._message_tokens(items) * token_scale)
+            ),
             force=force,
             input_entry=self._compaction_input_entry(),
             budget_tokens=self._compaction_budget_tokens(),

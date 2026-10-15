@@ -29,6 +29,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `[llm] thinking`, a router-controller level or an explicit model override
   are left alone. Lowered turns log `turn_runner.effort_by_tier`.
   `[agentos_router] effort_by_tier = false` keeps each tier's level.
+- Proactive compaction. When a turn ends with the session's history at
+  `[compaction] proactive_ratio` (default 0.70) of the compaction trigger, the
+  session is compacted in the background between turns with the same
+  summarizer and persisted like an in-turn compaction (checkpoint, summary,
+  `reset` record, notifications with phase `proactive_background`), so the
+  next turn no longer waits for the summarizer. A turn that starts first
+  makes the job persist nothing; subagent and cron sessions are skipped; the
+  in-turn check stays as the safety net. `[compaction] proactive = false`
+  turns it off.
 - Suggested next prompt. When a turn finishes, the chat input in the web
   console, the desktop app and `agentos chat` shows the message the user is
   most likely to send next as grey placeholder text; `Tab` takes it into the
@@ -77,6 +86,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   holds the call's exclusive batch slot (the same applies to sandbox
   approval prompts); once approved, the commands still run one at a time
   and their results keep the order the model asked for them.
+- Compaction trigger calibration: the request-size estimate (chars / 4)
+  over-counted 1.6-2x against provider-reported input tokens, so compaction
+  fired far too early. Per provider and model, a running ratio of reported
+  input tokens to the estimate now scales the estimate after two calls
+  (clamped 0.5-1.25; logged on `agent.context_estimate_vs_provider` as
+  `calibration_factor`). `[compaction] estimate_calibration = false` keeps the
+  raw estimate.
 - Anthropic prompt cache now covers the whole conversation, not only the
   system prompt: breakpoints on the system prompt, the last tool definition
   and a rolling one on the last block of the last user message (at most four),
@@ -170,6 +186,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unstarted like every other queued call. This was also the cause of the
   `test_batch_deadline_times_out_running_and_queued_calls` flake on Windows
   CI, which now uses a fake clock.
+- Compaction fallback now always shrinks the history: the deterministic
+  digest used when the summarizer fails is bounded to an eighth of the context
+  window (one shared bound across chunks, a carried-over summary gets at most
+  half), and a summarizer that raises or outlives its timeout falls back to
+  that digest instead of failing the compaction. Before, a history of many
+  short messages produced a digest as large as what it replaced and was
+  declined, so the request was never reduced.
 - Engine: the request right after an in-turn compaction lost most of its
   system prompt (the Skills and Local Toolchain sections, ~60% of it in a
   live session) because the compaction rebuilt the prompt without the

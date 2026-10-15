@@ -59,6 +59,7 @@ from agentos.engine.hooks import (
 from agentos.engine.outcome import outcome_from_error, turn_outcome_details
 from agentos.engine.pipeline import TurnContext
 from agentos.engine.pricing import PriceEntry, lookup_price
+from agentos.engine.proactive_compaction import ProactiveCompactionScheduler
 from agentos.engine.router_decision import build_router_decision_event
 from agentos.engine.transcript import transcript_record_of
 from agentos.engine.turn_policy import resolve_turn_policy
@@ -1818,9 +1819,12 @@ class TurnRunner:
         )
         # TurnRunner stage decomposition CompactionAndHistoryStage instance. Holds no
         # per-turn state. Active unconditionally as of.
+        # Between-turns (proactive) compaction + estimator calibration.
+        self._proactive_compaction = ProactiveCompactionScheduler(self)
         self._compaction_and_history_stage = CompactionAndHistoryStage(
             history_loader=_TurnRunnerHistoryLoaderAdapter(self),
             request_context_prepender=_RequestContextPrependAdapter(),
+            turn_start_observer=self._proactive_compaction,
         )
         # TurnRunner stage decomposition AttachmentStage instance. Holds no per-turn
         # state. Active unconditionally as of.
@@ -1857,6 +1861,7 @@ class TurnRunner:
             session_totals=_TurnRunnerSessionTotalsAdapter(self),
             turn_error_persist=_TurnRunnerTurnErrorPersistAdapter(self),
             memory_nudge=_TurnRunnerMemoryNudgeAdapter(self),
+            proactive_compaction=self._proactive_compaction,
         )
 
     @property
@@ -1884,6 +1889,10 @@ class TurnRunner:
         # The anchor only means something for the turn that loaded the history;
         # the next turn's _load_history records a fresh one.
         self._compaction_snapshots.pop(session_key, None)
+        # The turn is over: a proactive compaction it scheduled may start.
+        proactive = getattr(self, "_proactive_compaction", None)
+        if proactive is not None:
+            proactive.turn_ended(session_key)
 
     def refresh_memory_snapshot(self, agent_id: str) -> None:
         """Refresh frozen snapshots for all sessions of the given agent.

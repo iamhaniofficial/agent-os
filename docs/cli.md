@@ -503,6 +503,19 @@ model) bounded by `compaction.summary_timeout_seconds` (default 45):
 agentos config set compaction.summary_timeout_seconds 30
 ```
 
+Once a turn ends with the history at `compaction.proactive_ratio` (default
+0.70) of the compaction trigger, the session is compacted in the background
+before the next turn; `compaction.proactive false` turns that off. The
+trigger's size estimate is calibrated per provider/model against the input
+tokens providers report; `compaction.estimate_calibration false` uses the raw
+estimate:
+
+```sh
+agentos config set compaction.proactive false
+agentos config set compaction.proactive_ratio 0.6
+agentos config set compaction.estimate_calibration false
+```
+
 Search:
 
 ```sh
