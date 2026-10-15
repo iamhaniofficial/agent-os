@@ -18,6 +18,7 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket
 
 from agentos import __version__
+from agentos.application.approval_rpc import approval_display_title
 from agentos.gateway.approval_queue import get_approval_queue
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.control_ui import create_control_ui_routes
@@ -365,6 +366,7 @@ def create_gateway_app(
             item["argv"] = argv if isinstance(argv, list) else []
             item["mode"] = params.get("mode", mode)
             item["params"] = params
+            item["title"] = approval_display_title(str(p["namespace"]), params)
             items.append(item)
         return JSONResponse(
             {
@@ -432,6 +434,8 @@ def create_gateway_app(
         }
         if namespace != "plugin" and body.get("elevatedMode") in ("on", "bypass", "full"):
             resolve_params["elevatedMode"] = body.get("elevatedMode")
+        if namespace != "plugin" and isinstance(body.get("payload"), dict):
+            resolve_params["payload"] = body["payload"]
         result = await dispatcher.dispatch(
             "_http",
             method,

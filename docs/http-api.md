@@ -79,7 +79,7 @@ These require no auth and are safe for load balancers and container probes.
 | --- | --- | --- |
 | `GET` | `/api/approvals` | Pending approvals + current mode/patterns. |
 | `POST` | `/api/approvals/settings` | Set mode (`prompt` / `auto-approve` / `auto-deny`). |
-| `POST` | `/api/approvals/resolve` | Approve or deny a pending item. |
+| `POST` | `/api/approvals/resolve` | Approve or deny a pending item (optional `payload` object carries ACP form answers). |
 | `POST` | `/api/elevated-mode` | Set per-session elevated mode (admitted Control connection only). |
 
 `GET /api/approvals` serializes every pending command and its arguments, so it

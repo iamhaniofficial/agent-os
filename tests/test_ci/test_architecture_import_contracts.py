@@ -12,6 +12,7 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # It imports nothing from agentos, so these edges are leaves and cannot
     # participate in a cycle.
     ("application", "util"),
+    ("acp", "util"),
     ("channels", "util"),
     ("engine", "util"),
     ("gateway", "util"),
@@ -20,6 +21,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("sandbox", "util"),
     ("session", "util"),
     ("tools", "util"),
+    # The ACP permission/elicitation bridges queue operator prompts on the
+    # application ApprovalQueue (application does not import acp).
+    ("acp", "application"),
     ("agents", "gateway"),
     ("agents", "identity"),
     ("agents", "onboarding"),
