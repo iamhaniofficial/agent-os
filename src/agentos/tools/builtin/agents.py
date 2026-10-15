@@ -166,7 +166,9 @@ async def subagents(
                 log.warning("subagents.list_no_session_context")
                 return json.dumps({"action": "list", "subagents": []})
             subs = await _list_children(mgr, current_key)
-            return json.dumps({"action": "list", "subagents": subs})
+            from agentos.acp.spawn import annotate_acp_rows
+
+            return json.dumps({"action": "list", "subagents": annotate_acp_rows(subs)})
         except (ImportError, AttributeError, NotImplementedError) as exc:
             raise _manager_unavailable() from exc
 
@@ -181,6 +183,11 @@ async def subagents(
             raise ToolError(f"Subagent not found: {session_key}")
 
         _check_spawned_by_or_raise(session, current_key)
+
+        from agentos.acp.spawn import acp_subagent_action, row_is_acp
+
+        if row_is_acp(session):
+            return await acp_subagent_action(action, str(session_key), session, message=message)
 
         # Terminal check
         status = getattr(session, "status", None)

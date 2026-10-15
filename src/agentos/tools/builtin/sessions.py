@@ -12,7 +12,7 @@ import structlog
 
 from agentos.agents.limits import MAX_SPAWN_DEPTH
 from agentos.gateway.routing import build_subagent_route_envelope
-from agentos.session.keys import build_subagent_session_key, parse_agent_id
+from agentos.session.keys import build_subagent_session_key, is_acp_key, parse_agent_id
 from agentos.session.naming import normalize_session_name
 from agentos.tools.registry import tool
 from agentos.tools.types import SafeToolError, ToolError, current_tool_context
@@ -266,12 +266,24 @@ def _sessions_spawn_concurrency_key(
             "type": "string",
             "description": "Message text to inject",
         },
+        "mode": {
+            "type": "string",
+            "enum": ["followup", "steer"],
+            "description": (
+                "ACP coding sessions only: 'followup' (default) queues the message as the "
+                "next turn; 'steer' cancels the running turn first."
+            ),
+        },
     },
     required=["session_key", "message"],
 )
-async def sessions_send(session_key: str, message: str) -> str:
+async def sessions_send(session_key: str, message: str, mode: str | None = None) -> str:
     if not message:
         raise SafeToolError("Message must not be empty")
+    if is_acp_key(session_key):
+        from agentos.acp.spawn import send_to_acp_session
+
+        return await send_to_acp_session(session_key, message, mode=mode or "followup")
 
     try:
         mgr = _get_session_manager()
@@ -352,6 +364,53 @@ async def sessions_send(session_key: str, message: str) -> str:
             "type": "string",
             "description": 'Model override (e.g. "claude-sonnet-4-20250514")',
         },
+        "runtime": {
+            "type": "string",
+            "enum": ["subagent", "acp"],
+            "description": (
+                "'subagent' (default) runs an AgentOS agent. 'acp' delegates the task to an "
+                "external coding harness (Claude Code, Codex, Gemini CLI, ...) over ACP; "
+                "agent_id is then ignored and acp_agent picks the harness."
+            ),
+        },
+        "acp_agent": {
+            "type": "string",
+            "description": "runtime=acp: harness id (claude, codex, gemini, ...). "
+            "Defaults to [acp] default_agent.",
+        },
+        "cwd": {
+            "type": "string",
+            "description": "runtime=acp: working directory (default: the agent workspace). "
+            "Must be inside the workspace or [acp] allowed_cwds.",
+        },
+        "mode": {
+            "type": "string",
+            "enum": ["oneshot", "persistent"],
+            "description": "runtime=acp: 'oneshot' (default) closes the harness after the "
+            "first turn; 'persistent' keeps it for sessions_send follow-ups.",
+        },
+        "harness_mode": {
+            "type": "string",
+            "description": "runtime=acp: harness session mode id (e.g. 'plan', 'acceptEdits', "
+            "'read-only').",
+        },
+        "resume_session_id": {
+            "type": "string",
+            "description": "runtime=acp: continue an earlier harness session recorded for this "
+            "session or one of its children.",
+        },
+        "worktree": {
+            "type": "boolean",
+            "description": "runtime=acp: run in a fresh managed git worktree of cwd's repo.",
+        },
+        "worktree_name": {
+            "type": "string",
+            "description": "runtime=acp + worktree: branch / directory name (default acp-<id>).",
+        },
+        "worktree_base_ref": {
+            "type": "string",
+            "description": "runtime=acp + worktree: ref to branch from (default HEAD).",
+        },
     },
     required=["task"],
 )
@@ -359,9 +418,36 @@ async def sessions_spawn(
     agent_id: str | None = None,
     task: str = "",
     model: str | None = None,
+    runtime: str | None = None,
+    acp_agent: str | None = None,
+    cwd: str | None = None,
+    mode: str | None = None,
+    harness_mode: str | None = None,
+    resume_session_id: str | None = None,
+    worktree: bool = False,
+    worktree_name: str | None = None,
+    worktree_base_ref: str | None = None,
 ) -> str:
     if not task:
         raise ToolError("Task must not be empty")
+    spawn_runtime = (runtime or "subagent").strip().lower()
+    if spawn_runtime == "acp":
+        from agentos.acp.spawn import spawn_acp_session
+
+        return await spawn_acp_session(
+            task=task,
+            acp_agent=acp_agent,
+            cwd=cwd,
+            mode=mode,
+            harness_mode=harness_mode,
+            resume_session_id=resume_session_id,
+            worktree=bool(worktree),
+            worktree_name=worktree_name,
+            worktree_base_ref=worktree_base_ref,
+            model=model,
+        )
+    if spawn_runtime != "subagent":
+        raise ToolError("runtime must be 'subagent' or 'acp'")
 
     try:
         mgr = _get_session_manager()
@@ -450,7 +536,7 @@ async def sessions_spawn(
             if isinstance(policy_model, str) and policy_model.strip():
                 model = policy_model
 
-        runtime = _get_task_runtime()
+        task_runtime = _get_task_runtime()
         spawn_depth = current_depth + 1
         session_key = build_subagent_session_key(resolved_agent_id, uuid.uuid4().hex[:8])
         grounded_task = (
@@ -502,7 +588,7 @@ async def sessions_spawn(
             parent_task_id=parent_task_id,
             spawn_depth=spawn_depth,
         )
-        handle = await runtime.enqueue(
+        handle = await task_runtime.enqueue(
             envelope,
             grounded_task,
             mode="followup",

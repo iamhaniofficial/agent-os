@@ -708,6 +708,9 @@ def _derive_source_metadata(session: Any) -> dict[str, Any]:
     elif ":subagent:" in key:
         source_kind = source_kind or "subagent"
         channel_kind = channel_kind or "subagent"
+    elif ":acp:" in key:
+        source_kind = source_kind or "acp"
+        channel_kind = channel_kind or "acp"
     elif key.startswith("cron:") or ":cron:" in key:
         source_kind = source_kind or "cron"
         channel_kind = channel_kind or "cron"
