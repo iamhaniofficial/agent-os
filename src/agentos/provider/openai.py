@@ -602,8 +602,28 @@ def _build_openai_tool_choice(tool_choice: Any) -> Any:
     return tool_choice
 
 
-def _parallel_tool_calls(cfg: ChatConfig) -> bool | None:
-    if cfg.parallel_tool_calls is not None:
+def _accepts_parallel_tool_calls_opt_in(provider_kind: str, base_url: str, model: str) -> bool:
+    """Whether ``parallel_tool_calls: true`` may be sent to this endpoint.
+
+    The engine asks for parallel tool calls on every request, so the opt-in
+    only goes where the field is documented: api.openai.com (minus the o-series
+    reasoning models, which reject it) and OpenRouter. Other OpenAI-compatible
+    servers (DeepSeek, Zhipu, Gemini-compatible, Ollama, gateways, local
+    servers) either reject unknown fields or are unverified, so they get none.
+    An explicit ``False`` is a correctness request and is not gated.
+    """
+    if provider_kind == "openrouter":
+        return True
+    if provider_kind != "openai" or not base_url:
+        return False
+    if httpx.URL(base_url).host != "api.openai.com":
+        return False
+    model_name = model.rsplit("/", 1)[-1].strip().lower()
+    return not model_name.startswith(("o1", "o3", "o4"))
+
+
+def _parallel_tool_calls(cfg: ChatConfig, *, accepts_opt_in: bool = True) -> bool | None:
+    if cfg.parallel_tool_calls is False or (cfg.parallel_tool_calls and accepts_opt_in):
         return cfg.parallel_tool_calls
     choice = cfg.tool_choice
     if isinstance(choice, ToolChoice) and choice.disable_parallel_tool_use is not None:
@@ -1251,7 +1271,12 @@ class OpenAIProvider:
             tool_choice_payload = _build_openai_tool_choice(cfg.tool_choice)
             if tool_choice_payload is not None:
                 payload["tool_choice"] = tool_choice_payload
-            parallel_tool_calls = _parallel_tool_calls(cfg)
+            parallel_tool_calls = _parallel_tool_calls(
+                cfg,
+                accepts_opt_in=_accepts_parallel_tool_calls_opt_in(
+                    self._provider_kind, self._base_url, self._model
+                ),
+            )
             if parallel_tool_calls is not None:
                 payload["parallel_tool_calls"] = parallel_tool_calls
         if _openai_supports_prompt_cache_key(self._provider_kind, self._base_url):

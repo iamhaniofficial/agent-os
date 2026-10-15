@@ -3998,7 +3998,43 @@ class TurnRunner:
             metadata.get("thinking_level", "medium"),
             source="agentos_router",
         )
+        if isinstance(parsed, ThinkingLevel):
+            parsed = self._effort_by_tier(parsed, metadata)
         return parsed if parsed is not None else False
+
+    def _effort_by_tier(self, level: ThinkingLevel, metadata: Mapping[str, Any]) -> ThinkingLevel:
+        """Cap a router-chosen thinking level at the routed tier's ceiling.
+
+        Only the tier's own level is capped: a controller-chosen level, an
+        explicit ``[llm] thinking`` (handled before this) or a route the turn
+        did not honor stay as they are. ``[agentos_router] effort_by_tier =
+        false`` turns it off. The model choice is never touched.
+        """
+        from agentos.router_tiers import effort_for_tier
+
+        router_cfg = getattr(self._config, "agentos_router", None) if self._config else None
+        if not getattr(router_cfg, "effort_by_tier", True):
+            return level
+        if metadata.get("thinking_level_source") != "tier":
+            return level
+        if metadata.get("routing_applied") is False:
+            return level
+        tier = metadata.get("routed_tier")
+        capped = ThinkingLevel(effort_for_tier(tier, level.value))
+        if capped is not level:
+            log.info(
+                "turn_runner.effort_by_tier",
+                tier=tier,
+                level=capped.value,
+                tier_level=level.value,
+            )
+        return capped
+
+    def _resolve_parallel_tool_calls(self) -> bool:
+        """``[tools] parallel_calls``: ask providers for parallel tool calls."""
+
+        tools_cfg = getattr(self._config, "tools", None) if self._config else None
+        return bool(getattr(tools_cfg, "parallel_calls", True))
 
     @staticmethod
     def _parse_thinking_level(value: Any, *, source: str) -> bool | ThinkingLevel | None:

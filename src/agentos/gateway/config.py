@@ -246,6 +246,9 @@ class ToolsConfig(BaseModel):
     # every request; the model loads them on demand through ``tool_search``.
     # ``false`` sends every tool on every request, the pre-deferral behaviour.
     defer_loading: bool = True
+    # Ask the model for several independent tool calls in one response (sent
+    # only to providers known to accept the field). ``false`` sends nothing.
+    parallel_calls: bool = True
     profile: Literal["full", "minimal", "memory_only", "coding", "messaging"] | None = None
     allow: list[str] = Field(default_factory=list)
     deny: list[str] = Field(default_factory=list)
@@ -1352,6 +1355,9 @@ class AgentOSRouterConfig(BaseSettings):
     enabled: bool = True
     cost_aware: bool = True
     auto_thinking: bool = True
+    # Cap the routed tier's thinking level for cheap tiers (c0 -> low,
+    # c1 -> medium) when the level came from the tier itself.
+    effort_by_tier: bool = True
     rollout_phase: str = "full"  # "observe" | "prompt_only" | "full"
     # "pilot-v1" (default: local ONNX+MiniLM router, English-optimized, no LLM
     # call) | "llm_judge" (routes via a small LLM judge call) | "jev"
