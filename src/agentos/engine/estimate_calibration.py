@@ -12,14 +12,22 @@ the usage of every provider call. The factor it hands back is clamped to
 ``[MIN_FACTOR, MAX_FACTOR]`` and only applies after ``MIN_OBSERVATIONS``
 samples; until then it is exactly ``1.0`` (uncalibrated, the old behaviour).
 The store is in memory, owned by the runtime and bounded in size.
+
+Samples that do not measure the estimator are skipped: usage the provider
+marked ``"estimated": true`` (OpenCAP's trailing chunk) is the gateway's own
+guess, and a request carrying image or document blocks counts their base64
+text in the estimate while the provider bills them by size or tiles, which
+drags the ratio down for every later text-only request.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
-MIN_FACTOR = 0.5
+MIN_FACTOR = 0.7
 MAX_FACTOR = 1.25
 MIN_OBSERVATIONS = 2
 EMA_ALPHA = 0.3
@@ -31,6 +39,35 @@ _MAX_SANE_RATIO = 3.0
 # Below this size the fixed per-request overhead dominates the ratio.
 _MIN_ESTIMATE_TOKENS = 256
 DEFAULT_MAX_KEYS = 64
+# Content blocks whose payload is base64 the estimate counts as text.
+_MEDIA_BLOCK_TYPES = frozenset({"image", "document"})
+
+
+def _block_type(block: Any) -> Any:
+    if isinstance(block, dict):
+        return block.get("type")
+    return getattr(block, "type", None)
+
+
+def _blocks_have_media(blocks: Iterable[Any]) -> bool:
+    for block in blocks:
+        kind = _block_type(block)
+        if kind in _MEDIA_BLOCK_TYPES or kind == "image_url":
+            return True
+        if kind == "tool_result":
+            nested = block.get("content") if isinstance(block, dict) else block.content
+            if isinstance(nested, list) and _blocks_have_media(nested):
+                return True
+    return False
+
+
+def request_has_media(messages: Iterable[Any]) -> bool:
+    """True when any message carries an image or document block (also in tool results)."""
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else message.content
+        if isinstance(content, list) and _blocks_have_media(content):
+            return True
+    return False
 
 
 @dataclass
@@ -58,8 +95,16 @@ class EstimateCalibration:
         *,
         estimated_tokens: int,
         provider_input_tokens: int,
+        usage_estimated: bool = False,
+        has_media: bool = False,
     ) -> bool:
-        """Record one provider call; ``False`` when the sample was ignored."""
+        """Record one provider call; ``False`` when the sample was ignored.
+
+        *usage_estimated*: the provider marked its usage as an estimate.
+        *has_media*: the request carried image or document blocks.
+        """
+        if usage_estimated or has_media:
+            return False
         if estimated_tokens < _MIN_ESTIMATE_TOKENS or provider_input_tokens <= 0:
             return False
         ratio = provider_input_tokens / estimated_tokens

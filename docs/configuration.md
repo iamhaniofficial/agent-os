@@ -1013,7 +1013,8 @@ estimate_calibration = true      # scale the size estimate by what providers rep
   which over-counts against what providers bill. Per provider and model,
   AgentOS keeps a running ratio of the provider's reported input tokens to its
   own estimate and, after two calls, scales the estimate by it (clamped to
-  0.5-1.25), so compaction does not fire early. `estimate_calibration = false`
+  0.7-1.25), so compaction does not fire early. Usage the provider marks as
+  estimated and requests carrying images or documents are not counted. `estimate_calibration = false`
   uses the raw estimate.
 - When the summarizer fails or times out, a deterministic digest bounded to an
   eighth of the context window is used instead, so a compaction still shrinks

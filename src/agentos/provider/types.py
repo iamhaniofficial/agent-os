@@ -165,6 +165,10 @@ class DoneEvent:
     # False when the provider's usage carried no cache-read figure at all
     # (unknown, not zero hits); the cache-break monitor skips such responses.
     cache_usage_reported: bool = True
+    # True when ``input_tokens`` came only from a usage object the provider
+    # marked ``"estimated": true`` (OpenCAP), not from a billed count. The
+    # request-size calibration ignores such samples.
+    usage_estimated: bool = False
 
     def __post_init__(self) -> None:
         given = self.stop_reason

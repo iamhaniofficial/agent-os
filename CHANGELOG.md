@@ -99,8 +99,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   over-counted 1.6-2x against provider-reported input tokens, so compaction
   fired far too early. Per provider and model, a running ratio of reported
   input tokens to the estimate now scales the estimate after two calls
-  (clamped 0.5-1.25; logged on `agent.context_estimate_vs_provider` as
-  `calibration_factor`). `[compaction] estimate_calibration = false` keeps the
+  (clamped 0.7-1.25; logged on `agent.context_estimate_vs_provider` as
+  `calibration_factor`). Usage the provider marks `"estimated": true`
+  (OpenCAP) and requests carrying image or document blocks are not used as
+  samples. `[compaction] estimate_calibration = false` keeps the
   raw estimate.
 - Turn setup runs its independent reads concurrently: the external memory
   provider's recall, the session's project knowledge, the deferred-tool

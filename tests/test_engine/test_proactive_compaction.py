@@ -626,17 +626,18 @@ async def _calibrated_run(
     tmp_path: Path, storages: list[SessionStorage], *, calibrate: bool
 ) -> _Provider:
     manager = await _manager(tmp_path, storages)
-    # Usage reports 60% of the agent's estimate, as providers do.
-    provider = _Provider(input_ratio=0.6)
+    # Usage reports 75% of the agent's estimate, as providers do (inside the
+    # 0.7-1.25 clamp).
+    provider = _Provider(input_ratio=0.75)
     runner = _runner(provider, manager, tmp_path, proactive=False, estimate_calibration=calibrate)
     await _seed(manager, KEY, rounds=1, chars=400)
     await _turn(runner, manager, KEY, "first", tmp_path)
     await _turn(runner, manager, KEY, "second", tmp_path)
-    # Grow the history past the raw 7.2k trigger, under it once scaled by 0.6.
+    # Grow the history past the raw 7.2k trigger, under it once scaled by 0.75.
     await _seed(manager, KEY, rounds=3)
     _ESTIMATES.clear()
     await _turn(runner, manager, KEY, "third", tmp_path)
-    assert 7_200 < _ESTIMATES[0] < 7_200 / 0.6
+    assert 7_200 < _ESTIMATES[0] < 7_200 / 0.75
     return provider
 
 

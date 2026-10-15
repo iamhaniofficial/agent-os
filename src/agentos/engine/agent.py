@@ -26,7 +26,7 @@ from agentos.engine.cache_break_monitor import (
     record_prompt_state,
 )
 from agentos.engine.compaction_service import CompactionService, auxiliary_chunk_summarizer
-from agentos.engine.estimate_calibration import EstimateCalibration
+from agentos.engine.estimate_calibration import EstimateCalibration, request_has_media
 from agentos.engine.fallback import FallbackPolicy, backoff_sleep, retry_after_delay
 from agentos.engine.history import limit_turns, repair_tool_pairing
 from agentos.engine.progress_watchdog import (
@@ -2015,7 +2015,10 @@ class Agent:
                                 # compaction trigger runs on this estimate,
                                 # scaled by the calibration it feeds.
                                 calibration_factor = self._observe_estimate(
-                                    estimated_context_tokens, raw_ev.input_tokens
+                                    estimated_context_tokens,
+                                    raw_ev.input_tokens,
+                                    usage_estimated=raw_ev.usage_estimated,
+                                    request_messages=request_messages,
                                 )
                                 logger.debug(
                                     "agent.context_estimate_vs_provider",
@@ -3825,8 +3828,18 @@ class Agent:
             return 1.0
         return self.estimate_calibration.factor(*self._calibration_key())
 
-    def _observe_estimate(self, estimated_tokens: int, provider_input_tokens: int) -> float:
-        """Feed one provider usage sample to the calibration; return the factor."""
+    def _observe_estimate(
+        self,
+        estimated_tokens: int,
+        provider_input_tokens: int,
+        *,
+        usage_estimated: bool = False,
+        request_messages: Sequence[Message] = (),
+    ) -> float:
+        """Feed one provider usage sample to the calibration; return the factor.
+
+        Estimated usage and requests with image/document blocks are skipped.
+        """
         if self.estimate_calibration is None:
             return 1.0
         provider, model = self._calibration_key()
@@ -3835,6 +3848,8 @@ class Agent:
             model,
             estimated_tokens=estimated_tokens,
             provider_input_tokens=provider_input_tokens,
+            usage_estimated=usage_estimated,
+            has_media=not usage_estimated and request_has_media(request_messages),
         )
         return round(self.estimate_calibration.factor(provider, model), 3)
 
