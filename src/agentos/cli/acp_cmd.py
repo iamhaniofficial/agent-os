@@ -58,6 +58,11 @@ _FALLBACK_CODES = frozenset({"METHOD_NOT_FOUND", "ACP_UNAVAILABLE"})
 
 _NOT_REACHED = object()
 
+# Keywords handed to a runtime factory that takes ``**kwargs``.
+_CANONICAL_RUNTIME_KWARGS = frozenset(
+    {"config", "permission_bridge", "elicitation_bridge", "state_dir"}
+)
+
 
 # --------------------------------------------------------------------------
 # Config / gateway helpers
@@ -348,6 +353,8 @@ def _build_runtime(config: Any, bridge: Any, elicitation: Any | None = None) -> 
         for p in sig.parameters.values()
         if p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD) and p.name != "self"
     }
+    if any(p.kind is p.VAR_KEYWORD for p in sig.parameters.values()):
+        names |= _CANONICAL_RUNTIME_KWARGS
     return factory(**{k: v for k, v in candidates.items() if k in names})
 
 

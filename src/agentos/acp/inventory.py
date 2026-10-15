@@ -82,13 +82,12 @@ def known_agent_ids(config: Any = None) -> list[str]:
     return ids
 
 
-def harness_row(
-    agent_id: str, config: Any = None, *, which: Which = shutil.which
-) -> dict[str, Any]:
+def harness_row(agent_id: str, config: Any = None, *, which: Which | None = None) -> dict[str, Any]:
     """One registry/doctor row for ``agent_id`` (no process is started).
 
     Raises ``KeyError`` for an id that is neither built in nor overridden.
     """
+    which = which or shutil.which
     aid = normalize_agent_id(agent_id)
     overrides = harness_overrides(config)
     definition: HarnessDefinition | None = get_harness(aid)
@@ -138,11 +137,11 @@ def _name(definition: HarnessDefinition | None, aid: str) -> str:
     return definition.name if definition is not None else aid
 
 
-def harness_rows(config: Any = None, *, which: Which = shutil.which) -> list[dict[str, Any]]:
+def harness_rows(config: Any = None, *, which: Which | None = None) -> list[dict[str, Any]]:
     return [harness_row(aid, config, which=which) for aid in known_agent_ids(config)]
 
 
-def agents_payload(config: Any = None, *, which: Which = shutil.which) -> dict[str, Any]:
+def agents_payload(config: Any = None, *, which: Which | None = None) -> dict[str, Any]:
     acp = _acp_config(config)
     return {
         "enabled": bool(getattr(acp, "enabled", True)),
