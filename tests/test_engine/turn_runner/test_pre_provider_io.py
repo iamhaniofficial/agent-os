@@ -558,3 +558,77 @@ def test_config_defaults() -> None:
     assert TaskRuntimeConfig().concurrent_turn_setup is True
     with pytest.raises(ValueError):
         MemoryConfig(recall_timeout_seconds=0)
+
+
+# ---------------------------------------------------------------------------
+# Blocking work kept off the event loop
+# ---------------------------------------------------------------------------
+
+
+async def test_attachment_build_runs_off_the_event_loop() -> None:
+    import threading
+
+    from agentos.engine.turn_runner.attachment_stage import (
+        AttachmentStage,
+        AttachmentStageInput,
+    )
+
+    threads: list[int] = []
+
+    class _Builder:
+        def build(self, message: str, attachments: list[dict]) -> list[Any] | None:
+            threads.append(threading.get_ident())
+            return ["msg"] if attachments else None
+
+    stage = AttachmentStage(builder=_Builder())
+    out = (
+        await stage.run(AttachmentStageInput(effective_runtime_message="m", attachments=[{"x": 1}]))
+    ).require_output()
+    assert out.extra_messages == ["msg"]
+    assert out.turn_input == ""
+    assert threads[-1] != threading.get_ident()
+
+    # Nothing to build: stays inline, no thread hop.
+    out = (
+        await stage.run(AttachmentStageInput(effective_runtime_message="m", attachments=None))
+    ).require_output()
+    assert out.turn_input == "m"
+    assert threads[-1] == threading.get_ident()
+
+
+async def test_memory_sync_scans_and_reads_files_off_the_event_loop(tmp_path: Path) -> None:
+    import threading
+
+    from agentos.memory.sync_manager import MemorySyncManager
+
+    workspace = tmp_path / "ws"
+    (workspace / "memory").mkdir(parents=True)
+    (workspace / "MEMORY.md").write_text("root\n", encoding="utf-8")
+
+    class _Store:
+        def __init__(self) -> None:
+            self.indexed: dict[str, str] = {}
+
+        async def index_file(self, *, path: str, content: str, source: object, mtime=None) -> int:
+            self.indexed[path] = content
+            return 1
+
+        async def remove_file(self, path: str) -> None:
+            return None
+
+    store = _Store()
+    manager = MemorySyncManager(
+        store=store, workspace_dir=workspace, memory_dir=workspace / "memory"
+    )
+    loop_thread = threading.get_ident()
+    scan_threads: list[int] = []
+    real_scan = manager._scan_files
+
+    def _scan() -> dict[str, float]:
+        scan_threads.append(threading.get_ident())
+        return real_scan()
+
+    manager._scan_files = _scan  # type: ignore[method-assign]
+    await manager.warm_session("agent:main:s")
+    assert scan_threads and all(t != loop_thread for t in scan_threads)
+    assert store.indexed == {"MEMORY.md": "root\n"}
