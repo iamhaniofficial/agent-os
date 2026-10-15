@@ -1,6 +1,6 @@
 ---
 name: sub-agent
-description: 'Delegate a self-contained task to a sub-Agent (Codex, Claude Code, or Pi via background process). The original use case was coding tasks — building features, reviewing PRs, refactoring — but the skill is the generic "spawn a sub-Agent with full tool surface" slot used by meta-skill DAG steps for any LLM-driven sub-task (policy review, trace parsing, report synthesis, document generation). Renamed from ``coding-agent`` to reflect actual usage; the wrapped CLIs (codex / claude / pi) still bias toward coding workloads. Use when: (1) building/creating new features or apps, (2) reviewing PRs (spawn in temp dir), (3) refactoring large codebases, (4) iterative tasks that need file exploration, (5) meta-skill steps requiring full tool/LLM agency. NOT for: simple one-liner fixes (just edit), reading code (use read tool), thread-bound ACP harness requests in chat (for example spawn/run Codex or Claude Code in a Discord thread; use sessions_spawn with runtime:"acp"), or any work in ~/clawd workspace (never spawn agents here). Prefer non-interactive CLI modes such as codex exec, claude --print, opencode run, or pi -p.'
+description: 'Route coding work to an external coding harness (Claude Code, Codex, Gemini CLI, Cursor, GitHub Copilot, OpenCode, Pi, Droid, Qwen, Kimi, Kiro, ...) as an ACP child session via sessions_spawn(runtime="acp"). Use when: the user names a coding agent ("have Codex fix this", "ask Claude Code to review"), wants a feature built, a PR reviewed, a refactor or a multi-file change done by a separate worker, or a meta-skill step needs a full coding agent. Read this before spawning, steering, waiting for, or cancelling a harness. NOT for: one-line edits (edit directly), reading code (use read tools), or delegating to another AgentOS agent (plain sessions_spawn without runtime).'
 provenance:
   origin: openclaw-derived
   license: MIT
@@ -8,320 +8,167 @@ provenance:
   maintained_by: AgentOS
 metadata:
   {
-    "agentos":
-      {
-        "requires_tools": ["background_process", "exec_command", "process"],
-      },
     "openclaw":
       {
         "emoji": "🧩",
-        "requires": { "anyBins": ["claude", "codex", "opencode", "pi"] },
-        "install":
-          [
-            {
-              "id": "node-claude",
-              "kind": "npm",
-              "package": "@anthropic-ai/claude-code",
-              "bins": ["claude"],
-              "label": "Install Claude Code CLI (npm)",
-            },
-            {
-              "id": "node-codex",
-              "kind": "npm",
-              "package": "@openai/codex",
-              "bins": ["codex"],
-              "label": "Install Codex CLI (npm)",
-            },
-          ],
+        "requires":
+          {
+            "anyBins":
+              [
+                "claude",
+                "codex",
+                "gemini",
+                "cursor-agent",
+                "copilot",
+                "opencode",
+                "pi",
+                "droid",
+                "qwen",
+                "kimi",
+                "npx",
+              ],
+          },
       },
   }
 ---
 
-# Sub-Agent (agentos process tools)
+# Sub-Agent: route coding work to an ACP harness
 
-Generic "spawn a sub-Agent" entry point for delegating self-contained
-tasks to Codex / Claude Code / OpenCode / Pi via background process.
-Wrapping CLIs are coding-oriented, but the skill itself is used as
-the generic sub-Agent slot by meta-skill DAGs for any LLM-driven
-sub-task (file edits, document generation, policy review, etc.).
+Derived from OpenClaw's `acp-router` skill (MIT). AgentOS drives external
+coding agents ("harnesses") over the Agent Client Protocol. A harness runs as
+a child session with its own transcript: you get structured progress, its
+permission prompts go to the user's approval queue, and its final answer is
+pushed back to you with a `Stats:` line (runtime, tokens, cost when known).
 
-Use agentos's `exec_command`, `background_process`, and `process` tools for coding agent work. AgentOS does not expose a `bash` tool; do not use the legacy bash tool-call DSL.
+Do not scrape a harness through `exec_command` / `background_process` when
+the ACP path works. That path is only the fallback at the end of this page.
 
-## Non-Interactive CLI Mode
+## Pick the harness
 
-AgentOS's process tools do not expose a `pty` parameter. Prefer non-interactive command modes that run and exit cleanly:
+Map what the user says to `acp_agent`:
 
-```bash
-# ✅ Correct for Codex/Pi/OpenCode
-exec_command(command="codex exec 'Your prompt'")
+| User says | `acp_agent` |
+| --- | --- |
+| "claude", "claude code" | `claude` |
+| "codex", "openai codex" | `codex` |
+| "gemini", "gemini cli" | `gemini` |
+| "cursor", "cursor cli", "cursor agent" | `cursor` |
+| "copilot", "github copilot" | `copilot` |
+| "opencode" | `opencode` |
+| "pi" | `pi` |
+| "droid", "factory droid" | `droid` |
+| "qwen", "qwen code" | `qwen` |
+| "kimi", "kimi cli" | `kimi` |
+| "kiro", "kiro cli" | `kiro` |
+| "grok build" | `grok-build` (a harness, not the xAI model id) |
+| "kilo", "kilocode" | `kilocode` |
+| "iflow", "junie", "qoder", "trae", "mux", "devin", "fx", "pool", "mcode", "zeroclaw", "fast-agent", "antigravity", "openclaw" | the same word |
+| nothing specific | omit `acp_agent` (the configured `[acp] default_agent`, usually `claude`) |
+
+If the user asks for a specific harness, use that one. If it fails, report
+the error and ask; do not silently switch harness or do the work yourself.
+
+## Spawn
+
+```json
+{
+  "task": "Fix the failing test in tests/test_api.py. Run pytest -q before you finish and report what changed.",
+  "runtime": "acp",
+  "acp_agent": "codex",
+  "cwd": "/path/to/app",
+  "mode": "oneshot"
+}
 ```
 
-For **Claude Code** (`claude` CLI), use `--print --permission-mode bypassPermissions` instead.
-`--dangerously-skip-permissions` with PTY can exit after the confirmation dialog.
-`--print` mode keeps full tool access and avoids interactive confirmation:
+- `task`: self-contained. The harness cannot see this conversation: include
+  the goal, the files, the constraints, how to verify, and the exact output
+  you need back.
+- `cwd`: the project directory. Never the AgentOS state directory
+  (`~/.agentos/state`) or the live AgentOS workspace.
+- `mode`: `oneshot` (default) for a single job; the harness exits when it
+  answers. `persistent` when you expect follow-ups in the same harness
+  context (iterating on a feature, a conversation the user keeps steering).
+- `harness_mode`: optional session mode the harness offers, for example
+  `read-only` (Codex) or `plan` / `acceptEdits` (Claude Code). Use a
+  read-only mode for reviews and investigations.
+- `worktree: true` (with optional `worktree_name`, `worktree_base_ref`):
+  run in a managed git worktree instead of the checkout. Use it for parallel
+  workers on one repo and for anything you want isolated from the user's
+  working tree.
+- `resume_session_id`: continue an earlier harness session you or your
+  children started.
 
-```bash
-# ✅ Correct for Claude Code (no PTY needed)
-cd /path/to/project && claude --permission-mode bypassPermissions --print 'Your task'
+## Wait
 
-# For background execution: use background_process
+After spawning one or more harnesses, call `sessions_yield` with no
+`session_key` and end your turn. Completions are pushed back to this session
+as messages; do not poll in a loop or sleep. Tell the user once what is
+running and where, then report again only when something changes (a worker
+finished, failed, or needs an answer).
 
-# ❌ Wrong for Claude Code
-exec_command(command="claude --dangerously-skip-permissions 'task'")
+## Steer, cancel, close
+
+- Follow-up for a `persistent` child: `sessions_send` to its session key
+  (`agent:<you>:acp:<id>`). `followup` queues the text after the current
+  turn; `steer` cancels the running turn and sends the new text instead.
+- List children: `subagents` (ACP children carry `runtime: "acp"`).
+- Stop one: `subagents` with `action="kill"` (cancel + close).
+- Harness permission prompts reach the user through the normal approvals
+  surface. If a child is waiting on one, say so; do not try to answer it.
+
+## Safety rules
+
+1. Never spawn a worker with permissions bypassed (`approve-all`, Claude
+   `bypassPermissions`, Codex `danger-full-access`) on code you have not
+   read: a pull request from a fork, a freshly cloned unknown repo, a branch
+   someone else pushed. Hostile repo content can instruct the harness to run
+   anything. Review those in a read-only `harness_mode`, in a worktree.
+2. Never start a harness inside the AgentOS state or workspace directories,
+   and never check out branches there; use the project checkout or a
+   worktree.
+3. One writer per checkout. Parallel workers on the same repo each get
+   `worktree: true`.
+4. Be patient. A quiet harness is working; only cancel on the user's word,
+   a clear hang (no progress for a long time on a short task), or a wrong
+   direction.
+
+## When spawning fails
+
+| Error code | What to do |
+| --- | --- |
+| `ACP_HARNESS_MISSING` | The harness CLI is not installed. Tell the user which one (`agentos acp doctor <id>` shows the fix). |
+| `ACP_AGENT_NOT_ALLOWED` | Not in `[acp] allowed_agents`, or ACP is disabled. Report it and ask which allowed harness to use. |
+| `ACP_SESSION_INIT_FAILED` | The harness started but would not open a session (often not logged in). Ask the user to run the harness CLI once and sign in. |
+| `ACP_PERMISSION_PROMPT_UNAVAILABLE` | It needed approval and nobody can answer here. Report it; suggest a read-only task or a different `[acp] permission_mode`. |
+| `ACP_TURN_TIMEOUT` | The turn hit `[acp] turn_timeout_s`. Report partial results; respawn with a smaller task if the user wants. |
+| unknown parameter `runtime` / `ACP_UNAVAILABLE` | This build or host has no ACP runtime. Use the fallback below. |
+
+## Fallback: raw CLI (only without the ACP runtime)
+
+Use this only when `sessions_spawn(runtime="acp")` is unavailable on this
+host (no ACP runtime, no Node/`npx` for the adapter). You lose approvals,
+resume and cost accounting. Run the harness non-interactively in the project
+directory with `background_process`, then follow it with `process`
+(`poll`, `log`, `kill`):
+
+```text
+background_process(workdir="/path/to/project",
+  command="codex exec --sandbox workspace-write 'Fix the failing test in tests/test_api.py and run pytest -q'")
+
+background_process(workdir="/path/to/project",
+  command="claude -p --permission-mode acceptEdits 'Fix the failing test in tests/test_api.py and run pytest -q'")
+
+process(action="log", session_id="<id>")
 ```
 
-### AgentOS Tool Parameters
-
-| Tool | Key parameters | Description |
-| ---- | -------------- | ----------- |
-| `exec_command` | `command`, `workdir`, `timeout` | Run a foreground shell command. |
-| `background_process` | `command`, `workdir`, `timeout` | Start a long-running command and return `session_id`. |
-| `process` | `action`, `session_id`, `data`, `offset`, `limit` | Poll, log, write to, or stop a background process. |
-
-### Process Tool Actions (for background sessions)
-
-| Action      | Description                                          |
-| ----------- | ---------------------------------------------------- |
-| `list`      | List all running/recent sessions                     |
-| `poll`      | Check if session is still running                    |
-| `log`       | Get session output (with optional offset/limit)      |
-| `write`     | Send raw data to stdin                               |
-| `submit`    | Send data + newline (like typing and pressing Enter) |
-| `eof`       | Close stdin                                          |
-| `remove`    | Remove a finished session from the process list      |
-| `kill`      | Terminate the session                                |
-
----
-
-## Quick Start: One-Shot Tasks
-
-For quick prompts/chats, create a temp git repo and run:
-
-```bash
-# Quick chat (Codex needs a git repo!)
-SCRATCH=$(mktemp -d) && cd $SCRATCH && git init && codex exec "Your prompt here"
-
-# Or in a real project
-exec_command(workdir="~/Projects/myproject", command="codex exec 'Add error handling to the API calls'")
-```
-
-**Why git init?** Codex refuses to run outside a trusted git directory. Creating a temp repo solves this for scratch work.
-
----
-
-## The Pattern: workdir + background_process
-
-For longer tasks, use `background_process`:
-
-```bash
-# Start agent in target directory.
-background_process(workdir="~/project", command="codex exec --full-auto 'Build a snake game'")
-# Returns session_id for tracking
-
-# Monitor progress
-process(action="log", session_id="XXX")
-
-# Check if done
-process(action="poll", session_id="XXX")
-
-# Send input (if agent asks a question)
-process(action="write", session_id="XXX", data="y")
-
-# Submit with Enter (like typing "yes" and pressing Enter)
-process(action="submit", session_id="XXX", data="yes")
-
-# Kill if needed
-process(action="kill", session_id="XXX")
-```
-
-**Why workdir matters:** Agent wakes up in a focused directory, doesn't wander off reading unrelated files (like your soul.md 😅).
-
----
-
-## Codex CLI
-
-**Model:** `gpt-5.2-codex` is the default (set in ~/.codex/config.toml)
-
-### Flags
-
-| Flag            | Effect                                             |
-| --------------- | -------------------------------------------------- |
-| `exec "prompt"` | One-shot execution, exits when done                |
-| `--full-auto`   | Sandboxed but auto-approves in workspace           |
-| `--yolo`        | NO sandbox, NO approvals (fastest, most dangerous) |
-
-### Building/Creating
-
-```bash
-# Quick one-shot
-exec_command(workdir="~/project", command="codex exec --full-auto 'Build a dark mode toggle'")
-
-# Background for longer work
-background_process(workdir="~/project", command="codex exec --full-auto 'Refactor the auth module'")
-```
-
-### Reviewing PRs
-
-**⚠️ CRITICAL: Never review PRs in AgentOS's own project folder!**
-Clone to temp folder or use git worktree.
-
-```bash
-# Clone to temp for safe review
-REVIEW_DIR=$(mktemp -d)
-git clone https://github.com/user/repo.git $REVIEW_DIR
-cd $REVIEW_DIR && gh pr checkout 130
-exec_command(workdir="$REVIEW_DIR", command="codex review --base origin/main")
-# Clean up after: trash $REVIEW_DIR
-
-# Or use git worktree (keeps main intact)
-git worktree add /tmp/pr-130-review pr-130-branch
-exec_command(workdir="/tmp/pr-130-review", command="codex review --base main")
-```
-
-### Batch PR Reviews (parallel army!)
-
-```bash
-# Fetch all PR refs first
-git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
-
-# Deploy the army - one Codex per PR
-background_process(workdir="~/project", command="codex exec 'Review PR #86. git diff origin/main...origin/pr/86'")
-background_process(workdir="~/project", command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87'")
-
-# Monitor all
-process(action="list")
-
-# Post results to GitHub
-gh pr comment <PR#> --body "<review content>"
-```
-
----
-
-## Claude Code
-
-```bash
-# Foreground
-exec_command(workdir="~/project", command="claude --permission-mode bypassPermissions --print 'Your task'")
-
-# Background
-background_process(workdir="~/project", command="claude --permission-mode bypassPermissions --print 'Your task'")
-```
-
----
-
-## OpenCode
-
-```bash
-exec_command(workdir="~/project", command="opencode run 'Your task'")
-```
-
----
-
-## Pi Coding Agent
-
-```bash
-# Install: npm install -g @mariozechner/pi-coding-agent
-exec_command(workdir="~/project", command="pi -p 'Your task'")
-
-# Non-interactive mode
-exec_command(command="pi -p 'Summarize src/'")
-
-# Different provider/model
-exec_command(command="pi --provider openai --model gpt-4o-mini -p 'Your task'")
-```
-
-**Note:** Pi now has Anthropic prompt caching enabled (PR #584, merged Jan 2026)!
-
----
-
-## Parallel Issue Fixing with git worktrees
-
-For fixing multiple issues in parallel, use git worktrees:
-
-```bash
-# 1. Create worktrees for each issue
-git worktree add -b fix/issue-78 /tmp/issue-78 main
-git worktree add -b fix/issue-99 /tmp/issue-99 main
-
-# 2. Launch Codex in each
-background_process(workdir="/tmp/issue-78", command="pnpm install && codex exec --full-auto 'Fix issue #78: <description>. Commit and push.'")
-background_process(workdir="/tmp/issue-99", command="pnpm install && codex exec --full-auto 'Fix issue #99 from the approved ticket summary. Implement only the in-scope edits and commit after review.'")
-
-# 3. Monitor progress
-process(action="list")
-process(action="log", session_id="XXX")
-
-# 4. Create PRs after fixes
-cd /tmp/issue-78 && git push -u origin fix/issue-78
-gh pr create --repo user/repo --head fix/issue-78 --title "fix: ..." --body "..."
-
-# 5. Cleanup
-git worktree remove /tmp/issue-78
-git worktree remove /tmp/issue-99
-```
-
----
-
-## ⚠️ Rules
-
-1. **Use the right execution mode per agent**:
-   - Codex/Pi/OpenCode: non-interactive command mode (`codex exec`, `opencode run`, `pi -p`)
-   - Claude Code: `--print --permission-mode bypassPermissions` (no PTY required)
-2. **Respect tool choice** - if user asks for Codex, use Codex.
-   - Orchestrator mode: do NOT hand-code patches yourself.
-   - If an agent fails/hangs, respawn it or ask the user for direction, but don't silently take over.
-3. **Be patient** - don't kill sessions because they're "slow"
-4. **Monitor with process:log** - check progress without interfering
-5. **--full-auto for building** - auto-approves changes
-6. **vanilla for reviewing** - no special flags needed
-7. **Parallel is OK** - run many Codex processes at once for batch work
-8. **NEVER start Codex inside your AgentOS state directory** (`$AGENTOS_STATE_DIR`, default `~/.agentos/state`) - keep agent state separate from project worktrees.
-9. **NEVER checkout branches inside the live AgentOS runtime state/workspace directories** - use an explicit project worktree.
-
----
-
-## Progress Updates (Critical)
-
-When you spawn coding agents in the background, keep the user in the loop.
-
-- Send 1 short message when you start (what's running + where).
-- Then only update again when something changes:
-  - a milestone completes (build finished, tests passed)
-  - the agent asks a question / needs input
-  - you hit an error or need user action
-  - the agent finishes (include what changed + where)
-- If you kill a session, immediately say you killed it and why.
-
-This prevents the user from seeing only "Agent failed before reply" and having no idea what happened.
-
----
-
-## Auto-Notify on Completion
-
-For long-running background tasks, ask the agent to print a clear completion line so progress is visible in `process(action="log", ...)` output:
-
-```
-... your task here.
-
-When completely finished, send a brief status update in this session.
-```
-
-**Example:**
-
-```bash
-background_process(workdir="~/project", command="codex exec --full-auto 'Build a REST API for todos.
-
-When completely finished, print: Done: Built todos REST API with CRUD endpoints'")
-```
-
-This makes completion visible in the background process log.
-
----
-
-## Learnings (Jan 2026)
-
-- **Prefer non-interactive modes:** Coding agents are easiest to supervise when they print progress and exit cleanly.
-- **Git repo required:** Codex won't run outside a git directory. Use `mktemp -d && git init` for scratch work.
-- **exec is your friend:** `codex exec "prompt"` runs and exits cleanly - perfect for one-shots.
-- **submit vs write:** Use `submit` to send input + Enter, `write` for raw data without newline.
-- **Sass works:** Codex responds well to playful prompts. Asked it to write a haiku about being second fiddle to a space lobster, got: _"Second chair, I code / Space lobster sets the tempo / Keys glow, I follow"_ 🦞
+- Codex: `codex exec` runs one task and exits. `--sandbox read-only` for
+  reviews, `workspace-write` to let it edit; the model comes from
+  `~/.codex/config.toml` (or `-m`). It refuses to run outside a git
+  repository unless you add `--skip-git-repo-check`.
+- Claude Code: `claude -p` (print mode) runs one task and exits.
+  `--permission-mode plan` for read-only analysis, `acceptEdits` to let it
+  edit files; tools it is not allowed to use are refused, not prompted.
+  Do not add `--bare`: it skips the user's login.
+- Never use `--dangerously-bypass-approvals-and-sandbox` (Codex) or
+  `--dangerously-skip-permissions` / `bypassPermissions` (Claude) outside an
+  externally sandboxed, trusted checkout (see safety rule 1).
