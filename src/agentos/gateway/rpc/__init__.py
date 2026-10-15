@@ -52,6 +52,7 @@ __all__ = [
 # tests/test_gateway/test_rpc_extended.py. These methods MUST NOT register
 # handlers at boot — the release surface is contracted to reject them with
 # METHOD_NOT_FOUND.
+import agentos.gateway.rpc_acp  # noqa: E402, F401
 import agentos.gateway.rpc_agents  # noqa: E402, F401
 import agentos.gateway.rpc_approvals  # noqa: E402, F401
 import agentos.gateway.rpc_channels  # noqa: E402, F401
