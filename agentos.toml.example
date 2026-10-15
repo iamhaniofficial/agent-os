@@ -617,6 +617,12 @@ enabled = true
 # suggest_next = true
 # suggest_next_timeout_seconds = 15.0
 
+# [acp]
+# Coding harnesses (Claude Code, Codex, ...) spawned with
+# sessions_spawn(runtime="acp") work in the agent workspace by default. List
+# other directories (and their subtrees) a harness may use as its cwd:
+# allowed_cwds = ["~/Code/my-app"]
+
 [sandbox]
 # Per-command ephemeral sandbox + security grading.
 #

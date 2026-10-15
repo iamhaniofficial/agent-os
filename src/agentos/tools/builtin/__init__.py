@@ -8,6 +8,7 @@ import structlog
 
 _FATAL_MODULES = frozenset({"shell", "patch", "filesystem"})
 _NAMES = [
+    "acp_tools",
     "agents",
     "artifacts",
     "ask",

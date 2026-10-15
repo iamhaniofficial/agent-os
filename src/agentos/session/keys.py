@@ -149,6 +149,29 @@ def is_subagent_key(session_key: str) -> bool:
     return key.startswith("subagent:") or bool(re.match(r"^agent:[^:]+:subagent:[^:]+$", key))
 
 
+def build_acp_session_key(agent_id: str, run_id: str) -> str:
+    """Build the session key for an ACP coding-harness child.
+
+    ``agent_id`` is the *owner* AgentOS agent (the requester), not the
+    harness id; the harness lives in the session row ``origin``.
+    """
+    aid = normalize_agent_id(agent_id)
+    rid = _normalize_id(run_id)
+    return f"agent:{aid}:acp:{rid}"
+
+
+def is_acp_key(session_key: str | None) -> bool:
+    """Return True for ``agent:<id>:acp:<run>`` session keys."""
+    key = str(session_key or "").strip().lower()
+    return bool(re.match(r"^agent:[^:]+:acp:[^:]+$", key))
+
+
+def is_child_session_key(session_key: str | None) -> bool:
+    """Subagent or ACP child: a session some other session spawned."""
+    key = str(session_key or "")
+    return is_subagent_key(key) or is_acp_key(key)
+
+
 def allows_private_memory_prompt_injection(session_key: str | None) -> bool:
     """Return whether automatic private memory may be injected into a prompt."""
     key = canonicalize_session_key(session_key)
@@ -156,7 +179,7 @@ def allows_private_memory_prompt_injection(session_key: str | None) -> bool:
         return True
 
     key_lower = key.lower()
-    if is_subagent_key(key_lower) or key_lower.startswith("cron:"):
+    if is_child_session_key(key_lower) or key_lower.startswith("cron:"):
         return False
 
     chat_type = derive_chat_type(key_lower)

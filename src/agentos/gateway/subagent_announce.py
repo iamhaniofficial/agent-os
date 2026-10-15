@@ -106,6 +106,13 @@ async def announce_subagent_completion(
     parent = None
     parent_task_id = event.parent_task_id
     parent_wake_payloads: list[dict[str, Any]] | None = None
+    if session_manager is not None and await _is_superseded_acp_turn(
+        event, session_manager=session_manager
+    ):
+        # An ACP turn replaced by ``sessions_send(mode="steer")``: the
+        # replacement turn announces; this one stays silent and leaves the
+        # child running.
+        return
     if session_manager is not None:
         await _mark_child_terminal(event, session_manager=session_manager)
         if parent_task_id is None:
@@ -119,6 +126,9 @@ async def announce_subagent_completion(
             event.child_session_key,
             session_manager=session_manager,
         )
+        stats = await _read_child_stats(event.child_session_key, session_manager=session_manager)
+        if stats:
+            payload["stats"] = stats
         get_session = getattr(session_manager, "get_session", None)
         if callable(get_session):
             parent = await get_session(event.parent_session_key)
@@ -165,6 +175,26 @@ async def announce_subagent_completion(
         )
 
 
+async def _is_superseded_acp_turn(
+    event: SubagentCompletionEvent,
+    *,
+    session_manager: Any,
+) -> bool:
+    get_session = getattr(session_manager, "get_session", None)
+    if not callable(get_session):
+        return False
+    try:
+        child = await get_session(event.child_session_key)
+    except Exception:
+        return False
+    origin = _origin_from_session(child)
+    if origin.get("kind") != "acp":
+        return False
+    from agentos.acp.manager import is_superseded_task
+
+    return is_superseded_task(origin, event.task_id)
+
+
 async def _mark_child_terminal(
     event: SubagentCompletionEvent,
     *,
@@ -207,6 +237,9 @@ async def _announce_to_parent_channel(
     content = f"Subagent {payload['child_session_key']} completed with status {payload['status']}."
     if isinstance(result_text, str) and result_text:
         content = f"{content}\n{result_text[:500]}"
+    stats = payload.get("stats")
+    if isinstance(stats, str) and stats:
+        content = f"{content}\nStats: {stats}"
     metadata: dict[str, Any] = {}
     reply_to = thread_id or channel_id
     # Not a Slack-only rule: any channel whose thread id is not also a valid
@@ -293,6 +326,32 @@ async def _read_parent_task_id(
     origin = _origin_from_session(child)
     value = origin.get("parent_task_id")
     return value if isinstance(value, str) and value else None
+
+
+async def _read_child_stats(
+    child_session_key: str,
+    *,
+    session_manager: Any,
+) -> str | None:
+    """``Stats:`` text for ACP children (runtime, tokens, cost); else ``None``."""
+    get_session = getattr(session_manager, "get_session", None)
+    if not callable(get_session):
+        return None
+    try:
+        child = await get_session(child_session_key)
+    except Exception:
+        return None
+    return _stats_for_row(child)
+
+
+def _stats_for_row(row: Any) -> str | None:
+    if _origin_from_session(row).get("kind") != "acp":
+        return None
+    try:
+        from agentos.acp.projector import stats_for_session
+    except Exception:  # pragma: no cover - acp package always ships with the engine
+        return None
+    return stats_for_session(row)
 
 
 async def _read_child_result(
@@ -425,6 +484,9 @@ async def _build_terminal_group_payloads(
             ),
         }
         payload = _enrich_payload_from_task_row(payload, task_row)
+        stats = _stats_for_row(row)
+        if stats:
+            payload["stats"] = stats
         agent_id = _row_value(row, "agent_id")
         if "agent_id" not in payload and isinstance(agent_id, str) and agent_id:
             payload["agent_id"] = agent_id
@@ -485,7 +547,7 @@ async def _list_latest_task_rows_for_sessions(
 def _select_latest_task_row(rows: list[Any]) -> Any | None:
     if not rows:
         return None
-    subagent_rows = [row for row in rows if _row_value(row, "run_kind") == "subagent"]
+    subagent_rows = [row for row in rows if _row_value(row, "run_kind") in ("subagent", "acp")]
     terminal_subagent_rows = [
         row for row in subagent_rows if _task_status_value(_row_value(row, "status"))
     ]
@@ -742,6 +804,9 @@ def _format_parent_wake_message(
             lines.append(f"error_class={error_class}")
         if error_message:
             lines.append(f"error_message={error_message}")
+        stats = payload.get("stats")
+        if isinstance(stats, str) and stats:
+            lines.append(f"Stats: {stats}")
         lines.extend(
             [
                 "<untrusted_subagent_result>",

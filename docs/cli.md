@@ -495,6 +495,14 @@ clamped to 4,000-12,000 characters:
 agentos config set compaction.history_tool_result_max_chars 20000
 ```
 
+Coding harnesses (`sessions_spawn(runtime="acp")`) run in the agent workspace
+unless the spawn passes a `cwd`; that `cwd` must sit inside the workspace or
+under one of `acp.allowed_cwds` (managed worktrees are always allowed):
+
+```sh
+agentos config set acp.allowed_cwds '["~/Code/my-app"]'
+```
+
 The in-turn compaction summary is an auxiliary side task (`compaction`, the
 router's cheapest text tier unless `[auxiliary.tasks.compaction]` names a
 model) bounded by `compaction.summary_timeout_seconds` (default 45):
