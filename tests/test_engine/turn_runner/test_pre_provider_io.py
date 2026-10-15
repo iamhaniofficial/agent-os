@@ -202,6 +202,7 @@ def _recording_io(*, concurrent: bool, started: list[str], gate: asyncio.Event |
         project_knowledge=lambda: piece("project_knowledge", "KNOWLEDGE"),
         hydrate_tools=lambda: piece("hydrate_tools", ["t"]),
         router_context=lambda: piece("router_context", {"prev_assistant_text": "x"}),
+        memory_warm=lambda: piece("memory_warm", None),
     )
 
 
@@ -210,7 +211,13 @@ async def test_concurrent_mode_starts_every_read_before_any_is_awaited() -> None
     gate = asyncio.Event()
     io = _recording_io(concurrent=True, started=started, gate=gate)
     await asyncio.sleep(0)
-    assert sorted(started) == ["hydrate_tools", "project_knowledge", "recall", "router_context"]
+    assert sorted(started) == [
+        "hydrate_tools",
+        "memory_warm",
+        "project_knowledge",
+        "recall",
+        "router_context",
+    ]
     gate.set()
     extra = await io.extra_prompt_context({"Base": "b"})
     assert list(extra or {}) == ["Base", MEMORY_CONTEXT_KEY, PROJECT_KNOWLEDGE_KEY]
@@ -229,11 +236,8 @@ async def test_serial_mode_keeps_the_old_order_and_fetches_router_context_in_sta
     await io.hydrate_tools()
     assert started == ["recall", "project_knowledge", "hydrate_tools"]
     assert io.router_context() is None
-
-    async def warm() -> None:
-        return None
-
-    assert io.start_memory_warm(warm) is None
+    assert io.memory_warm() is None
+    assert "memory_warm" not in started
 
 
 async def test_extra_context_is_identical_in_both_modes() -> None:
@@ -632,3 +636,27 @@ async def test_memory_sync_scans_and_reads_files_off_the_event_loop(tmp_path: Pa
     await manager.warm_session("agent:main:s")
     assert scan_threads and all(t != loop_thread for t in scan_threads)
     assert store.indexed == {"MEMORY.md": "root\n"}
+
+
+def test_system_prompt_template_is_compiled_once_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jinja2
+
+    from agentos.identity.prompt import _make_env, assemble_system_prompt
+    from agentos.identity.types import AgentProfile
+
+    profile = AgentProfile(agent_id="main")
+    first = assemble_system_prompt(profile)
+    compiles: list[str] = []
+    real_compile = jinja2.Environment.compile
+
+    def _counting_compile(self, *args, **kwargs):
+        compiles.append("compile")
+        return real_compile(self, *args, **kwargs)
+
+    monkeypatch.setattr(jinja2.Environment, "compile", _counting_compile)
+    assert assemble_system_prompt(profile) == first
+    assert assemble_system_prompt(profile) == first
+    assert compiles == []
+    assert _make_env() is _make_env()

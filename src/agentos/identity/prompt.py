@@ -1,6 +1,7 @@
 """Jinja2-based system prompt assembly for agent identity."""
 
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
@@ -10,7 +11,12 @@ from .types import AgentProfile
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
+@lru_cache(maxsize=1)
 def _make_env() -> Environment:
+    # One environment per process: Jinja caches compiled templates per
+    # environment, and compiling system_prompt.j2 cost ~10 ms of event-loop
+    # time on every turn. ``auto_reload`` (the default) still picks up an
+    # edited template file.
     return Environment(
         loader=FileSystemLoader(str(_TEMPLATES_DIR)),
         undefined=StrictUndefined,

@@ -70,6 +70,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   workspace scan and file reads (session-start sync and the 2-second watcher)
   run on worker threads, so one session's setup no longer stalls another's
   stream.
+- The system prompt template is compiled once per process instead of on every
+  turn (~8 ms of event-loop time per turn); edits to the template file are
+  still picked up.
 - Anthropic prompt cache now covers the whole conversation, not only the
   system prompt: breakpoints on the system prompt, the last tool definition
   and a rolling one on the last block of the last user message (at most four),
