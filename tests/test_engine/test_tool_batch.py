@@ -28,6 +28,7 @@ from agentos.provider import DoneEvent as ProviderDone
 from agentos.provider import TextDeltaEvent as ProviderTextDelta
 from agentos.provider import ToolUseEndEvent as ProviderToolUseEnd
 from agentos.provider import ToolUseStartEvent as ProviderToolUseStart
+from agentos.tools.batch_slot import wait_outside_tool_slot
 from agentos.tools.registry import ToolRegistry, tool
 from agentos.tools.types import ToolSpec
 
@@ -627,6 +628,126 @@ async def test_approvals_are_awaited_concurrently_and_retried_as_granted() -> No
     assert "approval_denied" in outcomes[0].result.content
     assert outcomes[1].result.content == "ran t1"
     assert outcomes[1].call.arguments == {"approval_id": "ap-t1"}
+
+
+async def _until(predicate: Callable[[], bool], *, limit: int = 500) -> None:
+    """Yield to the loop until *predicate* holds (bounded, no wall clock)."""
+
+    for _ in range(limit):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never became true")
+
+
+async def test_inline_approval_waits_free_the_exclusive_slot() -> None:
+    """Calls that wait for approval inside the tool (exec on the Web UI) ask at once.
+
+    Both exclusive calls must have requested their approval before either is
+    answered, and a parallel call queued behind them runs meanwhile. Once
+    approved, the tool bodies still run one at a time, and the transcript
+    order is the order the model emitted the calls.
+    """
+
+    specs = {"exec": _spec("exec"), "read": _spec("read", concurrency="parallel")}
+    loop = asyncio.get_running_loop()
+    decisions: dict[str, asyncio.Future[bool]] = {}
+    tracker = _Tracker()
+
+    async def execute(call: ToolCall) -> ToolResult:
+        if call.tool_name == "read":
+            tracker.enter(call)
+            tracker.leave(call)
+            return _ok(call, "read")
+        decisions[call.tool_use_id] = loop.create_future()
+        approved = await wait_outside_tool_slot(decisions[call.tool_use_id])
+        tracker.enter(call)
+        for _ in range(5):  # give an overlapping body every chance to show up
+            await asyncio.sleep(0)
+        tracker.leave(call)
+        return _ok(call, f"ran {call.tool_use_id}" if approved else "denied")
+
+    executor = _executor(execute, specs)
+    results: list[ToolResultEvent] = []
+
+    async def _consume() -> None:
+        async for event in executor.run([_call(0, "exec"), _call(1, "exec"), _call(2, "read")]):
+            if isinstance(event, ToolResultEvent):
+                results.append(event)
+
+    consumer = asyncio.create_task(_consume())
+    await _until(lambda: len(decisions) == 2 and any(r.tool_use_id == "t2" for r in results))
+    assert not any(future.done() for future in decisions.values())
+
+    # Answer the second first, then the first; then both bodies race for the slot.
+    decisions["t1"].set_result(True)
+    decisions["t0"].set_result(True)
+    await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert not tracker.ever_together("t0", "t1")
+    assert [o.result.tool_use_id for o in executor.outcomes] == ["t0", "t1", "t2"]
+    assert [o.result.content for o in executor.outcomes] == ["ran t0", "ran t1", "read"]
+    assert sorted(r.tool_use_id for r in results) == ["t0", "t1", "t2"]
+
+
+async def test_inline_approval_wait_keeps_key_lock_order_after_readmission() -> None:
+    """A keyed call that waits outside its slot re-takes its key before running."""
+
+    specs = {"k": _spec("k", concurrency="keyed")}
+    loop = asyncio.get_running_loop()
+    gate_open: asyncio.Future[bool] = loop.create_future()
+    tracker = _Tracker()
+
+    async def execute(call: ToolCall) -> ToolResult:
+        if call.tool_use_id == "t0":
+            await wait_outside_tool_slot(gate_open)
+        tracker.enter(call)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        tracker.leave(call)
+        return _ok(call, call.tool_use_id)
+
+    executor = _executor(execute, specs)
+    consumer = asyncio.create_task(_drain(executor, [_call(0, "k"), _call(1, "k")]))
+    await _until(lambda: "t1" in {c for seen in tracker.overlaps for c in seen})
+    gate_open.set_result(True)
+    await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert not tracker.ever_together("t0", "t1")
+    assert [o.result.content for o in executor.outcomes] == ["t0", "t1"]
+
+
+async def test_batch_deadline_while_waiting_outside_the_slot_pairs_every_call() -> None:
+    specs = {"exec": _spec("exec")}
+    clock = _FakeClock()
+    loop = asyncio.get_running_loop()
+    waiting: list[str] = []
+    never: asyncio.Future[bool] = loop.create_future()
+
+    async def execute(call: ToolCall) -> ToolResult:
+        waiting.append(call.tool_use_id)
+        await wait_outside_tool_slot(asyncio.shield(never))
+        return _ok(call)
+
+    async def _cross_deadline() -> None:
+        await _until(lambda: len(waiting) == 2)
+        clock.now += 10.0
+
+    executor = _clocked_executor(execute, specs, clock)
+    crosser = asyncio.create_task(_cross_deadline())
+    events = await asyncio.wait_for(_drain(executor, [_call(0, "exec"), _call(1, "exec")]), 5.0)
+    await crosser
+
+    assert sorted(_result_ids(events)) == ["t0", "t1"]
+    assert all("timed out" in o.result.content for o in executor.outcomes)
+    never.cancel()
+
+
+async def test_wait_outside_tool_slot_is_a_plain_await_outside_a_batch() -> None:
+    async def _value() -> int:
+        return 7
+
+    assert await wait_outside_tool_slot(_value()) == 7
 
 
 # ---------------------------------------------------------------------------
