@@ -2101,6 +2101,43 @@ class SubagentsGatewayConfig(BaseModel):
     """When enabled, subagent bootstrap prompts keep only AGENTS.md and TOOLS.md."""
 
 
+class AcpAgentOverride(BaseModel):
+    """Per-harness launch override (``[acp.agents.<id>]``)."""
+
+    command: str | None = None
+    """Executable; when set, replaces the registry argv (with ``args``)."""
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    """Extra environment for this harness only (merged last)."""
+
+
+class AcpConfig(BaseModel):
+    """ACP coding-harness consumer (``[acp]``). AgentOS drives Claude Code,
+    Codex, Gemini CLI, Cursor, ... as ACP agents over stdio."""
+
+    enabled: bool = True
+    default_agent: str = "claude"
+    allowed_agents: list[str] = Field(default_factory=lambda: ["*"])
+    """Harness ids ``sessions_spawn(runtime="acp")`` may launch; ``*`` = any."""
+    permission_mode: Literal["ask", "approve-all", "approve-reads", "deny-all"] = "ask"
+    """``ask`` routes harness permission prompts to the operator approval
+    queue; the other values answer them without a human."""
+    non_interactive_permissions: Literal["fail", "deny"] = "fail"
+    """What ``ask`` does when no operator surface can answer (unattended run)."""
+    approval_timeout_s: int = Field(default=900, ge=1)
+    turn_timeout_s: int = Field(default=0, ge=0)
+    """0 = no wall-clock limit on a harness turn."""
+    max_concurrent: int = Field(default=8, ge=1, le=64)
+    state_dir: str | None = None
+    """Override for ``<state>/acp`` (session records, leases, isolated homes)."""
+    isolate_codex_home: bool = True
+    """Give the Codex harness its own ``CODEX_HOME`` with a generated trust entry."""
+    install_missing_adapters: bool = True
+    """Allow ``npx -y`` / ``uvx`` adapter downloads on first use."""
+    stream_delivery: Literal["final_only", "live"] = "final_only"
+    agents: dict[str, AcpAgentOverride] = Field(default_factory=dict)
+
+
 class ObservabilityConfig(BaseSettings):
     """Observability, Prometheus metrics, OTLP trace export, and log retention configuration."""
 
@@ -2441,6 +2478,7 @@ class GatewayConfig(BaseSettings):
     agents: list[AgentEntryConfig] = Field(default_factory=list)
     agents_defaults: AgentDefaults = Field(default_factory=AgentDefaults)
     subagents: SubagentsGatewayConfig = Field(default_factory=SubagentsGatewayConfig)
+    acp: AcpConfig = Field(default_factory=AcpConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
     budgets: BudgetsConfig = Field(default_factory=BudgetsConfig)
 
