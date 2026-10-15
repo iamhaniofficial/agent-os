@@ -256,6 +256,7 @@ class AgentOSAcpClient:
         self.turn_failure: BaseException | None = None
         self.on_turn_failure: Callable[[BaseException], None] | None = None
         self.permission_requests = 0
+        self.available_commands: list[str] = []
         self._sink: Callable[[AcpEvent], None] | None = None
 
     # -- turn wiring ---------------------------------------------------
@@ -294,6 +295,12 @@ class AgentOSAcpClient:
             self.current_mode_id = str(update.current_mode_id)
         elif tag == "config_option_update":
             self.config_options = [_dump(o) for o in (update.config_options or [])]
+        elif tag == "available_commands_update":
+            # Session metadata (Claude sends several KB of it at start-up and
+            # it races the first prompt): keep the names, never stream it.
+            cmds = getattr(update, "available_commands", None) or []
+            self.available_commands = [str(getattr(c, "name", "")) for c in cmds]
+            return
         elif tag == "usage_update":
             cost = getattr(update, "cost", None)
             if cost is not None and str(getattr(cost, "currency", "") or "").upper() in (

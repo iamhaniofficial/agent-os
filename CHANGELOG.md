@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- ACP runtime (`agentos.acp.runtime`): drives ACP harnesses over stdio in their own
+  process group with a lease file and a redacted stderr log, normalizes `session/update`
+  into `AcpEvent`s, resumes via `session/load`, enforces turn timeouts and the
+  cancel -> SIGTERM -> SIGKILL ladder, isolates `CODEX_HOME`, and reaps harnesses left
+  by an earlier gateway.
+
 ## [2026.10.13] - 2026-10-13
 
 ### Added
