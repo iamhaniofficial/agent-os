@@ -255,9 +255,12 @@ def test_tier_thinking_source_tells_shipped_levels_from_operator_levels() -> Non
     ctx = SimpleNamespace(metadata={})
     _record_thinking_metadata(ctx, openai, openai.tiers["c1"], tier_name="c1")
     assert ctx.metadata["thinking_level_source"] == "tier_config"
-    assert _runner()._resolve_turn_thinking(
-        _turn("c1", thinking_level_source=ctx.metadata["thinking_level_source"])
-    ) == ThinkingLevel.HIGH
+    assert (
+        _runner()._resolve_turn_thinking(
+            _turn("c1", thinking_level_source=ctx.metadata["thinking_level_source"])
+        )
+        == ThinkingLevel.HIGH
+    )
 
     # The shipped level on the same profile is still a default.
     shipped = AgentOSRouterConfig(tier_profile="openai")

@@ -15,12 +15,19 @@ so its preflight check is a no-op.
 Concurrency rules:
 
 * a job starts only after the turn that scheduled it has ended
-  (:meth:`ProactiveCompactionScheduler.turn_ended`);
+  (:meth:`ProactiveCompactionScheduler.turn_ended`) and the session then
+  stayed idle for ``[compaction] proactive_idle_seconds``: a user who is
+  still chatting would cancel a summarizer call that is already billed. A
+  job cancelled while summarizing doubles that delay for the session (up to
+  :data:`MAX_PROACTIVE_IDLE_SECONDS`) until a job runs to completion. A
+  process that exits inside the delay (a one-shot CLI run) cancels the job
+  before it calls any model;
 * every turn bumps the session's generation before it loads history
   (:meth:`ProactiveCompactionScheduler.before_history_load`), under the same
   per-session gate the job holds while it persists. A job whose generation
   is stale persists nothing -- the next turn end checks again -- so a turn
-  never runs on a history that is rewritten underneath it;
+  never runs on a history that is rewritten underneath it. A job that has
+  already persisted is never cancelled (only its notifications remain);
 * the job persists while holding the runtime's session lock, the lock
   transcript writers take, so no row is appended in the middle of the
   rewrite;
@@ -35,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import inspect
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -52,7 +60,7 @@ from agentos.engine.compaction_service import (
 from agentos.engine.estimate_calibration import EstimateCalibration
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Sequence
 
     from agentos.provider.types import Message
 
@@ -60,6 +68,13 @@ log = structlog.get_logger(__name__)
 
 PROACTIVE_PHASE = "proactive_background"
 DEFAULT_PROACTIVE_RATIO = 0.70
+DEFAULT_PROACTIVE_IDLE_SECONDS = 20.0
+MAX_PROACTIVE_IDLE_SECONDS = 300.0
+
+# Job phases, as seen by ``before_history_load``.
+_WAITING = "waiting"  # idle delay: cancelling costs nothing
+_SUMMARIZING = "summarizing"  # a summarizer call may be in flight (billed)
+_PERSISTED = "persisted"  # passed the generation check under the gate
 
 
 @dataclass
@@ -78,6 +93,7 @@ class _SessionState:
     agent_id: str = "main"
     pending: _Pending | None = None
     task: asyncio.Task[None] | None = None
+    phase: str = _WAITING
     gate: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -108,6 +124,19 @@ def proactive_ratio(config: Any) -> float:
     if ratio <= 0.0 or ratio > 1.0:
         return DEFAULT_PROACTIVE_RATIO
     return ratio
+
+
+def proactive_idle_seconds(config: Any) -> float:
+    raw = getattr(
+        _compaction_settings(config), "proactive_idle_seconds", DEFAULT_PROACTIVE_IDLE_SECONDS
+    )
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PROACTIVE_IDLE_SECONDS
+    if seconds < 0.0 or seconds != seconds:  # negative or NaN
+        return DEFAULT_PROACTIVE_IDLE_SECONDS
+    return min(seconds, MAX_PROACTIVE_IDLE_SECONDS)
 
 
 def calibration_enabled(config: Any) -> bool:
@@ -181,6 +210,11 @@ class ProactiveCompactionScheduler:
         self._runner = runner
         self._sessions: dict[str, _SessionState] = {}
         self._calibration = EstimateCalibration()
+        # Per session: how many jobs in a row were cancelled after their
+        # summarizer call started. Each one doubles the idle delay.
+        self._backoff: dict[str, int] = {}
+        # Seam for tests (fake clock); the job's idle wait.
+        self._sleep: Callable[[float], Any] = asyncio.sleep
 
     # -- turn lifecycle --------------------------------------------------
 
@@ -215,15 +249,33 @@ class ProactiveCompactionScheduler:
             state.agent_id = agent_id
             state.pending = None
             task = state.task
-        if task is not None and not task.done():
-            # Still summarizing: its result could not be persisted any more.
-            task.cancel()
-            log.info(
-                "compaction.proactive",
-                session_key=session_key,
-                action="skipped",
-                reason="turn_started",
-            )
+            phase = state.phase
+        if task is None or task.done() or phase == _PERSISTED:
+            # Nothing running, or the job already persisted: it only has its
+            # notifications and hooks left, which must not be cut short.
+            return
+        # Still waiting or summarizing: its result could not be persisted any
+        # more. A cancelled summarizer call was billed, so back off.
+        task.cancel()
+        billed = phase == _SUMMARIZING
+        if billed:
+            self._backoff[session_key] = self._backoff.get(session_key, 0) + 1
+        log.info(
+            "compaction.proactive",
+            session_key=session_key,
+            action="skipped",
+            reason="turn_started",
+            phase=phase,
+            next_idle_seconds=self._idle_delay(session_key),
+        )
+
+    def _idle_delay(self, session_key: str) -> float:
+        """The idle wait before a job for *session_key* calls the summarizer."""
+        base = proactive_idle_seconds(getattr(self._runner, "_config", None))
+        misses = self._backoff.get(session_key, 0)
+        if misses <= 0 or base <= 0.0:
+            return base
+        return min(MAX_PROACTIVE_IDLE_SECONDS, base * float(1 << min(misses, 16)))
 
     def after_turn(self, *, session_key: str, agent_id: str, succeeded: bool) -> None:
         """The turn's transcript is persisted: schedule a job when it is due.
@@ -251,6 +303,8 @@ class ProactiveCompactionScheduler:
             return
         ratio = proactive_ratio(getattr(self._runner, "_config", None))
         if limit <= 0 or estimated < ratio * limit:
+            # Back under the ratio (an in-turn compaction ran): start afresh.
+            self._backoff.pop(session_key, None)
             return
         state.pending = _Pending(
             agent=agent,
@@ -282,8 +336,9 @@ class ProactiveCompactionScheduler:
             return
         # A fresh context: the job must not inherit the finished turn's
         # session-lock ownership markers (it takes the lock itself).
+        state.phase = _WAITING
         task = asyncio.get_running_loop().create_task(
-            self._run_job(session_key, state, pending),
+            self._run_job(session_key, state, pending, self._idle_delay(session_key)),
             context=contextvars.Context(),
         )
         state.task = task
@@ -307,9 +362,17 @@ class ProactiveCompactionScheduler:
 
     # -- the job ---------------------------------------------------------
 
-    async def _run_job(self, session_key: str, state: _SessionState, pending: _Pending) -> None:
+    async def _run_job(
+        self, session_key: str, state: _SessionState, pending: _Pending, delay: float
+    ) -> None:
         try:
-            await self._compact(session_key, state, pending)
+            if delay > 0.0:
+                # Idle wait: a turn that starts meanwhile cancels the job before
+                # any model call (and so does a process that exits).
+                await self._sleep(delay)
+            state.phase = _SUMMARIZING
+            if await self._compact(session_key, state, pending):
+                self._backoff.pop(session_key, None)
         except asyncio.CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001 - background job must not crash the loop
@@ -337,26 +400,27 @@ class ProactiveCompactionScheduler:
             **fields,
         )
 
-    async def _compact(self, session_key: str, state: _SessionState, pending: _Pending) -> None:
+    async def _compact(self, session_key: str, state: _SessionState, pending: _Pending) -> bool:
+        """Run the job; False when a turn won the race after the summarizer ran."""
         runner = self._runner
         manager = getattr(runner, "_session_manager", None)
         if manager is None:
-            return
+            return True
         agent = pending.agent
         view = _turn_view(agent)
         if view is None:
             self._skip(session_key, "no_turn_view")
-            return
+            return True
         transcript = await manager.get_transcript(session_key)
         tail = _kept_tail(transcript, getattr(agent, "_transcript_input_entry_id", None))
         if tail is None:
             self._skip(session_key, "no_structured_turn_record")
-            return
+            return True
         tail_index, record, current = tail
         prefix = view.messages[: view.turn_input_index]
         if len(view.messages) - view.turn_input_index != len(current):
             self._skip(session_key, "history_mismatch")
-            return
+            return True
         messages = [*prefix, *current]
         message_tokens = _scaled(agent._message_tokens, view.scale)
         estimated = int(view.overhead_tokens * view.scale) + message_tokens(messages)
@@ -379,8 +443,8 @@ class ProactiveCompactionScheduler:
         )
         if not result.compacted:
             self._skip(session_key, result.reason or result.status)
-            return
-        await self._persist(
+            return True
+        return await self._persist(
             session_key,
             state,
             pending,
@@ -402,7 +466,7 @@ class ProactiveCompactionScheduler:
         tail_index: int,
         record: Any,
         current: list[Message],
-    ) -> None:
+    ) -> bool:
         from agentos.engine.cache_break_monitor import notify_compaction
         from agentos.engine.hooks import CompactionState, fire_after_compact, fire_before_compact
         from agentos.engine.transcript import (
@@ -450,8 +514,13 @@ class ProactiveCompactionScheduler:
         hooks = tuple(getattr(runner, "_compaction_hooks", ()) or ())
         async with runner.get_session_lock(session_key), state.gate:
             if state.generation != pending.generation:
+                # A turn loaded history after the summarizer ran: billed and lost.
+                self._backoff[session_key] = self._backoff.get(session_key, 0) + 1
                 self._skip(session_key, "turn_started")
-                return
+                return False
+            # Past this point the job persists (or fails to) under the gate;
+            # a turn that starts afterwards must not cancel what is left.
+            state.phase = _PERSISTED
             await fire_before_compact(hooks, hook_state)
             try:
                 # Durable pre-image first; a failing checkpoint raises and
@@ -467,8 +536,6 @@ class ProactiveCompactionScheduler:
                 if "snapshot" in inspect.signature(persist).parameters:
                     kwargs["snapshot"] = snapshot
                 persisted = await persist(session_key, result.summary, kept_entries, **kwargs)
-                if persisted is None and "snapshot" in kwargs:
-                    raise RuntimeError("transcript changed since the job read it")
             except Exception as exc:  # noqa: BLE001 - reported, transcript untouched
                 log.warning(
                     "compaction.proactive",
@@ -490,7 +557,16 @@ class ProactiveCompactionScheduler:
                 await fire_after_compact(
                     hooks, hook_state, {"status": "failed", "reason": "persist_failed"}
                 )
-                return
+                return True
+            if persisted is None and "snapshot" in kwargs:
+                # The session was reset, truncated or rotated while the job
+                # ran: nothing was rewritten and nothing failed. The next turn
+                # end checks again.
+                self._skip(session_key, "transcript_changed")
+                await fire_after_compact(
+                    hooks, hook_state, {"status": "skipped", "reason": "transcript_changed"}
+                )
+                return True
         sync_manager = getattr(pending.agent, "_memory_sync_manager", None)
         if sync_manager is not None:
             sync_manager.mark_dirty()
@@ -520,6 +596,7 @@ class ProactiveCompactionScheduler:
             kept_rows=len(kept_entries),
             summary_source=result.summary_source,
         )
+        return True
 
 
 def _kept_tail(

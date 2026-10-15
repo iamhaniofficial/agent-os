@@ -34,12 +34,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   keep a cheap tier at a level equal to the shipped one, since config files
   store the whole tier table).
 - Proactive compaction. When a turn ends with the session's history at
-  `[compaction] proactive_ratio` (default 0.70) of the compaction trigger, the
-  session is compacted in the background between turns with the same
+  `[compaction] proactive_ratio` (default 0.70) of the compaction trigger and
+  the session then stays idle for `[compaction] proactive_idle_seconds`
+  (default 20), the session is compacted in the background with the same
   summarizer and persisted like an in-turn compaction (checkpoint, summary,
   `reset` record, notifications with phase `proactive_background`), so the
   next turn no longer waits for the summarizer. A turn that starts first
-  makes the job persist nothing; subagent and cron sessions are skipped; the
+  makes the job persist nothing (and when it cancels a summary already in
+  progress, the idle wait doubles for that session, up to 300 s, until a job
+  completes); a job that has persisted is never cancelled, and one whose
+  session was reset or truncated meanwhile is skipped without a failure
+  notice; subagent and cron sessions are skipped; the
   in-turn check stays as the safety net. `[compaction] proactive = false`
   turns it off.
 - Suggested next prompt. When a turn finishes, the chat input in the web

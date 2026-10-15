@@ -992,14 +992,21 @@ that is tighter.
 summary_timeout_seconds = 45.0   # bound on the summary call (auxiliary task "compaction")
 proactive = true                 # compact between turns, in the background
 proactive_ratio = 0.70           # ...once the history reaches 70% of the trigger
+proactive_idle_seconds = 20      # ...after the session has been idle this long
 estimate_calibration = true      # scale the size estimate by what providers report
 ```
 
 - **Proactive compaction.** After a turn ends with the history at
   `proactive_ratio` of the trigger or more, AgentOS compacts the session in the
-  background, so the next turn does not wait for the summarizer. A turn that
-  starts first wins: the background result is dropped and the check runs again
-  when that turn ends. Subagent and cron sessions are never compacted this
+  background, so the next turn does not wait for the summarizer. The job waits
+  until the session has been idle for `proactive_idle_seconds` (default 20,
+  0 = at once) before it calls the summarizer, so a quick follow-up does not
+  pay for a summary it throws away. A turn that starts first wins: the
+  background result is dropped and the check runs again when that turn ends.
+  When a turn cancels a summary already in progress, the wait doubles for that
+  session (up to 300 s) until a job completes. A job that has already
+  persisted is never cancelled; one whose session was reset or truncated
+  meanwhile is skipped quietly. Subagent and cron sessions are never compacted this
   way. The in-turn check stays as the safety net. `proactive = false` turns
   the background job off.
 - **Estimate calibration.** The request size is estimated as characters / 4,

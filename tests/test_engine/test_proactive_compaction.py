@@ -176,6 +176,8 @@ def _runner(
     **compaction: Any,
 ) -> TurnRunner:
     _AUX_PROVIDER["provider"] = provider
+    # Start jobs at once unless a test is about the idle wait.
+    compaction.setdefault("proactive_idle_seconds", 0)
     return TurnRunner(
         provider_selector=_Selector(provider),
         tool_registry=ToolRegistry(),
@@ -375,6 +377,244 @@ async def test_stale_generation_skips_the_persist(
 
     assert len(provider.summarizer_requests) == 1
     assert await manager.get_summaries(KEY) == []
+
+
+async def _until(predicate: Any) -> None:
+    for _ in range(200):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never became true")
+
+
+class _FakeSleep:
+    """The scheduler's idle wait, on a fake clock the test releases."""
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.entered.set()
+        await self.release.wait()
+
+
+def _notices(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    from agentos.engine import cache_break_monitor
+
+    seen: list[dict[str, Any]] = []
+    original = cache_break_monitor.notify_compaction
+
+    def _record(session_key: str, **fields: Any) -> Any:
+        seen.append({"session_key": session_key, **fields})
+        return original(session_key, **fields)
+
+    monkeypatch.setattr(cache_break_monitor, "notify_compaction", _record)
+    return seen
+
+
+async def test_job_waits_for_the_idle_delay_and_a_turn_inside_it_costs_nothing(
+    tmp_path: Path, storages: list[SessionStorage]
+) -> None:
+    manager = await _manager(tmp_path, storages)
+    provider = _Provider()
+    runner = _runner(provider, manager, tmp_path, proactive_idle_seconds=20)
+    scheduler = _scheduler(runner)
+    sleep = _FakeSleep()
+    scheduler._sleep = sleep
+    await _seed(manager, KEY, rounds=2)
+
+    await _turn(runner, manager, KEY, "deploy status?", tmp_path)
+    await asyncio.wait_for(sleep.entered.wait(), timeout=2)
+    assert sleep.delays == [20.0]
+    job = scheduler._sessions[KEY].task
+    assert job is not None and not job.done()
+    # Still idle-waiting: no summarizer call yet.
+    assert provider.summarizer_requests == []
+
+    # The user answers inside the wait: the job goes away before any model call.
+    await _turn(runner, manager, KEY, "and the logs?", tmp_path)
+    await asyncio.wait_for(asyncio.gather(job, return_exceptions=True), timeout=2)
+    assert job.done()
+    assert provider.summarizer_requests == []
+    # A free cancel does not back off.
+    assert scheduler._idle_delay(KEY) == 20.0
+    # The second turn scheduled a fresh job, again waiting.
+    follow_up = scheduler._sessions[KEY].task
+    assert follow_up is not job and follow_up is not None and not follow_up.done()
+    await _until(lambda: len(sleep.delays) == 2)
+    assert sleep.delays == [20.0, 20.0]
+    follow_up.cancel()
+    await asyncio.gather(follow_up, return_exceptions=True)
+
+
+async def test_a_cancelled_summary_backs_off_and_a_completed_job_resets_it(
+    tmp_path: Path, storages: list[SessionStorage]
+) -> None:
+    manager = await _manager(tmp_path, storages)
+    provider = _Provider()
+    provider.summary_gate = asyncio.Event()
+    runner = _runner(provider, manager, tmp_path, proactive_idle_seconds=20)
+    scheduler = _scheduler(runner)
+    sleep = _FakeSleep()
+    sleep.release.set()  # the idle wait passes at once on the fake clock
+    scheduler._sleep = sleep
+    await _seed(manager, KEY, rounds=2)
+
+    await _turn(runner, manager, KEY, "deploy status?", tmp_path)
+    await asyncio.wait_for(provider.summary_started.wait(), timeout=2)
+    job = scheduler._sessions[KEY].task
+    assert job is not None
+
+    # A turn cancels the billed summary: the next wait doubles.
+    await _turn(runner, manager, KEY, "and the logs?", tmp_path)
+    await asyncio.wait_for(asyncio.gather(job, return_exceptions=True), timeout=2)
+    assert job.done()
+    await _until(lambda: len(sleep.delays) == 2)
+    assert sleep.delays == [20.0, 40.0]
+    assert scheduler._idle_delay(KEY) == 40.0
+
+    # The second job runs to completion: the delay is back to the base.
+    provider.summary_gate.set()
+    await scheduler.wait_idle(KEY)
+    assert len(await manager.get_summaries(KEY)) == 1
+    assert scheduler._idle_delay(KEY) == 20.0
+
+    # Repeated misses cap at 300 s.
+    scheduler._backoff[KEY] = 10
+    assert scheduler._idle_delay(KEY) == 300.0
+
+
+async def test_a_job_that_has_persisted_is_not_cancelled_by_the_next_turn(
+    tmp_path: Path, storages: list[SessionStorage], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notices = _notices(monkeypatch)
+    manager = await _manager(tmp_path, storages)
+    provider = _Provider()
+    runner = _runner(provider, manager, tmp_path)
+    hook_entered = asyncio.Event()
+    hook_release = asyncio.Event()
+    outcomes: list[Any] = []
+
+    class _SlowAfterHook:
+        name = "slow_after"
+
+        async def before_compact(self, _state: Any) -> None:
+            return None
+
+        async def after_compact(self, _state: Any, outcome: Any) -> None:
+            hook_entered.set()
+            await hook_release.wait()
+            outcomes.append(outcome)
+
+    runner._compaction_hooks = (_SlowAfterHook(),)
+    await _seed(manager, KEY, rounds=2)
+
+    await _turn(runner, manager, KEY, "deploy status?", tmp_path)
+    await asyncio.wait_for(hook_entered.wait(), timeout=2)
+    job = _scheduler(runner)._sessions[KEY].task
+    assert job is not None and not job.done()
+
+    # The next turn starts while the persisted job runs its after-hooks.
+    second = await _turn(runner, manager, KEY, "and the logs?", tmp_path)
+    assert any(isinstance(event, DoneEvent) for event in second)
+    assert str(provider.turn_requests[1][0].content).startswith("[Context summary]")
+    assert not job.done()
+
+    hook_release.set()
+    await asyncio.wait_for(asyncio.gather(job, return_exceptions=True), timeout=2)
+    assert outcomes and outcomes[0]["status"] == "completed"
+    assert [n["status"] for n in notices if n.get("phase") == "proactive_background"] == [
+        "completed"
+    ]
+
+
+async def test_a_session_reset_during_the_job_is_skipped_quietly(
+    tmp_path: Path, storages: list[SessionStorage], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notices = _notices(monkeypatch)
+    manager = await _manager(tmp_path, storages)
+    provider = _Provider()
+    provider.summary_gate = asyncio.Event()
+    runner = _runner(provider, manager, tmp_path)
+    await _seed(manager, KEY, rounds=2)
+
+    await _turn(runner, manager, KEY, "deploy status?", tmp_path)
+    await asyncio.wait_for(provider.summary_started.wait(), timeout=2)
+    job = _scheduler(runner)._sessions[KEY].task
+    assert job is not None
+
+    # The operator resets the session while the summarizer runs.
+    await manager.rotate_session_id_archive_only(KEY)
+    provider.summary_gate.set()
+    await asyncio.wait_for(asyncio.gather(job, return_exceptions=True), timeout=2)
+
+    assert await manager.get_summaries(KEY) == []
+    proactive = [n for n in notices if n.get("phase") == "proactive_background"]
+    assert proactive == [], "a stale snapshot must not surface a failed compaction"
+
+
+async def test_gateway_write_lock_path_compacts_between_turns(
+    tmp_path: Path, storages: list[SessionStorage]
+) -> None:
+    """Through TaskRuntime: get_session_lock is the short write lock there."""
+    from agentos.gateway.routing import RouteEnvelope, SourceKind
+    from agentos.gateway.task_runtime import TaskRuntime
+    from tests.test_gateway.test_task_runtime_lock_pinned import _make_storage
+
+    manager = await _manager(tmp_path, storages)
+    provider = _Provider()
+    runner = _runner(provider, manager, tmp_path)
+    turns: list[list[Any]] = []
+
+    async def _handler(run: Any) -> None:
+        turns.append(
+            [
+                event
+                async for event in runner.run(
+                    run.message,
+                    run.envelope.session_key,
+                    tool_context=ToolContext(
+                        caller_kind=CallerKind.WEB, workspace_dir=str(tmp_path)
+                    ),
+                    history_has_persisted_user=True,
+                    no_memory_capture=True,
+                )
+            ]
+        )
+
+    rt = TaskRuntime(storage=_make_storage(), turn_handler=_handler, max_concurrency=2)
+    runner.set_session_lock_provider(rt._get_session_lock_for_turn)
+    held_during_persist: list[bool] = []
+    original_persist = manager.persist_compaction_result
+
+    async def _persist(session_key: str, *args: Any, **kwargs: Any) -> Any:
+        held_during_persist.append(rt._get_session_lock_for_turn(session_key).locked())
+        return await original_persist(session_key, *args, **kwargs)
+
+    manager.persist_compaction_result = _persist  # type: ignore[method-assign]
+    envelope = RouteEnvelope(
+        source_kind=SourceKind.WEB,
+        source_name="test",
+        agent_id="main",
+        session_key=KEY,
+        input_provenance={"kind": "test"},
+    )
+    await _seed(manager, KEY, rounds=2)
+
+    for text in ("deploy status?", "and the logs?"):
+        await manager.append_message(KEY, "user", text)
+        handle = await rt.enqueue(envelope, text)
+        await rt.wait(handle.task_id, timeout=5.0)
+        await _scheduler(runner).wait_idle(KEY)
+
+    assert all(any(isinstance(e, DoneEvent) for e in events) for events in turns)
+    assert len(provider.summarizer_requests) == 1
+    assert held_during_persist == [True]
+    assert len(await manager.get_summaries(KEY)) == 1
+    assert str(provider.turn_requests[1][0].content) == f"[Context summary]\n{SUMMARY}"
 
 
 # ---------------------------------------------------------------------------

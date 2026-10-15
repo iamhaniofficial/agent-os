@@ -578,6 +578,11 @@ enabled = true
 # for the summarizer.
 # proactive = true
 # proactive_ratio = 0.70
+# Seconds the session must stay idle after the turn before the background
+# summarizer starts (a turn that starts first cancels it for free). A job
+# cancelled mid-summary doubles the wait for that session, up to 300 s, until
+# one completes. 0 = start at once.
+# proactive_idle_seconds = 20
 # Scale the request-size estimate by the input tokens providers report
 # (per provider/model, clamped 0.5-1.25); false = raw chars/4 estimate.
 # estimate_calibration = true

@@ -787,9 +787,7 @@ def _shipped_tier_thinking_level(router_cfg: object, tier_name: object) -> str |
     return _normalize_thinking_level(tier.get("thinking_level", tier.get("thinking")))
 
 
-def _tier_thinking_source(
-    router_cfg: object, tier_name: object, tier_cfg: dict, level: str
-) -> str:
+def _tier_thinking_source(router_cfg: object, tier_name: object, tier_cfg: dict, level: str) -> str:
     """Tag a tier-derived thinking level as shipped or operator-configured.
 
     ``tier_default``: the level is what the shipped tier table says (or the
