@@ -37,10 +37,10 @@ import os
 import shutil
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import structlog
 
@@ -67,12 +67,42 @@ from agentos.acp.types import (
 if TYPE_CHECKING:
     from acp.client.connection import ClientSideConnection
 
-    from agentos.gateway.config import AcpConfig
-
 _log = structlog.get_logger("agentos.acp.runtime")
 
 _LAUNCHERS = frozenset({"npx", "uvx", "bunx", "pnpx", "pnpm", "yarn"})
 _STOP_REASONS = frozenset({"end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"})
+
+
+class AcpAgentOverrideLike(Protocol):
+    @property
+    def command(self) -> str | None: ...
+    @property
+    def args(self) -> list[str]: ...
+    @property
+    def env(self) -> dict[str, str]: ...
+
+
+class AcpConfigLike(Protocol):
+    """The slice of ``agentos.gateway.config.AcpConfig`` the runtime reads.
+
+    Typed structurally so ``agentos.acp`` does not import ``agentos.gateway``
+    (architecture import contract); pass ``config.acp``.
+    """
+
+    @property
+    def allowed_agents(self) -> list[str]: ...
+    @property
+    def turn_timeout_s(self) -> int: ...
+    @property
+    def max_concurrent(self) -> int: ...
+    @property
+    def state_dir(self) -> str | None: ...
+    @property
+    def isolate_codex_home(self) -> bool: ...
+    @property
+    def install_missing_adapters(self) -> bool: ...
+    @property
+    def agents(self) -> Mapping[str, AcpAgentOverrideLike]: ...
 
 
 # --------------------------------------------------------------------------
@@ -269,7 +299,7 @@ class AcpRuntimeImpl:
 
     def __init__(
         self,
-        config: AcpConfig | None = None,
+        config: AcpConfigLike,
         *,
         permission_bridge: PermissionBridge | None = None,
         elicitation_bridge: ElicitationBridge | None = None,
@@ -284,10 +314,6 @@ class AcpRuntimeImpl:
         base_env: dict[str, str] | None = None,
         user_codex_home: Path | None = None,
     ) -> None:
-        if config is None:
-            from agentos.gateway.config import AcpConfig as _AcpConfig
-
-            config = _AcpConfig()
         self.config = config
         self.permission_bridge = permission_bridge
         self.elicitation_bridge = elicitation_bridge
