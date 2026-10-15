@@ -8,6 +8,7 @@ the agent calls before every provider request.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
@@ -18,6 +19,8 @@ from agentos.engine.compaction_service import (
     SUMMARY_ACK,
     CompactionService,
     ends_mid_tool_round,
+    fallback_max_chars,
+    fallback_summary,
     is_ephemeral_session,
     should_compact,
     summarize_messages,
@@ -375,7 +378,7 @@ async def test_provider_failure_falls_back_to_a_deterministic_digest() -> None:
 
 
 @pytest.mark.asyncio
-async def test_summarizer_exception_is_a_failed_compaction_not_a_crash() -> None:
+async def test_summarizer_exception_falls_back_and_still_shrinks() -> None:
     async def _boom(messages: list[Message], previous: str | None) -> tuple[str, str]:
         raise RuntimeError("summarizer unavailable")
 
@@ -392,9 +395,80 @@ async def test_summarizer_exception_is_a_failed_compaction_not_a_crash() -> None
         message_tokens=_tokens,
     )
 
-    assert result.status == "failed"
-    assert result.reason == "compaction_failed"
-    assert result.messages is messages
+    assert result.status == "compacted"
+    assert result.summary_source == "fallback"
+    assert result.tokens_after < result.tokens_before
+    assert result.messages[-1].content == "now"
+
+
+@pytest.mark.asyncio
+async def test_hung_summarizer_times_out_into_the_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentos.engine import compaction_service
+
+    monkeypatch.setattr(compaction_service, "_SUMMARY_TIMEOUT_GRACE_SECONDS", 0.0)
+
+    async def _hang(messages: list[Message], previous: str | None) -> tuple[str, str]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    messages = [
+        Message(role="user", content="old " + "x" * 8000),
+        Message(role="assistant", content="answer"),
+        Message(role="user", content="now"),
+    ]
+    result = await CompactionService(provider=None, summarizer=_hang, timeout=0.01).compact(
+        messages,
+        turn_input_index=2,
+        estimated_tokens=_tokens(messages),
+        window_tokens=1_000,
+        message_tokens=_tokens,
+    )
+
+    assert result.status == "compacted"
+    assert result.summary_source == "fallback"
+    assert result.tokens_after < result.tokens_before
+
+
+@pytest.mark.asyncio
+async def test_fallback_over_many_chunks_fits_the_window() -> None:
+    """Many short messages over many chunks: the digest still shrinks the
+    history well under the trigger (it used to merge one 12k digest per
+    chunk and come out larger than the window)."""
+
+    async def _down(text: str, timeout: float) -> str | None:
+        return None
+
+    messages: list[Message] = []
+    for index in range(300):
+        messages.append(Message(role="user", content=f"q{index} " + "x" * 150))
+        messages.append(Message(role="assistant", content=f"a{index} " + "y" * 150))
+    messages.append(Message(role="user", content="now"))
+    window = 8_000
+    result = await CompactionService(provider=None, chunk_summarizer=_down).compact(
+        messages,
+        turn_input_index=len(messages) - 1,
+        estimated_tokens=_tokens(messages),
+        window_tokens=window,
+        message_tokens=_tokens,
+    )
+
+    assert result.status == "compacted"
+    assert result.summary_source == "fallback"
+    assert len(result.summary) <= fallback_max_chars(window) + 64
+    assert result.tokens_after < window * 0.85
+
+
+def test_repeated_fallbacks_do_not_grow_without_bound() -> None:
+    previous: str | None = None
+    batch = [Message(role="user", content="z" * 5_000)] * 30
+    sizes = []
+    for _ in range(5):
+        previous = fallback_summary(batch, previous, max_chars=6_000)
+        sizes.append(len(previous))
+    assert max(sizes) <= 6_000
+    assert sizes[-1] <= sizes[1] + 64
 
 
 @pytest.mark.asyncio

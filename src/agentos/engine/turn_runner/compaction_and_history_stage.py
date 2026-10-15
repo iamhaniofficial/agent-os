@@ -92,6 +92,20 @@ class RequestContextPrependPort(Protocol):
     ) -> str | None: ...
 
 
+@runtime_checkable
+class TurnStartObserverPort(Protocol):
+    """Told right before a turn loads its history.
+
+    Wraps ``ProactiveCompactionScheduler.before_history_load``: it invalidates
+    a between-turns compaction job that has not persisted yet and waits for
+    one that is persisting, so the load never sees a half-written rewrite.
+    """
+
+    async def before_history_load(
+        self, *, session_key: str, agent: Agent, agent_id: str
+    ) -> None: ...
+
+
 # ---------------------------------------------------------------------------
 # Stage I/O dataclasses (frozen)
 # ---------------------------------------------------------------------------
@@ -141,6 +155,7 @@ class CompactionAndHistoryStage:
     Stable boundary: runs ONCE per turn, after ``AgentBootstrapStage``
     and before the attachment-build + stream-consumer steps:
 
+    0. ``turn_start_observer.before_history_load`` (when wired).
     1. ``history_loader.load`` (always called).
     2. ``request_context_prepender.prepend`` (always called; pure).
 
@@ -155,9 +170,11 @@ class CompactionAndHistoryStage:
         *,
         history_loader: HistoryLoaderPort,
         request_context_prepender: RequestContextPrependPort,
+        turn_start_observer: TurnStartObserverPort | None = None,
     ) -> None:
         self._history_loader = history_loader
         self._request_context_prepender = request_context_prepender
+        self._turn_start_observer = turn_start_observer
 
     async def run(
         self,
@@ -165,6 +182,14 @@ class CompactionAndHistoryStage:
     ) -> StageOutcome[CompactionAndHistoryStageOutput]:
         # Local import keeps the module import-cycle-free.
         from agentos.engine.turn_runner.outcome import StageOutcome
+
+        # 0. A between-turns compaction must not rewrite the history under us.
+        if self._turn_start_observer is not None:
+            await self._turn_start_observer.before_history_load(
+                session_key=inp.session_key,
+                agent=inp.agent,
+                agent_id=inp.agent_id,
+            )
 
         # 1. Load history (transcript + structured/legacy messages + durable summary).
         load_kwargs: dict[str, Any] = {}

@@ -554,6 +554,14 @@ tool_result_store_retention_seconds = 604800
 enabled = true
 # model = ""            # None = use session model
 # timeout_seconds = 30.0
+# Compact between turns, in the background, once the history reaches
+# proactive_ratio of the compaction trigger; the next turn then does not wait
+# for the summarizer.
+# proactive = true
+# proactive_ratio = 0.70
+# Scale the request-size estimate by the input tokens providers report
+# (per provider/model, clamped 0.5-1.25); false = raw chars/4 estimate.
+# estimate_calibration = true
 
 [auxiliary]
 # The model for work AgentOS does on its own behalf rather than as part of a
