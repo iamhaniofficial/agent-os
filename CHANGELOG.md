@@ -22,13 +22,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   servers) get nothing, and Anthropic already allows parallel tool use, so no
   field is sent there. Subagents inherit the setting. `[tools] parallel_calls
   = false` sends nothing, as before.
-- Effort by router tier. When the thinking level comes from the routed tier's
-  own config, turns routed to `c0` run at most at `low` and turns routed to
-  `c1` at most at `medium`; `c2`, `c3` and the image tier are unchanged. A
-  level is only lowered, never raised, the model choice never changes, and
-  `[llm] thinking`, a router-controller level or an explicit model override
-  are left alone. Lowered turns log `turn_runner.effort_by_tier`.
-  `[agentos_router] effort_by_tier = false` keeps each tier's level.
+- Effort by router tier. When a turn runs at the thinking level the shipped
+  tier table gives the routed tier, turns routed to `c0` run at most at `low`
+  and turns routed to `c1` at most at `medium`; `c2`, `c3` and the image tier
+  are unchanged. A level is only lowered, never raised, and the model choice
+  never changes. Left alone: `[llm] thinking`, a router-controller level, an
+  explicit model override, a route or model the user pinned with router
+  control, and a tier level the operator set to something other than the
+  shipped value. Lowered turns log `turn_runner.effort_by_tier`.
+  `[agentos_router] effort_by_tier = false` keeps each tier's level (needed to
+  keep a cheap tier at a level equal to the shipped one, since config files
+  store the whole tier table).
 - Proactive compaction. When a turn ends with the session's history at
   `[compaction] proactive_ratio` (default 0.70) of the compaction trigger, the
   session is compacted in the background between turns with the same

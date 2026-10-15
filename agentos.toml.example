@@ -357,8 +357,9 @@ max_pending_per_session = 64
 enabled = true           # auto tier router
 auto_thinking = true
 # Lower the tier's thinking level on cheap tiers (c0 -> at most low, c1 -> at
-# most medium) when the level comes from the tier config. Never raises a level
-# and never changes the model. false keeps each tier's own level.
+# most medium) when the level is the shipped tier default. Never raises a
+# level, never changes the model, and skips router-control pins and tier levels
+# set to something other than the shipped value. false keeps each tier's level.
 effort_by_tier = true
 rollout_phase = "full"
 strategy = "pilot-v1"    # "pilot-v1" (default; local ONNX+MiniLM router,

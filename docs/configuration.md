@@ -571,12 +571,16 @@ strategy = "pilot-v1"   # default; or "llm_judge", or "jev" (experimental)
 ### Effort by tier
 
 A turn the router sends to a cheap tier also runs with less reasoning: when the
-thinking level comes from the routed tier's own config, `c0` turns run at most
-at `low` and `c1` turns at most at `medium`; `c2`, `c3` and the image tier keep
-their configured level. A level is only ever lowered, never raised, and the
-model choice does not change. It does not apply when `[llm] thinking` is set,
-when the router's controller picked the level, or when an explicit model
-overrode the route. Only providers with a thinking-level concept are affected
+turn runs at the thinking level the shipped tier table gives the routed tier,
+`c0` turns run at most at `low` and `c1` turns at most at `medium`; `c2`, `c3`
+and the image tier keep their configured level. A level is only ever lowered,
+never raised, and the model choice does not change. It does not apply when
+`[llm] thinking` is set, when the router's controller picked the level, when an
+explicit model overrode the route, when the user pinned a route or a model with
+router control, or when `[agentos_router.tiers.<tier>] thinking_level` is set to
+something other than the shipped value. Config files store the whole tier table,
+so a level equal to the shipped one cannot be told apart from a hand-written
+one; use `effort_by_tier = false` to keep it. Only providers with a thinking-level concept are affected
 (Anthropic effort, OpenAI reasoning effort, OpenRouter `reasoning.effort`).
 Each lowered turn logs `turn_runner.effort_by_tier`. To keep the tier's level
 on every turn:

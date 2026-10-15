@@ -768,7 +768,53 @@ def _compute_savings(routed_model: str, tiers: dict, routed_tier: str = "") -> d
     }
 
 
-def _record_thinking_metadata(ctx: TurnContext, router_cfg: object, tier_cfg: dict) -> None:
+def _shipped_tier_thinking_level(router_cfg: object, tier_name: object) -> str | None:
+    """Return the thinking level the shipped tier table gives *tier_name*.
+
+    The table is the active ``tier_profile`` (the default table when unset).
+    None when the tier is not in the shipped table or the profile is unknown.
+    """
+    from agentos.gateway.config import _router_tier_profile_defaults
+
+    try:
+        shipped = _router_tier_profile_defaults(getattr(router_cfg, "tier_profile", None))
+    except ValueError:
+        return None
+    name = normalize_text_tier(tier_name) or str(tier_name or "")
+    tier = shipped.get(name)
+    if not isinstance(tier, dict):
+        return None
+    return _normalize_thinking_level(tier.get("thinking_level", tier.get("thinking")))
+
+
+def _tier_thinking_source(
+    router_cfg: object, tier_name: object, tier_cfg: dict, level: str
+) -> str:
+    """Tag a tier-derived thinking level as shipped or operator-configured.
+
+    ``tier_default``: the level is what the shipped tier table says (or the
+    ``supports_thinking`` fallback). ``tier_config``: the operator set a level
+    of their own. Only ``tier_default`` is ever capped by effort by tier.
+    Config files persist the whole tier table, so a level equal to the shipped
+    one cannot be told apart from a hand-written one and counts as shipped.
+    """
+    explicit = _normalize_thinking_level(tier_cfg.get("thinking_level", tier_cfg.get("thinking")))
+    if explicit is None:
+        return "tier_default"
+    if tier_name is None:
+        return "tier_config"
+    shipped = _shipped_tier_thinking_level(router_cfg, tier_name)
+    return "tier_default" if shipped is not None and shipped == level else "tier_config"
+
+
+def _record_thinking_metadata(
+    ctx: TurnContext,
+    router_cfg: object,
+    tier_cfg: dict,
+    *,
+    tier_name: object = None,
+    source: str | None = None,
+) -> None:
     if not getattr(router_cfg, "auto_thinking", True):
         return
     level = _tier_thinking_level(tier_cfg)
@@ -776,7 +822,9 @@ def _record_thinking_metadata(ctx: TurnContext, router_cfg: object, tier_cfg: di
         return
     ctx.metadata["thinking_requested"] = True
     ctx.metadata["thinking_level"] = level
-    ctx.metadata["thinking_level_source"] = "tier"
+    ctx.metadata["thinking_level_source"] = source or _tier_thinking_source(
+        router_cfg, tier_name, tier_cfg, level
+    )
 
 
 def _record_controller_thinking_metadata(
@@ -784,6 +832,8 @@ def _record_controller_thinking_metadata(
     router_cfg: object,
     tier_cfg: dict,
     thinking_mode: str | None,
+    *,
+    tier_name: object = None,
 ) -> None:
     if not getattr(router_cfg, "auto_thinking", True):
         return
@@ -795,7 +845,11 @@ def _record_controller_thinking_metadata(
         return
     ctx.metadata["thinking_requested"] = True
     ctx.metadata["thinking_level"] = level
-    ctx.metadata["thinking_level_source"] = "controller" if thinking_mode is not None else "tier"
+    ctx.metadata["thinking_level_source"] = (
+        "controller"
+        if thinking_mode is not None
+        else _tier_thinking_source(router_cfg, tier_name, tier_cfg, level)
+    )
 
 
 def _inject_prompt_hint(message: str, hint: str) -> str:
@@ -1333,13 +1387,16 @@ def _apply_controller(
     prompt_policy: str | None,
     prompt_hint: str | None,
     rollout_phase: str,
+    tier_name: object = None,
 ) -> None:
     """Apply controller decisions based on rollout phase."""
     ctx.metadata["thinking_mode"] = thinking_mode
     ctx.metadata["prompt_policy"] = prompt_policy
 
     if rollout_phase == "observe":
-        _record_controller_thinking_metadata(ctx, router_cfg, tier_cfg, thinking_mode)
+        _record_controller_thinking_metadata(
+            ctx, router_cfg, tier_cfg, thinking_mode, tier_name=tier_name
+        )
         return
 
     # prompt_only or full: inject prompt hint. P2 is tracked for observability
@@ -1352,9 +1409,11 @@ def _apply_controller(
         ctx.message = _inject_prompt_hint(ctx.message, hint)
 
     if rollout_phase == "full" and getattr(router_cfg, "auto_thinking", True):
-        _record_controller_thinking_metadata(ctx, router_cfg, tier_cfg, thinking_mode)
+        _record_controller_thinking_metadata(
+            ctx, router_cfg, tier_cfg, thinking_mode, tier_name=tier_name
+        )
     else:
-        _record_thinking_metadata(ctx, router_cfg, tier_cfg)
+        _record_thinking_metadata(ctx, router_cfg, tier_cfg, tier_name=tier_name)
 
 
 def _attachments_include_image(attachments: list[dict[str, Any]] | None) -> bool:
@@ -1465,7 +1524,7 @@ async def apply_agentos_router(ctx: TurnContext) -> TurnContext:
         ctx.metadata["routing_source"] = decision.source
         ctx.metadata["route_max_history_turns"] = 1
         ctx.metadata.update(_compute_savings(decision.model, tiers, decision.tier))
-        _record_thinking_metadata(ctx, router_cfg, image_tiers[tier_name])
+        _record_thinking_metadata(ctx, router_cfg, image_tiers[tier_name], tier_name=tier_name)
         log.debug("agentos_router.image_routed", tier=decision.tier, model=decision.model)
         return ctx
 
@@ -1510,7 +1569,11 @@ async def apply_agentos_router(ctx: TurnContext) -> TurnContext:
             ctx.metadata["router_control_target_provider"] = hold.provider
             ctx.metadata["router_control_evidence"] = hold.evidence
             ctx.metadata.update(_compute_savings(decision.model, tiers, decision.tier))
-            _record_thinking_metadata(ctx, router_cfg, tiers[decision.tier])
+            # The user picked this route: the tier's level is theirs, never
+            # capped by effort by tier.
+            _record_thinking_metadata(
+                ctx, router_cfg, tiers[decision.tier], source="router_control"
+            )
             log.debug(
                 "agentos_router.router_control_hold_applied",
                 tier=decision.tier,
@@ -1715,10 +1778,11 @@ async def apply_agentos_router(ctx: TurnContext) -> TurnContext:
             prompt_policy,
             prompt_hint=(ctx.metadata.get("routing_extra") or {}).get("prompt_hint"),
             rollout_phase=rollout_phase,
+            tier_name=decision.tier,
         )
     except Exception:
         log.warning("agentos_router.controller_apply_error", exc_info=True)
-        _record_thinking_metadata(ctx, router_cfg, tiers[decision.tier])
+        _record_thinking_metadata(ctx, router_cfg, tiers[decision.tier], tier_name=decision.tier)
 
     # History-aware routers accumulate routing_extra into per-session history.
     if requires_history:

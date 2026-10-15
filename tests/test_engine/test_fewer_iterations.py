@@ -166,7 +166,7 @@ def _turn(tier: str, level: str = "high", **extra: Any) -> SimpleNamespace:
     metadata = {
         "thinking_requested": True,
         "thinking_level": level,
-        "thinking_level_source": "tier",
+        "thinking_level_source": "tier_default",
         "routed_tier": tier,
         "routing_applied": True,
     }
@@ -216,6 +216,13 @@ def test_effort_by_tier_leaves_explicit_levels_alone() -> None:
     # An explicit model overrode the route: the tier says nothing about it.
     overridden = _turn("c0", routing_applied=False)
     assert _runner()._resolve_turn_thinking(overridden) == ThinkingLevel.HIGH
+    # An operator-configured tier level is respected.
+    configured = _turn("c1", thinking_level_source="tier_config")
+    assert _runner()._resolve_turn_thinking(configured) == ThinkingLevel.HIGH
+    # The pre-fix "tier" tag is no longer capped: only a shipped level is.
+    assert _runner()._resolve_turn_thinking(_turn("c0", thinking_level_source="tier")) == (
+        ThinkingLevel.HIGH
+    )
     # Metadata from before this change (no source) is untouched.
     legacy = _turn("c0")
     del legacy.metadata["thinking_level_source"]
@@ -227,8 +234,8 @@ def test_effort_by_tier_leaves_explicit_levels_alone() -> None:
 def test_router_records_where_the_thinking_level_came_from() -> None:
     router_cfg = SimpleNamespace(auto_thinking=True)
     tier_ctx = SimpleNamespace(metadata={})
-    _record_thinking_metadata(tier_ctx, router_cfg, {"thinking_level": "high"})
-    assert tier_ctx.metadata["thinking_level_source"] == "tier"
+    _record_thinking_metadata(tier_ctx, router_cfg, {"thinking_level": "high"}, tier_name="c1")
+    assert tier_ctx.metadata["thinking_level_source"] == "tier_default"
 
     ctrl_ctx = SimpleNamespace(metadata={})
     _record_controller_thinking_metadata(ctrl_ctx, router_cfg, {"thinking_level": "high"}, "T3")
@@ -236,5 +243,77 @@ def test_router_records_where_the_thinking_level_came_from() -> None:
         assert ctrl_ctx.metadata["thinking_level_source"] == "controller"
 
     fallback_ctx = SimpleNamespace(metadata={})
-    _record_controller_thinking_metadata(fallback_ctx, router_cfg, {"thinking_level": "high"}, None)
-    assert fallback_ctx.metadata["thinking_level_source"] == "tier"
+    _record_controller_thinking_metadata(
+        fallback_ctx, router_cfg, {"thinking_level": "high"}, None, tier_name="c0"
+    )
+    assert fallback_ctx.metadata["thinking_level_source"] == "tier_default"
+
+
+def test_tier_thinking_source_tells_shipped_levels_from_operator_levels() -> None:
+    # openai ships c1 at "low": an operator who raises it to "high" set it.
+    openai = AgentOSRouterConfig(tier_profile="openai", tiers={"c1": {"thinking_level": "high"}})
+    ctx = SimpleNamespace(metadata={})
+    _record_thinking_metadata(ctx, openai, openai.tiers["c1"], tier_name="c1")
+    assert ctx.metadata["thinking_level_source"] == "tier_config"
+    assert _runner()._resolve_turn_thinking(
+        _turn("c1", thinking_level_source=ctx.metadata["thinking_level_source"])
+    ) == ThinkingLevel.HIGH
+
+    # The shipped level on the same profile is still a default.
+    shipped = AgentOSRouterConfig(tier_profile="openai")
+    ctx = SimpleNamespace(metadata={})
+    _record_thinking_metadata(ctx, shipped, shipped.tiers["c2"], tier_name="c2")
+    assert ctx.metadata["thinking_level_source"] == "tier_default"
+
+    # The default table ships c1 at "high": that is the level effort by tier caps.
+    default = AgentOSRouterConfig()
+    ctx = SimpleNamespace(metadata={})
+    _record_thinking_metadata(ctx, default, default.tiers["c1"], tier_name="c1")
+    assert ctx.metadata["thinking_level_source"] == "tier_default"
+    # A level that differs from the shipped one is the operator's.
+    lowered = AgentOSRouterConfig(tiers={**default.tiers, "c1": {"thinking_level": "xhigh"}})
+    ctx = SimpleNamespace(metadata={})
+    _record_thinking_metadata(ctx, lowered, lowered.tiers["c1"], tier_name="c1")
+    assert ctx.metadata["thinking_level_source"] == "tier_config"
+
+
+def test_router_control_hold_keeps_the_tier_thinking_level() -> None:
+    held = _turn("c1", router_control_hold_applied=True)
+    assert _runner()._resolve_turn_thinking(held) == ThinkingLevel.HIGH
+
+
+@pytest.mark.asyncio
+async def test_a_model_hold_is_not_capped_by_effort_by_tier() -> None:
+    """The user hand-picked a model: its host tier level must not be lowered."""
+    from agentos.engine.pipeline import TurnContext
+    from agentos.engine.steps.agentos_router import apply_agentos_router
+    from agentos.router_control import (
+        RouterControlHoldStore,
+        resolve_router_control_model_target,
+    )
+
+    cfg = AgentOSRouterConfig(enabled=True, rollout_phase="full", auto_thinking=True)
+    target = resolve_router_control_model_target(cfg, "anthropic/claude-opus-5.5")
+    store = RouterControlHoldStore()
+    store.set_hold("agent:main:effort-hold", target, evidence="use opus")
+    ctx = TurnContext(
+        message="review this",
+        session_key="agent:main:effort-hold",
+        config=SimpleNamespace(agentos_router=cfg),
+        provider=None,
+        model="default-model",
+        tool_defs=[],
+        system_prompt="system",
+        metadata={"router_control_hold_store": store},
+    )
+    out = await apply_agentos_router(ctx)
+    assert out.metadata["router_control_hold_applied"] is True
+    assert out.metadata["thinking_level_source"] == "router_control"
+
+    runner = TurnRunner(
+        provider_selector=None,
+        config=SimpleNamespace(llm=SimpleNamespace(thinking=None), agentos_router=cfg),
+    )
+    assert runner._resolve_turn_thinking(SimpleNamespace(metadata=out.metadata)) == (
+        ThinkingLevel.HIGH
+    )
