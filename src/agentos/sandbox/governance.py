@@ -305,8 +305,14 @@ class ApprovalGate:
             "fingerprint": fingerprint,
         }
         approval_id = self._queue.request(namespace=self._namespace, params=params)
+        # Lazy: ``agentos.tools`` imports every builtin, which imports this module.
+        from agentos.tools.batch_slot import wait_outside_tool_slot  # noqa: PLC0415
+
         try:
-            approved = await self._queue.wait(approval_id, timeout=self._timeout)
+            # Free the tool call's batch slot while the human decides.
+            approved = await wait_outside_tool_slot(
+                self._queue.wait(approval_id, timeout=self._timeout)
+            )
         except Exception:
             # Defensive: if the queue implementation itself errors, surface a
             # structured denial rather than crashing the tool call. The queue

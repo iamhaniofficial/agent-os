@@ -175,6 +175,17 @@ class MemoryNudgePort(Protocol):
     ) -> None: ...
 
 
+@runtime_checkable
+class ProactiveCompactionPort(Protocol):
+    """Schedule a between-turns compaction when the history is near the trigger.
+
+    Synchronous and cheap; the job runs after the turn has ended
+    (:class:`agentos.engine.proactive_compaction.ProactiveCompactionScheduler`).
+    """
+
+    def after_turn(self, *, session_key: str, agent_id: str, succeeded: bool) -> None: ...
+
+
 class _NoopMemoryNudge:
     """Stand-in used when no nudge port is wired. Never nudges."""
 
@@ -413,7 +424,9 @@ class TurnFinalizerStage:
         session_totals: SessionTotalsPort,
         turn_error_persist: TurnErrorPersistPort,
         memory_nudge: MemoryNudgePort | None = None,
+        proactive_compaction: ProactiveCompactionPort | None = None,
     ) -> None:
+        self._proactive_compaction = proactive_compaction
         self._transcript_append = transcript_append
         self._turn_memory_capture = turn_memory_capture
         self._session_totals = session_totals
@@ -575,6 +588,24 @@ class TurnFinalizerStage:
                     session_key=inp.session_key,
                     error=str(exc),
                 )
+
+        # --- proactive compaction (stream C) --------------------------------
+        # Last step of the success path: the turn is persisted, so a
+        # between-turns compaction may be scheduled; it starts after the turn.
+        if self._proactive_compaction is not None:
+            try:
+                self._proactive_compaction.after_turn(
+                    session_key=inp.session_key,
+                    agent_id=inp.agent_id,
+                    succeeded=transcript_appended and not inp.error_message,
+                )
+            except Exception as exc:  # noqa: BLE001 - log-and-continue intentional
+                log.warning(
+                    "compaction.proactive_schedule_failed",
+                    session_key=inp.session_key,
+                    error=str(exc),
+                )
+        # --- end proactive compaction ----------------------------------------
 
         return StageOutcome.success(
             TurnFinalizerStageOutput(

@@ -1639,6 +1639,10 @@ class SessionManager:
             if index < len(preserved_entries):
                 preserved = preserved_entries[index]
                 if preserved.role == raw.get("role") and preserved.content == raw.get("content"):
+                    if "provider_messages" in raw:
+                        # A between-turns compaction re-records the kept
+                        # turn as a ``reset`` record carrying the summary.
+                        preserved.provider_messages = raw["provider_messages"]
                     rewritten_entries.append(preserved)
                     continue
             entry = TranscriptEntry(

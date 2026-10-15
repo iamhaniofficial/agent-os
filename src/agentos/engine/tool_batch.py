@@ -20,6 +20,26 @@ when the approval is resolved the call is retried with its ``approval_id``.
 Approvals are therefore awaited concurrently instead of one by one, while what
 gets approved is still decided by the tool itself.
 
+A tool that waits for its approval inline instead (``exec`` on the Web UI and
+desktop, which poll the approval queue themselves) wraps that wait in
+``agentos.tools.batch_slot.wait_outside_tool_slot``: the call gives back its
+admission (gate slot, key lock, concurrency permit) for the duration of the
+wait and queues again for it before running. A pending approval therefore
+never holds an ``exclusive`` slot, so every approval of a batch is requested
+at once instead of each one after the previous answer.
+
+Stepping out does not reorder the batch: an ``exclusive`` call runs its body
+only once every earlier ``exclusive`` call has finished. A later call may get
+ahead only as far as its own approval prompt, and only when its tool declares
+``ToolSpec.early_approval`` (it then calls
+``agentos.tools.batch_slot.wait_for_batch_turn`` before acting); any other
+``exclusive`` call is not admitted before its turn. An ``exclusive`` call
+queueing again after its approval goes back to its place in emission order,
+not to the back of the queue. ``keyed`` and ``parallel`` calls are not held
+to that turn and re-queue at the back, as before. A call is not timed while
+it queues to be admitted again, and one admitted again after the batch
+deadline times out without running.
+
 The pairing guarantee holds whatever order calls finish in, and on timeout,
 cancellation or exception: ``outcomes`` has exactly one final result per
 tool_use, in the original call order, ready to be appended to the transcript.
@@ -28,12 +48,13 @@ tool_use, in the original call order, ready to be appended to the transcript.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import functools
+import itertools
 import time
-from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
@@ -49,6 +70,7 @@ from agentos.engine.types import (
 from agentos.execution_status import ExecutionStatusValue, runtime_execution_status
 from agentos.provider import ContentBlockToolResult
 from agentos.router_control import router_control_replay_event_from_payload
+from agentos.tools.batch_slot import current_admission
 from agentos.tools.types import ToolConcurrency, ToolSpec
 
 _log = structlog.get_logger(__name__)
@@ -135,31 +157,72 @@ def registry_spec_lookup(registry: Any | None) -> Callable[[str], ToolSpec | Non
 # ---------------------------------------------------------------------------
 
 
+class _ExclusiveTurns:
+    """Which ``exclusive`` calls of a batch are still unfinished, by call index.
+
+    It is an exclusive call's turn once every exclusive call emitted before it
+    has finished; ``keyed`` and ``parallel`` calls are not counted.
+    """
+
+    def __init__(self, indices: Sequence[int] = ()) -> None:
+        self._unfinished = set(indices)
+
+    def ready(self, index: int) -> bool:
+        return all(other >= index for other in self._unfinished)
+
+    def finish(self, index: int) -> None:
+        self._unfinished.discard(index)
+
+
 @dataclass(eq=False)
 class _Slot:
     exclusive: bool
     future: asyncio.Future[None]
     released: bool = False
+    # Queue position: the call's index, or None to queue at the back.
+    order: int | None = None
+    # An exclusive slot that may be admitted only in its call's turn.
+    needs_turn: bool = False
+    rank: tuple[float, int] = (0.0, 0)
 
 
 class _OrderedGate:
-    """FIFO reader/writer gate.
+    """Ordered reader/writer gate.
 
     Shared holders run together; an exclusive holder runs alone. Requests are
-    admitted strictly in the order they were reserved, so a shared request
-    behind a waiting exclusive one does not overtake it.
+    admitted strictly in queue order, so a shared request behind a waiting
+    exclusive one does not overtake it. The queue is ordered by the slot's
+    ``order`` (the call index; ``None`` sorts last) and then by reservation,
+    so a call that queues again can go back to its place. A ``needs_turn``
+    exclusive slot at the head waits until :class:`_ExclusiveTurns` says it
+    is the call's turn.
     """
 
-    def __init__(self) -> None:
-        self._queue: deque[_Slot] = deque()
+    def __init__(self, turns: _ExclusiveTurns | None = None) -> None:
+        self._queue: list[_Slot] = []
         self._shared_active = 0
         self._exclusive_active = False
+        self._turns = turns
+        self._counter = itertools.count()
 
-    def reserve(self, *, exclusive: bool) -> _Slot:
-        slot = _Slot(exclusive=exclusive, future=asyncio.get_running_loop().create_future())
-        self._queue.append(slot)
+    def reserve(
+        self, *, exclusive: bool, order: int | None = None, needs_turn: bool = False
+    ) -> _Slot:
+        slot = _Slot(
+            exclusive=exclusive,
+            future=asyncio.get_running_loop().create_future(),
+            order=order,
+            needs_turn=needs_turn and exclusive and order is not None,
+            rank=(float("inf") if order is None else float(order), next(self._counter)),
+        )
+        bisect.insort(self._queue, slot, key=_slot_rank)
         self._admit()
         return slot
+
+    def wake(self) -> None:
+        """Re-check the head after a call finished (its turn may have come)."""
+
+        self._admit()
 
     def release(self, slot: _Slot) -> None:
         """Give *slot* back. Idempotent; also abandons a slot never admitted."""
@@ -182,18 +245,154 @@ class _OrderedGate:
             slot = self._queue[0]
             if slot.future.done():
                 # Abandoned before admission.
-                self._queue.popleft()
+                self._queue.pop(0)
                 continue
             if self._exclusive_active:
                 return
             if slot.exclusive:
                 if self._shared_active:
                     return
+                if (
+                    slot.needs_turn
+                    and slot.order is not None
+                    and self._turns is not None
+                    and not self._turns.ready(slot.order)
+                ):
+                    return
                 self._exclusive_active = True
             else:
                 self._shared_active += 1
-            self._queue.popleft()
+            self._queue.pop(0)
             slot.future.set_result(None)
+
+
+def _slot_rank(slot: _Slot) -> tuple[float, int]:
+    return slot.rank
+
+
+@dataclass(eq=False)
+class _Admission:
+    """Everything one running call holds: its gate slot and, for a
+    non-exclusive call, its key lock and concurrency permit.
+
+    Acquired in the fixed order gate -> key lock -> permit, released in
+    reverse; tracking what is held makes release idempotent and safe after a
+    cancellation that landed half-way through acquiring.
+    """
+
+    gate: _OrderedGate
+    slot: _Slot
+    exclusive: bool
+    key_lock: asyncio.Lock | None = None
+    semaphore: asyncio.Semaphore | None = None
+    holds_key: bool = False
+    holds_permit: bool = False
+    yielded: bool = False
+    # The call's index for an exclusive first run (its place in the turn
+    # order); None for a call that is not held to a turn.
+    order: int | None = None
+    turns: _ExclusiveTurns | None = None
+    # The running call's own timeout. It is paused while the call queues to
+    # be admitted again (a queued call is not timed, as before its first
+    # admission); the time spent waiting for the approval itself does count.
+    timeout_scope: asyncio.Timeout | None = None
+    # Seconds left in the batch; a call admitted again with none left times
+    # out without running, like a call still queued at the deadline.
+    batch_remaining: Callable[[], float] | None = None
+    deadline_passed: bool = False
+    # Wraps the awaitable a call waits on outside its slot (an operator
+    # approval), so the turn's timing can count that wait.
+    outside_wait: Callable[[Awaitable[Any]], Awaitable[Any]] | None = None
+
+    async def acquire(self) -> None:
+        await self.slot.future
+        if self.key_lock is not None:
+            await self.key_lock.acquire()
+            self.holds_key = True
+        if self.semaphore is not None:
+            await self.semaphore.acquire()
+            self.holds_permit = True
+
+    def release(self) -> None:
+        if self.holds_permit and self.semaphore is not None:
+            self.holds_permit = False
+            self.semaphore.release()
+        if self.holds_key and self.key_lock is not None:
+            self.holds_key = False
+            self.key_lock.release()
+        self.gate.release(self.slot)
+
+    def finish(self) -> None:
+        """The call is done for good: release it and let later calls take their turn."""
+
+        if self.turns is not None and self.order is not None:
+            self.turns.finish(self.order)
+        self.release()
+        self.gate.wake()
+
+    def in_turn(self) -> bool:
+        return (
+            not self.exclusive
+            or self.order is None
+            or self.turns is None
+            or self.turns.ready(self.order)
+        )
+
+    async def wait_turn(self) -> None:
+        if self.yielded or self.in_turn():
+            return
+        self.yielded = True
+        self.release()
+        await self._readmit()
+
+    async def wait_outside[T](self, awaitable: Awaitable[T]) -> T:
+        self.yielded = True
+        self.release()
+        try:
+            if self.outside_wait is not None:
+                result = cast(T, await self.outside_wait(awaitable))
+            else:
+                result = await awaitable
+        except asyncio.CancelledError:
+            # Nothing is held; the call's own cleanup releases nothing more.
+            raise
+        except BaseException:
+            await self._readmit()
+            raise
+        await self._readmit()
+        return result
+
+    async def _readmit(self) -> None:
+        # Queue again; the call runs its tool only once it is admitted under
+        # its own policy again. An exclusive first run goes back to its place
+        # in emission order and is admitted only in its turn; anything else
+        # queues at the back. The call's timeout is paused meanwhile and
+        # resumes with the time it had left, capped by the batch.
+        loop = asyncio.get_running_loop()
+        scope = self.timeout_scope
+        when = scope.when() if scope is not None else None
+        left = None if when is None else max(0.0, when - loop.time())
+        if scope is not None and when is not None:
+            scope.reschedule(None)
+        self.slot = self.gate.reserve(
+            exclusive=self.exclusive,
+            order=self.order if self.exclusive else None,
+            needs_turn=self.exclusive,
+        )
+        await self.acquire()
+        self.yielded = False
+        batch_left = self.batch_remaining() if self.batch_remaining is not None else None
+        if batch_left is not None and batch_left <= 0:
+            # Admitted again only after the batch gave up: time out unstarted.
+            self.deadline_passed = True
+            if scope is None:
+                raise TimeoutError
+            scope.reschedule(loop.time())
+            await loop.create_future()  # the scope expires and cancels this
+        if scope is not None and left is not None:
+            if batch_left is not None:
+                left = min(left, batch_left)
+            scope.reschedule(loop.time() + left)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +481,9 @@ class ToolBatchExecutor:
     approval_wait_timeout: float = 180.0
     pending_approval: Callable[[str], dict[str, Any] | None] = lambda _content: None
     wait_for_approval: Callable[..., Awaitable[Any]] | None = None
+    # Wraps an inline approval wait a tool does outside its slot (see
+    # ``agentos.tools.batch_slot``); used to time it like ``wait_for_approval``.
+    outside_wait: Callable[[Awaitable[Any]], Awaitable[Any]] | None = None
     artifact_event: Callable[[dict[str, Any]], ArtifactEvent] = lambda a: ArtifactEvent(**a)
     pending_warnings: list[WarningEvent] = field(default_factory=list)
     preflight_results: Mapping[str, ToolResult] = field(default_factory=dict)
@@ -336,12 +538,16 @@ class ToolBatchExecutor:
             total_deadline=self.total_deadline,
             now=self.clock or asyncio.get_running_loop().time,
         )
-        gate = _OrderedGate()
+        policies = [self.policy_for(call) for call in self._calls]
+        turns = _ExclusiveTurns(
+            [index for index, policy in enumerate(policies) if policy.mode == "exclusive"]
+        )
+        gate = _OrderedGate(turns)
         semaphore = asyncio.Semaphore(max(1, int(self.max_concurrency)))
         key_locks: dict[Hashable, asyncio.Lock] = {}
         tasks: dict[asyncio.Task[ToolResult], _Job] = {}
 
-        async def _run_one(call: ToolCall) -> ToolResult:
+        async def _run_one(call: ToolCall, admission: _Admission) -> ToolResult:
             started = time.monotonic()
             self.call_log(
                 "tool_request",
@@ -354,11 +560,22 @@ class ToolBatchExecutor:
             preflight = self.preflight_results.get(call.tool_use_id)
             if preflight is not None:
                 result = preflight
+            elif clock.remaining() <= 0:
+                # Admitted only because an earlier call's own timeout fired at
+                # the batch deadline: starting it now would run a tool the
+                # batch has already given up on. It times out unstarted, like
+                # every other call still queued at the deadline.
+                result = _timeout_result(call, self.iteration_timeout)
             else:
                 try:
-                    result = await asyncio.wait_for(self.execute(call), timeout=tool_timeout)
+                    async with asyncio.timeout(tool_timeout) as scope:
+                        admission.timeout_scope = scope
+                        result = await self.execute(call)
                 except TimeoutError:
-                    result = _timeout_result(call, tool_timeout)
+                    result = _timeout_result(
+                        call,
+                        self.iteration_timeout if admission.deadline_passed else tool_timeout,
+                    )
             self.call_log(
                 "tool_response",
                 iteration=self.iteration,
@@ -371,33 +588,49 @@ class ToolBatchExecutor:
             )
             return result
 
-        async def _run_admitted(
-            call: ToolCall, policy: ToolConcurrencyPolicy, slot: _Slot
-        ) -> ToolResult:
-            try:
-                await slot.future
-                if policy.mode == "exclusive":
-                    return await _run_one(call)
-                key_lock = (
+        def _admission(
+            call: ToolCall, policy: ToolConcurrencyPolicy, order: int | None
+        ) -> _Admission:
+            exclusive = policy.mode == "exclusive"
+            if not exclusive:
+                order = None
+            spec = self.spec_for(call.tool_name)
+            early = bool(getattr(spec, "early_approval", False))
+            return _Admission(
+                gate=gate,
+                # An exclusive first run is admitted in its turn, unless its
+                # tool asks for approval first and waits for the turn itself.
+                slot=gate.reserve(
+                    exclusive=exclusive, order=order, needs_turn=exclusive and not early
+                ),
+                exclusive=exclusive,
+                order=order,
+                turns=turns if order is not None else None,
+                batch_remaining=clock.remaining,
+                key_lock=(
                     key_locks.setdefault(policy.key, asyncio.Lock())
-                    if policy.key is not None
+                    if not exclusive and policy.key is not None
                     else None
-                )
-                if key_lock is None:
-                    async with semaphore:
-                        return await _run_one(call)
-                async with key_lock, semaphore:
-                    return await _run_one(call)
+                ),
+                semaphore=None if exclusive else semaphore,
+                outside_wait=self.outside_wait,
+            )
+
+        async def _run_admitted(call: ToolCall, admission: _Admission) -> ToolResult:
+            token = current_admission.set(admission)
+            try:
+                await admission.acquire()
+                return await _run_one(call, admission)
             finally:
-                gate.release(slot)
+                admission.finish()
+                current_admission.reset(token)
 
         def _schedule(job: _Job) -> None:
-            policy = self.policy_for(job.call)
-            slot = gate.reserve(exclusive=policy.mode == "exclusive")
-            task = asyncio.create_task(_run_admitted(job.call, policy, slot))
+            admission = _admission(job.call, policies[job.index], job.index)
+            task = asyncio.create_task(_run_admitted(job.call, admission))
             # A task cancelled before it first runs never reaches its
             # ``finally``; give its slot back so the gate cannot stall.
-            task.add_done_callback(functools.partial(_release_slot, gate, slot))
+            task.add_done_callback(functools.partial(_release_admission, admission))
             tasks[task] = job
 
         async def _approve_then_retry(job: _Job, payload: dict[str, Any]) -> ToolResult:
@@ -406,9 +639,10 @@ class ToolBatchExecutor:
                     payload,
                     timeout=clock.cap(self.approval_wait_timeout),
                 )
-            policy = self.policy_for(job.call)
-            slot = gate.reserve(exclusive=policy.mode == "exclusive")
-            return await _run_admitted(job.call, policy, slot)
+            # A retry is not held to the turn order and queues at the back:
+            # each call runs the moment its own approval is resolved.
+            admission = _admission(job.call, self.policy_for(job.call), None)
+            return await _run_admitted(job.call, admission)
 
         def _schedule_retry(job: _Job, payload: dict[str, Any]) -> None:
             retry_arguments = dict(job.call.arguments)
@@ -529,8 +763,8 @@ class ToolBatchExecutor:
         return events
 
 
-def _release_slot(gate: _OrderedGate, slot: _Slot, _task: asyncio.Task[ToolResult]) -> None:
-    gate.release(slot)
+def _release_admission(admission: _Admission, _task: asyncio.Task[ToolResult]) -> None:
+    admission.finish()
 
 
 def _job_index(item: tuple[asyncio.Task[ToolResult], _Job]) -> int:

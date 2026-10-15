@@ -19,7 +19,7 @@ import os
 import platform
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +59,7 @@ from agentos.engine.hooks import (
 from agentos.engine.outcome import outcome_from_error, turn_outcome_details
 from agentos.engine.pipeline import TurnContext
 from agentos.engine.pricing import PriceEntry, lookup_price
+from agentos.engine.proactive_compaction import ProactiveCompactionScheduler
 from agentos.engine.router_decision import build_router_decision_event
 from agentos.engine.transcript import transcript_record_of
 from agentos.engine.turn_policy import resolve_turn_policy
@@ -109,7 +110,15 @@ from agentos.engine.turn_runner.harness import (
     _TurnRunnerTurnErrorPersistAdapter,
     _TurnRunnerTurnMemoryCaptureAdapter,
 )
+from agentos.engine.turn_runner.pre_provider_io import (
+    MEMORY_CONTEXT_KEY,
+    PROJECT_KNOWLEDGE_KEY,
+    PreProviderIO,
+    RecallBudget,
+    merge_extra_context_block,
+)
 from agentos.engine.turn_runner.stream_consumer_stage import _StreamState
+from agentos.engine.turn_timing import TurnTiming, emit_turn_timing_log
 from agentos.engine.types import (
     AgentConfig,
     AgentEvent,
@@ -196,6 +205,9 @@ _DEFAULT_LLM_TIMEOUT_SECONDS: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
 _ROUTER_PREV_ASSISTANT_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_TURNS: Final[int] = 4
+# Newest transcript rows read for the router context before falling back to
+# the whole transcript (only when the window lacks what the context needs).
+_ROUTER_CONTEXT_WINDOW_ENTRIES: Final[int] = 128
 _CONTEXT_SUMMARY_MARKER: Final[str] = "[Context Summary]"
 # Extra-context keys whose value is fixed for the life of a session (or changes
 # only on an explicit edit); rendered into the cached system prompt.
@@ -632,6 +644,9 @@ _HEARTBEAT_ACK_TOKEN: Final[str] = "HEARTBEAT_OK"
 # Markdown a model puts around a bare token. The system prompt itself shows the
 # sentinels as code spans, so `NO_REPLY` and **HEARTBEAT_OK** are ordinary replies.
 _SENTINEL_WRAPPERS: Final[str] = "`*_~"
+# Thinking-level sources the router owns; effort-by-tier may cap these.
+_EFFORT_BY_TIER_SOURCES: frozenset[str] = frozenset({"tier_default", "controller"})
+
 _THINKING_ALIASES: Final[dict[str, str]] = {
     "x-high": "xhigh",
     "x_high": "xhigh",
@@ -1817,9 +1832,12 @@ class TurnRunner:
         )
         # TurnRunner stage decomposition CompactionAndHistoryStage instance. Holds no
         # per-turn state. Active unconditionally as of.
+        # Between-turns (proactive) compaction + estimator calibration.
+        self._proactive_compaction = ProactiveCompactionScheduler(self)
         self._compaction_and_history_stage = CompactionAndHistoryStage(
             history_loader=_TurnRunnerHistoryLoaderAdapter(self),
             request_context_prepender=_RequestContextPrependAdapter(),
+            turn_start_observer=self._proactive_compaction,
         )
         # TurnRunner stage decomposition AttachmentStage instance. Holds no per-turn
         # state. Active unconditionally as of.
@@ -1856,6 +1874,7 @@ class TurnRunner:
             session_totals=_TurnRunnerSessionTotalsAdapter(self),
             turn_error_persist=_TurnRunnerTurnErrorPersistAdapter(self),
             memory_nudge=_TurnRunnerMemoryNudgeAdapter(self),
+            proactive_compaction=self._proactive_compaction,
         )
 
     @property
@@ -1883,6 +1902,10 @@ class TurnRunner:
         # The anchor only means something for the turn that loaded the history;
         # the next turn's _load_history records a fresh one.
         self._compaction_snapshots.pop(session_key, None)
+        # The turn is over: a proactive compaction it scheduled may start.
+        proactive = getattr(self, "_proactive_compaction", None)
+        if proactive is not None:
+            proactive.turn_ended(session_key)
 
     def refresh_memory_snapshot(self, agent_id: str) -> None:
         """Refresh frozen snapshots for all sessions of the given agent.
@@ -2007,6 +2030,110 @@ class TurnRunner:
             return ""
         return str(getattr(session, "session_id", "") or "")
 
+    # Default hard deadline for provider recall; ``[memory]
+    # recall_timeout_seconds`` overrides it.
+    RECALL_TIMEOUT_SECONDS_DEFAULT = 1.5
+    _recall_budget_state: RecallBudget | None = None
+
+    def _recall_budget(self) -> RecallBudget:
+        budget = self._recall_budget_state
+        if budget is None:
+            budget = self._recall_budget_state = RecallBudget()
+        return budget
+
+    def _recall_timeout_seconds(self) -> float:
+        value = getattr(getattr(self._config, "memory", None), "recall_timeout_seconds", None)
+        if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+            return self.RECALL_TIMEOUT_SECONDS_DEFAULT
+        return float(value)
+
+    async def _fetch_prefetch_block(
+        self,
+        *,
+        agent_id: str,
+        session_id: str,
+        message: str,
+        timeout: float | None = None,
+    ) -> str:
+        """Return the provider's fenced recall block for ``message``, or ``""``.
+
+        Bounded by ``[memory] recall_timeout_seconds``: a recall that misses
+        the deadline is not cancelled; it finishes in the background and its
+        block can stand in on the session's next turn (see ``RecallBudget``).
+        """
+        manager = self._provider_manager_for(agent_id)
+        if manager is None or not message:
+            return ""
+        return await self._recall_budget().recall(
+            (agent_id, session_id) if session_id else None,
+            lambda: manager.prefetch_all(message, session_id=session_id),
+            timeout=self._recall_timeout_seconds() if timeout is None else timeout,
+            log_fields={"agent_id": agent_id},
+        )
+
+    async def _recall_block_for_turn(self, *, agent_id: str, session_key: str, message: str) -> str:
+        return await self._fetch_prefetch_block(
+            agent_id=agent_id,
+            session_id=await self._resolve_session_id_for_prefetch(session_key),
+            message=message,
+        )
+
+    def _concurrent_turn_setup(self) -> bool:
+        task_runtime = getattr(self._config, "task_runtime", None)
+        return getattr(task_runtime, "concurrent_turn_setup", True) is not False
+
+    def _start_pre_provider_io(
+        self,
+        *,
+        agent_id: str,
+        session_key: str,
+        runtime_message: str,
+        router_exclude_last_user: bool,
+    ) -> PreProviderIO:
+        """Start the independent pre-provider reads (see ``pre_provider_io``)."""
+        from agentos.tools.deferred import hydrate_loaded_tools
+
+        concurrent = self._concurrent_turn_setup()
+        return PreProviderIO(
+            concurrent=concurrent,
+            # Gated on provider presence so the disabled default adds only a
+            # dict lookup.
+            recall=(
+                (
+                    lambda: self._recall_block_for_turn(
+                        agent_id=agent_id,
+                        session_key=session_key,
+                        message=runtime_message,
+                    )
+                )
+                if self._provider_manager_for(agent_id) is not None
+                else None
+            ),
+            project_knowledge=lambda: self._project_knowledge_block(session_key),
+            hydrate_tools=lambda: hydrate_loaded_tools(self._session_manager, session_key),
+            router_context=(
+                (
+                    lambda: self._router_previous_assistant_context(
+                        session_key,
+                        exclude_last_user=router_exclude_last_user,
+                    )
+                )
+                if concurrent
+                else None
+            ),
+            memory_warm=self._memory_warm_for(agent_id, session_key) if concurrent else None,
+        )
+
+    def _memory_warm_for(
+        self, agent_id: str, session_key: str
+    ) -> Callable[[], Coroutine[Any, Any, None]] | None:
+        sync_manager = (
+            self._memory_sync_managers.get(agent_id) if self._memory_sync_managers else None
+        )
+        if sync_manager is None:
+            return None
+        return lambda: sync_manager.warm_session(session_key)
+
     async def _augment_extra_context_with_prefetch(
         self,
         *,
@@ -2014,7 +2141,7 @@ class TurnRunner:
         session_id: str,
         message: str,
         extra_context: dict[str, str] | None,
-        timeout: float = 3.0,
+        timeout: float | None = None,
     ) -> dict[str, str] | None:
         """Return ``extra_context`` with the provider's fenced recall injected.
 
@@ -2025,33 +2152,13 @@ class TurnRunner:
         inject nothing, returning the context unchanged. No-op (returns the
         input object) when no provider is configured.
         """
-        manager = self._provider_manager_for(agent_id)
-        if manager is None or not message:
-            return extra_context
-        try:
-            block = await asyncio.wait_for(
-                manager.prefetch_all(message, session_id=session_id),
-                timeout=timeout,
-            )
-        except TimeoutError:
-            log.warning(
-                "turn_runner.memory_prefetch_timeout",
-                agent_id=agent_id,
-                timeout_seconds=timeout,
-            )
-            return extra_context
-        except Exception as exc:  # noqa: BLE001 — recall is best-effort
-            log.warning(
-                "turn_runner.memory_prefetch_failed",
-                agent_id=agent_id,
-                error=str(exc),
-            )
-            return extra_context
-        if not block:
-            return extra_context
-        merged = dict(extra_context) if extra_context else {}
-        merged["Memory Context"] = block
-        return merged
+        block = await self._fetch_prefetch_block(
+            agent_id=agent_id,
+            session_id=session_id,
+            message=message,
+            timeout=timeout,
+        )
+        return merge_extra_context_block(extra_context, MEMORY_CONTEXT_KEY, block)
 
     # Injection ceiling for project knowledge. Kept equal to
     # SessionManager.PROJECT_KNOWLEDGE_MAX_CHARS (a release-consistency test
@@ -2066,7 +2173,12 @@ class TurnRunner:
         session_key: str,
         extra_context: dict[str, str] | None,
     ) -> dict[str, str] | None:
-        """Return ``extra_context`` with the session's project knowledge injected.
+        """Return ``extra_context`` with the session's project knowledge injected."""
+        block = await self._project_knowledge_block(session_key)
+        return merge_extra_context_block(extra_context, PROJECT_KNOWLEDGE_KEY, block)
+
+    async def _project_knowledge_block(self, session_key: str) -> str | None:
+        """Return the session's wrapped project-knowledge block, or ``None``.
 
         Sessions grouped into a project share the project's free-form
         knowledge text: it is read fresh from storage each turn (an edit is
@@ -2077,10 +2189,10 @@ class TurnRunner:
         file content. Best-effort: any failure injects nothing.
         """
         if self._session_manager is None or not session_key:
-            return extra_context
+            return None
         getter = getattr(self._session_manager, "get_project_knowledge_for_session", None)
         if not callable(getter):
-            return extra_context
+            return None
         try:
             knowledge = await getter(session_key)
         except Exception as exc:  # noqa: BLE001 — knowledge injection is best-effort
@@ -2089,17 +2201,13 @@ class TurnRunner:
                 session_key=session_key,
                 error=str(exc),
             )
-            return extra_context
+            return None
         if not knowledge:
-            return extra_context
+            return None
         cap = self.PROJECT_KNOWLEDGE_INJECT_MAX_CHARS
         if len(knowledge) > cap:
             knowledge = knowledge[:cap] + "\n... [project knowledge truncated]"
-        merged = dict(extra_context) if extra_context else {}
-        merged["Project Knowledge"] = injection_guard.wrap_untrusted(
-            knowledge, source="project:knowledge"
-        )
-        return merged
+        return injection_guard.wrap_untrusted(knowledge, source="project:knowledge")
 
     async def _capture_turn_memory(
         self,
@@ -2677,6 +2785,7 @@ class TurnRunner:
         # Observability: bracket turn setup + stream loop with monotonic clock
         # so latency_ms reflects the full turn.
         turn_started_at = time.monotonic()
+        timing = TurnTiming()
         turn_id = uuid.uuid4().hex
         resolved_model = ""
         final_prompt_str = ""
@@ -2763,6 +2872,7 @@ class TurnRunner:
                 yield self._handle_runtime_warning(
                     WarningEvent(code="budget_warning", message=budget_message)
                 )
+            timing.stage_start("input")
             input_out = await self._input_stage.run(
                 InputStageInput(
                     message=message,
@@ -2775,36 +2885,26 @@ class TurnRunner:
                     session_append=self._session_manager,
                 )
             )
+            timing.stage_end("input")
             runtime_message = input_out.runtime_message
             semantic_input = input_out.semantic_input
             extra_prompt_context = input_out.extra_prompt_context
             normalization_metadata = input_out.normalization_metadata
 
-            # External memory provider PREFETCH (Plan B): inject this turn's
-            # recalled context as a per-turn volatile block. Gated on provider
-            # presence first so the disabled default adds only a dict lookup;
-            # bounded by a modest timeout so a slow provider cannot stall turns.
-            if self._provider_manager_for(agent_id) is not None:
-                extra_prompt_context = await self._augment_extra_context_with_prefetch(
-                    agent_id=agent_id,
-                    session_id=await self._resolve_session_id_for_prefetch(session_key),
-                    message=runtime_message,
-                    extra_context=extra_prompt_context,
-                )
-
-            # Project knowledge: sessions grouped into a project share the
-            # project's knowledge text as a per-turn prompt block. Read fresh
-            # each turn so a knowledge edit lands on the next turn.
-            extra_prompt_context = await self._augment_extra_context_with_project_knowledge(
+            # Provider recall (deadline-bounded), project knowledge, the
+            # deferred-tool hydrate and the router-context read do not depend
+            # on each other: they start together here and are applied at their
+            # old points in the old order (recall block, then project
+            # knowledge; hydrate before the tool list is built).
+            pre_io = self._start_pre_provider_io(
+                agent_id=agent_id,
                 session_key=session_key,
-                extra_context=extra_prompt_context,
+                runtime_message=runtime_message,
+                router_exclude_last_user=history_has_persisted_user or persist_input,
             )
-
-            # Loaded deferred tools persist with the session; read them back
-            # before the tool list for this turn is built.
-            from agentos.tools.deferred import hydrate_loaded_tools
-
-            await hydrate_loaded_tools(self._session_manager, session_key)
+            extra_prompt_context = await pre_io.extra_prompt_context(extra_prompt_context)
+            await pre_io.hydrate_tools()
+            timing.stage_start("provider_and_tools")
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
                     session_key=session_key,
@@ -2814,6 +2914,7 @@ class TurnRunner:
                     input_mode=input_mode,
                 )
             )
+            timing.stage_end("provider_and_tools")
             if pt_outcome.terminate:
                 # Harness performs the legacy observability + persist +
                 # yield sequence in the legacy ORDER (trace-emit, persist,
@@ -2846,6 +2947,7 @@ class TurnRunner:
             tool_context = pt_out.effective_tool_context
             tool_metadata = pt_out.tool_metadata
 
+            timing.stage_start("prompt_assembler")
             pa_outcome = await self._prompt_assembler_stage.run(
                 PromptAssemblerStageInput(
                     runtime_message=runtime_message,
@@ -2873,8 +2975,10 @@ class TurnRunner:
                     ),
                     ingress_pipeline_steps=ingress_pipeline_steps,
                     normalization_metadata=normalization_metadata,
+                    router_context=pre_io.router_context(),
                 )
             )
+            timing.stage_end("prompt_assembler")
             pa_out = pa_outcome.require_output()
             provider = pa_out.provider
             turn = pa_out.turn
@@ -2942,6 +3046,7 @@ class TurnRunner:
             router_event = build_router_decision_event(turn)
             if router_event is not None:
                 yield router_event
+            timing.stage_start("agent_bootstrap")
             ab_outcome = await self._agent_bootstrap_stage.run(
                 AgentBootstrapStageInput(
                     provider=provider,
@@ -2964,10 +3069,13 @@ class TurnRunner:
                     request_timeout=request_timeout,
                     max_provider_retries=max_provider_retries,
                     length_capped_continuations=length_capped_continuations,
+                    pending_memory_warm=pre_io.memory_warm(),
                 )
             )
+            timing.stage_end("agent_bootstrap")
             ab_out = ab_outcome.require_output()
             agent = ab_out.agent
+            agent.turn_timing = timing
             agent_config = ab_out.agent_config  # noqa: F841
             # These locals are read by the test_agent_bootstrap_stage_snapshot
             # frame-walking probe. Do not remove.
@@ -2994,6 +3102,7 @@ class TurnRunner:
             # before-turn step any more: the agent's CompactionService checks
             # the live request before every provider call (first one included)
             # with the configured ratio, and persists via CompactionEvent.
+            timing.stage_start("compaction_and_history")
             ch_outcome = await self._compaction_and_history_stage.run(
                 CompactionAndHistoryStageInput(
                     agent=agent,
@@ -3006,6 +3115,7 @@ class TurnRunner:
                     ),
                 )
             )
+            timing.stage_end("compaction_and_history")
             ch_out = ch_outcome.require_output()
             agent.config.request_context_prompt = ch_out.final_request_context_prompt
             agent.config.context_overflow_threshold = self._preflight_compact_ratio()
@@ -3021,12 +3131,14 @@ class TurnRunner:
 
             # 8. Build extra messages for attachments + turn_input rebind.
             # AttachmentStage owns the slice.
+            timing.stage_start("attachment")
             att_outcome = await self._attachment_stage.run(
                 AttachmentStageInput(
                     effective_runtime_message=effective_runtime_message,
                     attachments=attachments,
                 )
             )
+            timing.stage_end("attachment")
             att_out = att_outcome.require_output()
             extra_msgs = att_out.extra_messages
 
@@ -3072,12 +3184,14 @@ class TurnRunner:
                 tool_context=tool_context,
             )
             router_control_replay_event: RouterControlReplayEvent | None = None
+            timing.stage_start("stream_consumer")
             async for event in self._stream_consumer_stage.run(stream_inp):
                 if isinstance(event, RouterControlReplayEvent):
                     router_control_replay_event = event
                     yield event
                     break
                 yield event
+            timing.stage_end("stream_consumer")
             if router_control_replay_event is not None:
                 async for replayed_event in self._run_turn(
                     message,
@@ -3129,6 +3243,7 @@ class TurnRunner:
             # fire in legacy order: heartbeat normalize -> transcript
             # append -> memory capture (try/except) -> error persist ->
             # session totals rollup (try/except).
+            timing.stage_start("turn_finalizer")
             fin_outcome = await self._turn_finalizer_stage.run(
                 TurnFinalizerStageInput(
                     final_text_parts=final_text_parts,
@@ -3150,6 +3265,7 @@ class TurnRunner:
                     provider_messages=transcript_record_of(agent, artifacts=turn_artifacts),
                 )
             )
+            timing.stage_end("turn_finalizer")
             fin_out = fin_outcome.require_output()
             final_text = fin_out.final_text
             turn_segments = fin_out.turn_segments
@@ -3226,6 +3342,7 @@ class TurnRunner:
                 done_event=done_event,
                 trace_id=trace_context.trace_id if trace_context is not None else None,
                 skills_invoked=collect_invoked_skills(turn_segments),
+                timing=timing.summary(),
             )
             if pending_error_event is not None:
                 yield pending_error_event
@@ -3354,6 +3471,7 @@ class TurnRunner:
             # here. A reservation that outlived its turn would permanently
             # shrink the ceiling for everyone else.
             self._release_spend_budget(budget_reservation)
+            emit_turn_timing_log(timing, session_key=session_key, turn_id=turn_id)
 
     @staticmethod
     def _write_trace_event(
@@ -3998,7 +4116,51 @@ class TurnRunner:
             metadata.get("thinking_level", "medium"),
             source="agentos_router",
         )
+        if isinstance(parsed, ThinkingLevel):
+            parsed = self._effort_by_tier(parsed, metadata)
         return parsed if parsed is not None else False
+
+    def _effort_by_tier(self, level: ThinkingLevel, metadata: Mapping[str, Any]) -> ThinkingLevel:
+        """Cap a router-chosen thinking level at the routed tier's ceiling.
+
+        Router-owned levels are capped: the shipped tier level
+        (``tier_default``) and the pilot controller's per-turn pick
+        (``controller``), which is what the default ``pilot-v1`` strategy
+        uses on every routed turn. User intent is never capped: an
+        operator-configured tier level (``tier_config``), a router-control
+        hold (the user picked the route), an explicit ``[llm] thinking``
+        (handled before this) or a route the turn did not honor stay as they
+        are. ``[agentos_router] effort_by_tier = false``
+        turns it off. The model choice is never touched.
+        """
+        from agentos.router_tiers import effort_for_tier
+
+        router_cfg = getattr(self._config, "agentos_router", None) if self._config else None
+        if not getattr(router_cfg, "effort_by_tier", True):
+            return level
+        if metadata.get("router_control_hold_applied"):
+            return level
+        if metadata.get("thinking_level_source") not in _EFFORT_BY_TIER_SOURCES:
+            return level
+        if metadata.get("routing_applied") is False:
+            return level
+        tier = metadata.get("routed_tier")
+        capped = ThinkingLevel(effort_for_tier(tier, level.value))
+        if capped is not level:
+            log.info(
+                "turn_runner.effort_by_tier",
+                tier=tier,
+                thinking_level=capped.value,
+                tier_level=level.value,
+                source=metadata.get("thinking_level_source"),
+            )
+        return capped
+
+    def _resolve_parallel_tool_calls(self) -> bool:
+        """``[tools] parallel_calls``: ask providers for parallel tool calls."""
+
+        tools_cfg = getattr(self._config, "tools", None) if self._config else None
+        return bool(getattr(tools_cfg, "parallel_calls", True))
 
     @staticmethod
     def _parse_thinking_level(value: Any, *, source: str) -> bool | ThinkingLevel | None:
@@ -4947,9 +5109,34 @@ class TurnRunner:
         *,
         exclude_last_user: bool = False,
     ) -> dict[str, Any]:
-        """Return transcript context for the V4 router, excluding the current user turn."""
+        """Return transcript context for the V4 router, excluding the current user turn.
+
+        Reads the newest ``_ROUTER_CONTEXT_WINDOW_ENTRIES`` rows first: the
+        context only needs the last few user texts and the last assistant
+        text, and deserializing a long session's whole transcript on every
+        turn is the expensive part. When the window does not hold all of
+        that, the whole transcript is read as before, so the result is the
+        same either way.
+        """
         if self._session_manager is None:
             return {}
+        get_recent = getattr(type(self._session_manager), "get_recent_transcript", None)
+        if get_recent is not None:
+            try:
+                recent = list(
+                    await self._session_manager.get_recent_transcript(
+                        session_key, _ROUTER_CONTEXT_WINDOW_ENTRIES
+                    )
+                    or []
+                )
+            except Exception:  # noqa: BLE001 - fall back to the full read below
+                recent = None
+            if recent is not None:
+                context, complete = self._router_context_from_entries(
+                    recent, exclude_last_user=exclude_last_user
+                )
+                if complete or len(recent) < _ROUTER_CONTEXT_WINDOW_ENTRIES:
+                    return context
         get_transcript = getattr(self._session_manager, "get_transcript", None)
         if not callable(get_transcript):
             return {}
@@ -4960,7 +5147,23 @@ class TurnRunner:
         except Exception:  # noqa: BLE001 - router context must never block a turn
             log.debug("turn_runner.router_context_failed", session_key=session_key)
             return {}
-        entries = list(transcript or [])
+        context, _complete = self._router_context_from_entries(
+            list(transcript or []), exclude_last_user=exclude_last_user
+        )
+        return context
+
+    def _router_context_from_entries(
+        self,
+        entries: list[Any],
+        *,
+        exclude_last_user: bool,
+    ) -> tuple[dict[str, Any], bool]:
+        """Build the router context from ``entries`` (oldest first).
+
+        The flag says whether ``entries`` held everything the context can use
+        (a full set of recent user texts and an assistant text), i.e. whether
+        any older rows could still change the result.
+        """
         user_texts: list[str] = []
         for index, entry in enumerate(entries):
             if getattr(entry, "role", None) != "user":
@@ -4979,6 +5182,7 @@ class TurnRunner:
         context: dict[str, Any] = {}
         if user_texts:
             context["history_user_texts"] = user_texts[-_ROUTER_HISTORY_USER_MAX_TURNS:]
+        users_complete = len(user_texts) >= _ROUTER_HISTORY_USER_MAX_TURNS
 
         for entry in reversed(entries):
             if getattr(entry, "role", None) != "assistant":
@@ -4997,8 +5201,8 @@ class TurnRunner:
                 and token_count > 0
             ):
                 context["prev_assistant_usage"] = {"output_tokens": token_count}
-            return context
-        return context
+            return context, users_complete
+        return context, False
 
     def _resolve_prompt_config(self, turn: Any) -> tuple[str, list | None, str | None]:
         """Resolve final system prompt and cache breakpoints from pipeline output."""
@@ -5066,6 +5270,7 @@ class TurnRunner:
         done_event: DoneEvent | None = None,
         trace_id: str | None = None,
         skills_invoked: list[str] | None = None,
+        timing: dict[str, Any] | None = None,
     ) -> None:
         """Write one DecisionEntry for this turn (best-effort, never raises).
 
@@ -5322,6 +5527,7 @@ class TurnRunner:
                     if done_event is not None and done_event.stop_reason == "refusal"
                     else None
                 ),
+                timing=timing or {},
             )
             write_decision_entry(entry)
         except Exception as exc:  # pragma: no cover — observability must not break turns

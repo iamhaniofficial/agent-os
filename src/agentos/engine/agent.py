@@ -11,7 +11,7 @@ import hashlib
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -26,6 +26,7 @@ from agentos.engine.cache_break_monitor import (
     record_prompt_state,
 )
 from agentos.engine.compaction_service import CompactionService, auxiliary_chunk_summarizer
+from agentos.engine.estimate_calibration import EstimateCalibration, request_has_media
 from agentos.engine.fallback import FallbackPolicy, backoff_sleep, retry_after_delay
 from agentos.engine.history import limit_turns, repair_tool_pairing
 from agentos.engine.progress_watchdog import (
@@ -76,6 +77,7 @@ from agentos.engine.transcript import (
 from agentos.engine.transcript import (
     TOOL_ARGUMENT_PROJECTION_PREFIX as _TOOL_ARGUMENT_PROJECTION_PREFIX,
 )
+from agentos.engine.turn_timing import NULL_TURN_TIMING, TurnTiming
 from agentos.engine.verification_ledger import (
     VerificationLedger,
     build_verification_nudge,
@@ -298,6 +300,12 @@ def _pending_approval_payload(content: str) -> dict[str, Any] | None:
     if not isinstance(approval_id, str) or not approval_id:
         return None
     return payload
+
+
+async def _await_outside_slot(awaitable: Awaitable[Any]) -> Any:
+    """Identity wrapper for an inline approval wait, so timing can wrap it."""
+
+    return await awaitable
 
 
 async def _wait_for_pending_approval_resolution(
@@ -696,6 +704,15 @@ class Agent:
       IDLE -> THINKING -> STREAMING -> [TOOL_CALLING -> THINKING -> ...] -> DONE
       Any step can transition to ERROR.
     """
+
+    #: Per-turn timing recorder; the runtime assigns a fresh one per turn.
+    turn_timing: TurnTiming = NULL_TURN_TIMING
+    # Runtime-owned estimator calibration (set by the TurnRunner before the
+    # turn runs); ``None`` keeps the raw estimate. Last request's size minus
+    # its messages (system prompt, tools, config), for the between-turns
+    # proactive compaction check.
+    estimate_calibration: EstimateCalibration | None = None
+    _last_request_overhead_tokens: int | None = None
 
     def __init__(
         self,
@@ -1418,6 +1435,8 @@ class Agent:
             ),
             provider_request_max_chars=self._provider_request_proof_max_chars(),
             tool_choice=None,
+            # Only an opt-in: the providers drop it where the API would reject it.
+            parallel_tool_calls=True if self.config.parallel_tool_calls else None,
             context_window_tokens=self.config.context_window_tokens,
         )
         _thinking_fallback_done = False
@@ -1800,6 +1819,9 @@ class Agent:
                         tools=provider_tools_for_call,
                         config=call_chat_cfg,
                     )
+                    self._last_request_overhead_tokens = max(
+                        0, estimated_context_tokens - self._message_tokens(request_messages)
+                    )
                     overflow_outcome = await self._preflight_context_overflow(
                         turn_messages,
                         estimated_context_tokens,
@@ -1845,6 +1867,12 @@ class Agent:
                                 else None
                             ),
                         )
+                        # Calibrate against the request actually sent.
+                        estimated_context_tokens = self._estimate_live_request_tokens(
+                            request_messages,
+                            tools=provider_tools_for_call,
+                            config=call_chat_cfg,
+                        )
                         self._write_context_stage(
                             "stream:context:compacted",
                             request_messages,
@@ -1880,10 +1908,12 @@ class Agent:
                             tools=provider_tools_for_call,
                             config=call_chat_cfg,
                         )
-                        async for raw_ev in self._stream_provider_events_with_deadline(
-                            raw_stream,
-                            loop=_loop,
-                            total_deadline=_total_deadline,
+                        async for raw_ev in self.turn_timing.provider_stream(
+                            self._stream_provider_events_with_deadline(
+                                raw_stream,
+                                loop=_loop,
+                                total_deadline=_total_deadline,
+                            )
                         ):
                             if isinstance(raw_ev, ProviderTextDelta):
                                 assistant_text_parts.append(raw_ev.text)
@@ -1982,7 +2012,14 @@ class Agent:
                                 provider_done_for_log = raw_ev
                                 _got_done_event = True
                                 # Make the estimator's drift visible: the
-                                # compaction trigger runs on this estimate.
+                                # compaction trigger runs on this estimate,
+                                # scaled by the calibration it feeds.
+                                calibration_factor = self._observe_estimate(
+                                    estimated_context_tokens,
+                                    raw_ev.input_tokens,
+                                    usage_estimated=raw_ev.usage_estimated,
+                                    request_messages=request_messages,
+                                )
                                 logger.debug(
                                     "agent.context_estimate_vs_provider",
                                     session_key=self._session_key,
@@ -1991,6 +2028,7 @@ class Agent:
                                     provider_input_tokens=raw_ev.input_tokens,
                                     provider_cached_tokens=raw_ev.cached_tokens,
                                     provider_cache_write_tokens=raw_ev.cache_write_tokens,
+                                    calibration_factor=calibration_factor,
                                 )
                                 iter_input_tokens = raw_ev.input_tokens
                                 iter_output_tokens = raw_ev.output_tokens
@@ -3040,7 +3078,10 @@ class Agent:
                     heartbeat_interval=self._tool_activity_heartbeat_interval(),
                     approval_wait_timeout=self._approval_wait_timeout(),
                     pending_approval=_pending_approval_payload,
-                    wait_for_approval=_wait_for_pending_approval_resolution,
+                    wait_for_approval=self.turn_timing.timed_approval(
+                        _wait_for_pending_approval_resolution
+                    ),
+                    outside_wait=self.turn_timing.timed_approval(_await_outside_slot),
                     artifact_event=lambda a: ArtifactEvent(**_artifact_event_kwargs(a)),
                     pending_warnings=self._pending_warnings,
                     preflight_results=preflight_tool_results,
@@ -3048,7 +3089,9 @@ class Agent:
                     iteration=iterations,
                     clock=_loop.time,
                 )
-                async for event in tool_batch.run(tool_calls):
+                async for event in self.turn_timing.tool_batch(
+                    tool_batch.run(tool_calls), calls=len(tool_calls)
+                ):
                     yield event
                 tool_result_blocks = tool_batch.result_blocks()
                 executed_results = tool_batch.executed_results
@@ -3774,6 +3817,42 @@ class Agent:
     def _message_tokens(self, messages: Sequence[Message]) -> int:
         return max(0, self._message_sizes.messages_chars(messages) // 4)
 
+    def _calibration_key(self) -> tuple[str, str]:
+        return str(getattr(self.provider, "provider_name", "") or ""), str(
+            self.config.model_id or ""
+        )
+
+    def estimate_scale(self) -> float:
+        """Calibration factor for this provider/model's estimates (1.0 = raw)."""
+        if self.estimate_calibration is None:
+            return 1.0
+        return self.estimate_calibration.factor(*self._calibration_key())
+
+    def _observe_estimate(
+        self,
+        estimated_tokens: int,
+        provider_input_tokens: int,
+        *,
+        usage_estimated: bool = False,
+        request_messages: Sequence[Message] = (),
+    ) -> float:
+        """Feed one provider usage sample to the calibration; return the factor.
+
+        Estimated usage and requests with image/document blocks are skipped.
+        """
+        if self.estimate_calibration is None:
+            return 1.0
+        provider, model = self._calibration_key()
+        self.estimate_calibration.observe(
+            provider,
+            model,
+            estimated_tokens=estimated_tokens,
+            provider_input_tokens=provider_input_tokens,
+            usage_estimated=usage_estimated,
+            has_media=not usage_estimated and request_has_media(request_messages),
+        )
+        return round(self.estimate_calibration.factor(provider, model), 3)
+
     def _compaction_service(self, *, window_tokens: int | None = None) -> CompactionService:
         del window_tokens
         hint = getattr(self.config, "compaction_summary_model_hint", None) or ("", "")
@@ -3826,11 +3905,16 @@ class Agent:
 
         Returns an uncompacted outcome when the request is under the threshold
         or there is nothing to compact, and ``None`` when compaction failed.
+
+        The estimate (and every message-size estimate the service makes) is
+        scaled by the provider/model calibration factor, 1.0 until calibrated.
         """
+        scale = self.estimate_scale()
         return await self._check_context_overflow(
             turn_messages,
-            estimated_context_tokens,
+            max(1, int(estimated_context_tokens * scale)),
             turn_input_index=turn_input_index,
+            token_scale=scale,
         )
 
     async def _check_context_overflow(
@@ -3841,6 +3925,7 @@ class Agent:
         turn_input_index: int | None = None,
         compaction_window_tokens: int | None = None,
         force: bool = False,
+        token_scale: float = 1.0,
     ) -> CompactionOutcome | None:
         """Run the compaction service; ``None`` signals a failed compaction."""
         self._last_compaction_refusal_reason = None
@@ -3856,7 +3941,11 @@ class Agent:
             turn_input_index=input_index,
             estimated_tokens=estimated_context_tokens,
             window_tokens=window_tokens,
-            message_tokens=self._message_tokens,
+            message_tokens=(
+                self._message_tokens
+                if token_scale == 1.0
+                else lambda items: int(self._message_tokens(items) * token_scale)
+            ),
             force=force,
             input_entry=self._compaction_input_entry(),
             budget_tokens=self._compaction_budget_tokens(),
@@ -4230,6 +4319,7 @@ class Agent:
             tool_use_argument_projection_enabled=(self.config.tool_use_argument_projection_enabled),
             tool_failure_loop_block_threshold=(self.config.tool_failure_loop_block_threshold),
             max_safe_tool_concurrency=self.config.max_safe_tool_concurrency,
+            parallel_tool_calls=self.config.parallel_tool_calls,
             tool_result_store_dir=self.config.tool_result_store_dir,
             tool_result_store_session_id=self.config.tool_result_store_session_id,
             tool_result_store_session_key=self.config.tool_result_store_session_key,

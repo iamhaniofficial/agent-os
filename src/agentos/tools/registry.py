@@ -455,6 +455,7 @@ def tool(
     concurrency_key: ToolConcurrencyKey | None = None,
     read_only: bool = False,
     requires_approval: bool = False,
+    early_approval: bool = False,
 ) -> Any:
     """Decorator to register an async function as a tool.
 
@@ -483,6 +484,7 @@ def tool(
             concurrency_key=concurrency_key,
             read_only=read_only,
             requires_approval=requires_approval,
+            early_approval=early_approval,
         )
         target = registry if registry is not None else _default_registry
         target.register(spec, fn)

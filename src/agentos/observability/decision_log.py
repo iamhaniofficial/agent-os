@@ -19,7 +19,7 @@ import re
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
 
@@ -29,7 +29,7 @@ from agentos.redact import mask_url_userinfo
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 _INTENT_SUMMARY_MAX_CHARS = 500
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _URL_RE = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
@@ -186,6 +186,11 @@ class DecisionEntry:
     # safety category when the model declined. Added in schema 15.
     stop_reason: str | None = None
     refusal_category: str | None = None
+    # Wall-clock breakdown of the turn (engine/turn_timing.py
+    # ``TurnTiming.summary()``): totals in integer ms, per-stage durations,
+    # per provider call and per tool batch detail. Empty for rows written
+    # before schema 16. Added in schema 16.
+    timing: dict[str, Any] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
 
 
@@ -396,4 +401,6 @@ def _coerce_decision_payload(payload: dict) -> dict:
     if "trace_id" not in normalized:
         turn_id = normalized.get("turn_id")
         normalized["trace_id"] = turn_id if isinstance(turn_id, str) else None
+    if not isinstance(normalized.get("timing", {}), dict):
+        normalized["timing"] = {}
     return normalized

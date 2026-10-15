@@ -215,6 +215,13 @@ class ToolSpec:
     # ``approval_required`` envelope). Descriptive only: whether a given call
     # needs approval is still decided inside the tool.
     requires_approval: bool = False
+    # Scheduling contract, not a description: the tool raises any approval
+    # prompt before it acts and calls
+    # ``agentos.tools.batch_slot.wait_for_batch_turn()`` before acting. An
+    # ``exclusive`` call of such a tool may then be started while earlier
+    # calls of its batch still wait for their approvals, so every prompt of
+    # the batch is pending at once while the bodies still run in order.
+    early_approval: bool = False
     defer_loading: bool = False  # left out of requests until tool_search loads it
 
 

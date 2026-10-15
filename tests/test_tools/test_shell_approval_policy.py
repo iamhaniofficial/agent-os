@@ -1590,3 +1590,111 @@ async def test_retry_approval_timeout_returns_pending_and_no_ledger_denial(
     entry = get_approval_queue().get(approval_id)
     assert entry.resolved is False
     assert entry.approved is False
+
+
+@pytest.mark.asyncio
+async def test_web_inline_approvals_of_one_batch_are_all_requested_at_once() -> None:
+    """Two exec calls in one batch on the Web UI: both prompts are pending together.
+
+    exec is ``exclusive`` and, on the Web UI, waits for its approval inside the
+    tool call. Holding the exclusive slot during that wait used to keep the
+    second call from even asking until the operator answered the first.
+    """
+    from agentos.engine.tool_batch import ToolBatchExecutor, registry_spec_lookup
+    from agentos.engine.types import ToolCall, ToolResult
+
+    queue = get_approval_queue()
+    current_tool_context.set(
+        ToolContext(caller_kind=CallerKind.WEB, session_key="agent:main:webchat:batch")
+    )
+
+    async def execute(call: ToolCall) -> ToolResult:
+        outcome = await shell._check_exec_approval(
+            "exec_command",
+            call.arguments["command"],
+            None,
+            "command requires approval",
+            None,
+            False,
+        )
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="approved" if outcome is None else json.dumps(outcome),
+        )
+
+    async def project(result: ToolResult, *, tool_call: ToolCall | None = None) -> ToolResult:
+        return result
+
+    loop = asyncio.get_running_loop()
+    executor = ToolBatchExecutor(
+        execute=execute,
+        project=project,
+        timeout_for=lambda _call: 30.0,
+        # exec's real spec: exclusive, and early_approval so it may ask ahead.
+        spec_for=registry_spec_lookup(None),
+        deadline=loop.time() + 30.0,
+        iteration_timeout=30.0,
+    )
+    calls = [
+        ToolCall(tool_use_id=f"t{i}", tool_name="exec_command", arguments={"command": cmd})
+        for i, cmd in enumerate(["rm a.txt", "rm b.txt"])
+    ]
+    consumer = asyncio.create_task(_drain_batch(executor, calls))
+
+    for _ in range(400):
+        if len(queue.list_pending("exec")) == 2:
+            break
+        await asyncio.sleep(0.005)
+    pending = queue.list_pending("exec")
+    assert len(pending) == 2, "the second exec never asked while the first waited"
+
+    for entry in pending:
+        queue.resolve(entry["id"], True)
+    await asyncio.wait_for(consumer, timeout=5.0)
+
+    assert [o.result.content for o in executor.outcomes] == ["approved", "approved"]
+
+
+async def _drain_batch(executor, calls) -> None:
+    async for _event in executor.run(calls):
+        pass
+
+
+def test_shell_tools_declare_early_approval() -> None:
+    from agentos.tools.registry import get_default_registry
+
+    registry = get_default_registry()
+    for name in ("exec_command", "background_process"):
+        registered = registry.get(name)
+        assert registered is not None
+        assert registered.spec.concurrency == "exclusive"
+        assert registered.spec.early_approval is True
+
+
+@pytest.mark.asyncio
+async def test_exec_command_waits_for_its_batch_turn_before_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``early_approval`` lets the batch start exec ahead of earlier calls; it must
+    not run its command until they have finished."""
+
+    order: list[str] = []
+
+    async def fake_turn() -> None:
+        order.append("turn")
+
+    async def fake_run(*args: object, **kwargs: object) -> str:
+        order.append("run")
+        return "ran"
+
+    monkeypatch.setattr(shell, "wait_for_batch_turn", fake_turn)
+    monkeypatch.setattr(shell, "_run_exec_subprocess", fake_run)
+    monkeypatch.setattr(
+        shell,
+        "check_safe_bin",
+        lambda command: PolicyResult(allowed=True, reason="", needs_approval=False),
+    )
+
+    assert await shell.exec_command("echo hi") == "ran"
+    assert order == ["turn", "run"]

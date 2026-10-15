@@ -18,6 +18,7 @@ import agentos.engine.runtime as runtime_module
 from agentos.engine import Agent, AgentConfig, ToolResult
 from agentos.engine.tool_batch import (
     ToolBatchExecutor,
+    _Admission,
     _OrderedGate,
     registry_spec_lookup,
     resolve_tool_concurrency,
@@ -28,6 +29,7 @@ from agentos.provider import DoneEvent as ProviderDone
 from agentos.provider import TextDeltaEvent as ProviderTextDelta
 from agentos.provider import ToolUseEndEvent as ProviderToolUseEnd
 from agentos.provider import ToolUseStartEvent as ProviderToolUseStart
+from agentos.tools.batch_slot import wait_for_batch_turn, wait_outside_tool_slot
 from agentos.tools.registry import ToolRegistry, tool
 from agentos.tools.types import ToolSpec
 
@@ -394,29 +396,112 @@ async def test_pairing_survives_exception_timeout_and_batch_deadline() -> None:
     assert not outcomes[2].result.is_error
 
 
+class _FakeClock:
+    """The batch clock, moved only by the test."""
+
+    def __init__(self, now: float = 1_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _clocked_executor(
+    execute: Callable[[ToolCall], Awaitable[ToolResult]],
+    specs: dict[str, ToolSpec],
+    clock: _FakeClock,
+    *,
+    batch_seconds: float = 10.0,
+    **kwargs: Any,
+) -> ToolBatchExecutor:
+    # Every budget is long in real time (the per-tool ``wait_for`` uses the
+    # real loop clock), so only the fake clock can end the batch.
+    kwargs.setdefault("heartbeat_interval", 0.005)
+    return ToolBatchExecutor(
+        execute=execute,
+        project=_identity_project,
+        timeout_for=lambda _call: 30.0,
+        spec_for=specs.get,
+        deadline=clock() + batch_seconds,
+        iteration_timeout=batch_seconds,
+        clock=clock,
+        **kwargs,
+    )
+
+
 async def test_batch_deadline_times_out_running_and_queued_calls() -> None:
+    """The deadline passes while t0 runs: t0 is cancelled, queued t1 never starts.
+
+    Deterministic: the batch clock is fake and crosses the deadline only once
+    t0 is known to be running, and no real timer is short enough to fire.
+    """
+
     specs = {"hang": _spec("hang")}  # exclusive: t1 is still queued at the deadline
+    clock = _FakeClock()
+    started: list[str] = []
     cancelled: list[str] = []
+    t0_running = asyncio.Event()
 
     async def execute(call: ToolCall) -> ToolResult:
+        started.append(call.tool_use_id)
+        t0_running.set()
         try:
-            await asyncio.sleep(30)
+            await asyncio.Event().wait()
         except asyncio.CancelledError:
             cancelled.append(call.tool_use_id)
             raise
         return _ok(call)
 
-    executor = _executor(execute, specs, batch_seconds=0.05, tool_seconds=30)
-    events = await _drain(executor, [_call(0, "hang"), _call(1, "hang")])
+    async def _cross_deadline() -> None:
+        await t0_running.wait()
+        clock.now += 10.0
+
+    executor = _clocked_executor(execute, specs, clock)
+    crosser = asyncio.create_task(_cross_deadline())
+    events = await asyncio.wait_for(_drain(executor, [_call(0, "hang"), _call(1, "hang")]), 5.0)
+    await crosser
 
     assert _result_ids(events) == ["t0", "t1"]
+    assert started == ["t0"]
     assert cancelled == ["t0"]
     for outcome in executor.outcomes:
         assert outcome.result.is_error
-        # The per-tool timeout is capped by the batch deadline, so whichever
-        # fires first reports it; either way the call times out.
-        assert "timed out after" in outcome.result.content
-    assert executor.outcomes[1].result.content.endswith("timed out after 0.05s")
+        assert outcome.result.content.endswith("timed out after 10.0s")
+
+
+async def test_queued_call_is_not_started_once_the_batch_deadline_has_passed() -> None:
+    """Regression for the windows-latest flake.
+
+    t0 ends on its own exactly at the batch deadline (its timeout is capped to
+    the batch's remaining time, so both expire together). That frees the gate
+    and admits t1 before the batch loop sees the deadline; t1 must time out
+    unstarted rather than run a tool the batch has already given up on.
+    """
+
+    specs = {"hang": _spec("hang")}
+    clock = _FakeClock()
+    started: list[str] = []
+
+    async def execute(call: ToolCall) -> ToolResult:
+        started.append(call.tool_use_id)
+        if call.tool_use_id == "t0":
+            clock.now += 10.0  # the deadline passes while t0 is running
+            return ToolResult(
+                tool_use_id=call.tool_use_id,
+                tool_name=call.tool_name,
+                content="Tool 'hang' timed out after 10.0s",
+                is_error=True,
+            )
+        return _ok(call)
+
+    executor = _clocked_executor(execute, specs, clock, heartbeat_interval=15.0)
+    events = await asyncio.wait_for(_drain(executor, [_call(0, "hang"), _call(1, "hang")]), 5.0)
+
+    assert started == ["t0"]
+    assert _result_ids(events) == ["t0", "t1"]
+    assert [o.result.tool_use_id for o in executor.outcomes] == ["t0", "t1"]
+    assert executor.outcomes[1].result.is_error
+    assert executor.outcomes[1].result.content.endswith("timed out after 10.0s")
 
 
 async def test_heartbeat_while_tools_run() -> None:
@@ -546,6 +631,347 @@ async def test_approvals_are_awaited_concurrently_and_retried_as_granted() -> No
     assert outcomes[1].call.arguments == {"approval_id": "ap-t1"}
 
 
+async def _until(predicate: Callable[[], bool], *, limit: int = 500) -> None:
+    """Yield to the loop until *predicate* holds (bounded, no wall clock)."""
+
+    for _ in range(limit):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never became true")
+
+
+async def test_inline_approval_waits_free_the_exclusive_slot() -> None:
+    """Calls that wait for approval inside the tool (exec on the Web UI) ask at once.
+
+    Both exclusive calls must have requested their approval before either is
+    answered, and a parallel call queued behind them runs meanwhile. Once
+    approved, the tool bodies still run one at a time, and the transcript
+    order is the order the model emitted the calls.
+    """
+
+    specs = {
+        "exec": _spec("exec", early_approval=True),
+        "read": _spec("read", concurrency="parallel"),
+    }
+    loop = asyncio.get_running_loop()
+    decisions: dict[str, asyncio.Future[bool]] = {}
+    tracker = _Tracker()
+    bodies: list[str] = []
+
+    async def execute(call: ToolCall) -> ToolResult:
+        if call.tool_name == "read":
+            tracker.enter(call)
+            tracker.leave(call)
+            return _ok(call, "read")
+        decisions[call.tool_use_id] = loop.create_future()
+        approved = await wait_outside_tool_slot(decisions[call.tool_use_id])
+        tracker.enter(call)
+        bodies.append(call.tool_use_id)
+        for _ in range(5):  # give an overlapping body every chance to show up
+            await asyncio.sleep(0)
+        tracker.leave(call)
+        return _ok(call, f"ran {call.tool_use_id}" if approved else "denied")
+
+    executor = _executor(execute, specs)
+    results: list[ToolResultEvent] = []
+
+    async def _consume() -> None:
+        async for event in executor.run([_call(0, "exec"), _call(1, "exec"), _call(2, "read")]):
+            if isinstance(event, ToolResultEvent):
+                results.append(event)
+
+    consumer = asyncio.create_task(_consume())
+    await _until(lambda: len(decisions) == 2 and any(r.tool_use_id == "t2" for r in results))
+    assert not any(future.done() for future in decisions.values())
+
+    # Answer the second first, then the first; then both bodies race for the slot.
+    decisions["t1"].set_result(True)
+    decisions["t0"].set_result(True)
+    await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert not tracker.ever_together("t0", "t1")
+    # Approved out of order, the commands still run in the order emitted.
+    assert bodies == ["t0", "t1"]
+    assert [o.result.tool_use_id for o in executor.outcomes] == ["t0", "t1", "t2"]
+    assert [o.result.content for o in executor.outcomes] == ["ran t0", "ran t1", "read"]
+    assert sorted(r.tool_use_id for r in results) == ["t0", "t1", "t2"]
+
+
+async def test_inline_approval_wait_keeps_key_lock_order_after_readmission() -> None:
+    """A keyed call that waits outside its slot re-takes its key before running."""
+
+    specs = {"k": _spec("k", concurrency="keyed")}
+    loop = asyncio.get_running_loop()
+    gate_open: asyncio.Future[bool] = loop.create_future()
+    tracker = _Tracker()
+
+    async def execute(call: ToolCall) -> ToolResult:
+        if call.tool_use_id == "t0":
+            await wait_outside_tool_slot(gate_open)
+        tracker.enter(call)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        tracker.leave(call)
+        return _ok(call, call.tool_use_id)
+
+    executor = _executor(execute, specs)
+    consumer = asyncio.create_task(_drain(executor, [_call(0, "k"), _call(1, "k")]))
+    await _until(lambda: "t1" in {c for seen in tracker.overlaps for c in seen})
+    gate_open.set_result(True)
+    await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert not tracker.ever_together("t0", "t1")
+    assert [o.result.content for o in executor.outcomes] == ["t0", "t1"]
+
+
+async def test_batch_deadline_while_waiting_outside_the_slot_pairs_every_call() -> None:
+    specs = {"exec": _spec("exec", early_approval=True)}
+    clock = _FakeClock()
+    loop = asyncio.get_running_loop()
+    waiting: list[str] = []
+    never: asyncio.Future[bool] = loop.create_future()
+
+    async def execute(call: ToolCall) -> ToolResult:
+        waiting.append(call.tool_use_id)
+        await wait_outside_tool_slot(asyncio.shield(never))
+        return _ok(call)
+
+    async def _cross_deadline() -> None:
+        await _until(lambda: len(waiting) == 2)
+        clock.now += 10.0
+
+    executor = _clocked_executor(execute, specs, clock)
+    crosser = asyncio.create_task(_cross_deadline())
+    events = await asyncio.wait_for(_drain(executor, [_call(0, "exec"), _call(1, "exec")]), 5.0)
+    await crosser
+
+    assert sorted(_result_ids(events)) == ["t0", "t1"]
+    assert all("timed out" in o.result.content for o in executor.outcomes)
+    never.cancel()
+
+
+async def test_time_queued_for_readmission_does_not_count_against_the_call_timeout() -> None:
+    """Like a CLI retry, whose timer starts once admitted: waiting for another
+    call's command to finish before running is not the call's own run time."""
+
+    gate = _OrderedGate()
+    admission = _Admission(gate=gate, slot=gate.reserve(exclusive=True), exclusive=True)
+    await admission.acquire()
+    held_for = 0.02
+
+    async def _other_call() -> None:
+        other = gate.reserve(exclusive=True)
+        await other.future  # admitted once ``admission`` steps out
+        await _until(lambda: bool(gate._queue))  # ``admission`` queued again
+        await asyncio.sleep(held_for)  # the other call's command runs
+        gate.release(other)
+
+    other_task = asyncio.create_task(_other_call())
+    async with asyncio.timeout(30.0) as scope:
+        admission.timeout_scope = scope
+        original = scope.when()
+        assert original is not None
+        await admission.wait_outside(asyncio.sleep(0))
+        extended = scope.when()
+    await other_task
+
+    assert extended is not None and extended - original >= held_for
+    assert not admission.yielded
+    admission.release()
+
+
+async def test_wait_outside_tool_slot_is_a_plain_await_outside_a_batch() -> None:
+    async def _value() -> int:
+        return 7
+
+    assert await wait_outside_tool_slot(_value()) == 7
+    await wait_for_batch_turn()  # a no-op outside a batch
+
+
+def _exec_like(
+    decisions: dict[str, asyncio.Future[bool]], ran: list[str], entered: list[str]
+) -> Callable[[ToolCall], Awaitable[ToolResult]]:
+    """Mirror exec_command: an optional inline approval, then the turn, then the command."""
+
+    async def execute(call: ToolCall) -> ToolResult:
+        entered.append(call.tool_use_id)
+        decision = decisions.get(call.tool_use_id)
+        if decision is not None and not await wait_outside_tool_slot(decision):
+            return _ok(call, "denied")
+        await wait_for_batch_turn()
+        ran.append(call.tool_use_id)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return _ok(call, f"ran {call.tool_use_id}")
+
+    return execute
+
+
+async def test_later_exec_does_not_run_before_an_earlier_exec_awaiting_approval() -> None:
+    """[exec "rm -rf dist" (needs approval), exec "cp -r build dist"]: cp must not
+    run first and then have rm delete its result once the operator clicks."""
+
+    specs = {"exec": _spec("exec", early_approval=True)}
+    loop = asyncio.get_running_loop()
+    decisions: dict[str, asyncio.Future[bool]] = {"t0": loop.create_future()}
+    ran: list[str] = []
+    entered: list[str] = []
+
+    executor = _executor(_exec_like(decisions, ran, entered), specs)
+    consumer = asyncio.create_task(_drain(executor, [_call(0, "exec"), _call(1, "exec")]))
+    # t1 gets as far as its (absent) approval prompt, but no further.
+    await _until(lambda: entered == ["t0", "t1"])
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert ran == []
+
+    decisions["t0"].set_result(True)
+    await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert ran == ["t0", "t1"]
+    assert [o.result.content for o in executor.outcomes] == ["ran t0", "ran t1"]
+
+
+async def test_exclusive_tool_without_early_approval_waits_its_turn() -> None:
+    """A plain exclusive call is not admitted while an earlier one awaits approval;
+    a later exec still raises its own prompt only after it, in order."""
+
+    specs = {"exec": _spec("exec", early_approval=True), "write": _spec("write")}
+    loop = asyncio.get_running_loop()
+    decisions: dict[str, asyncio.Future[bool]] = {
+        "t0": loop.create_future(),
+        "t2": loop.create_future(),
+    }
+    ran: list[str] = []
+    entered: list[str] = []
+    exec_like = _exec_like(decisions, ran, entered)
+
+    async def execute(call: ToolCall) -> ToolResult:
+        if call.tool_name == "write":
+            entered.append(call.tool_use_id)
+            ran.append(call.tool_use_id)
+            return _ok(call, "wrote")
+        return await exec_like(call)
+
+    executor = _executor(execute, specs)
+    calls = [_call(0, "exec"), _call(1, "write"), _call(2, "exec")]
+    consumer = asyncio.create_task(_drain(executor, calls))
+    await _until(lambda: entered == ["t0"])
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert entered == ["t0"] and ran == []
+
+    decisions["t0"].set_result(True)
+    await _until(lambda: "t2" in entered)
+    assert ran == ["t0", "t1"]
+    decisions["t2"].set_result(True)
+    await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert ran == ["t0", "t1", "t2"]
+    assert [o.result.content for o in executor.outcomes] == ["ran t0", "wrote", "ran t2"]
+
+
+async def test_denied_earlier_exec_lets_the_later_one_run() -> None:
+    specs = {"exec": _spec("exec", early_approval=True)}
+    loop = asyncio.get_running_loop()
+    decisions: dict[str, asyncio.Future[bool]] = {
+        "t0": loop.create_future(),
+        "t1": loop.create_future(),
+    }
+    ran: list[str] = []
+    entered: list[str] = []
+
+    executor = _executor(_exec_like(decisions, ran, entered), specs)
+    consumer = asyncio.create_task(_drain(executor, [_call(0, "exec"), _call(1, "exec")]))
+    await _until(lambda: entered == ["t0", "t1"])  # both prompts pending at once
+    decisions["t1"].set_result(True)
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert ran == []  # approved, but t0 has not finished yet
+    decisions["t0"].set_result(False)
+    await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert ran == ["t1"]
+    assert [o.result.content for o in executor.outcomes] == ["denied", "ran t1"]
+
+
+async def test_call_timeout_does_not_run_while_queued_for_readmission() -> None:
+    """The tool timeout must not expire while the call waits to be admitted again:
+    an approved command would otherwise time out without ever running."""
+
+    gate = _OrderedGate()
+    admission = _Admission(gate=gate, slot=gate.reserve(exclusive=True), exclusive=True)
+    await admission.acquire()
+    loop = asyncio.get_running_loop()
+
+    async def _other_call() -> None:
+        other = gate.reserve(exclusive=True)
+        await other.future  # admitted once ``admission`` steps out
+        await _until(lambda: bool(gate._queue))  # ``admission`` queued again
+        await asyncio.sleep(0.045)  # longer than the call's whole timeout
+        gate.release(other)
+
+    other_task = asyncio.create_task(_other_call())
+    async with asyncio.timeout(0.03) as scope:
+        admission.timeout_scope = scope
+        await admission.wait_outside(asyncio.sleep(0))
+        resumed = scope.when()
+        now = loop.time()
+    await other_task
+
+    assert resumed is not None and 0 < resumed - now <= 0.03
+    admission.release()
+
+
+async def test_readmission_timeout_is_capped_by_the_batch_clock() -> None:
+    gate = _OrderedGate()
+    admission = _Admission(
+        gate=gate,
+        slot=gate.reserve(exclusive=True),
+        exclusive=True,
+        batch_remaining=lambda: 5.0,
+    )
+    await admission.acquire()
+    loop = asyncio.get_running_loop()
+    async with asyncio.timeout(30.0) as scope:
+        admission.timeout_scope = scope
+        await admission.wait_outside(asyncio.sleep(0))
+        resumed = scope.when()
+        now = loop.time()
+    assert resumed is not None and resumed - now <= 5.0
+    admission.release()
+
+
+async def test_call_admitted_again_after_the_batch_deadline_does_not_run() -> None:
+    specs = {"exec": _spec("exec", early_approval=True)}
+    clock = _FakeClock()
+    loop = asyncio.get_running_loop()
+    decision: asyncio.Future[bool] = loop.create_future()
+    entered: list[str] = []
+    ran: list[str] = []
+
+    async def execute(call: ToolCall) -> ToolResult:
+        entered.append(call.tool_use_id)
+        try:
+            await wait_outside_tool_slot(decision)
+        except TimeoutError:  # what exec does; must not let the command run
+            pass
+        ran.append(call.tool_use_id)
+        return _ok(call, "ran")
+
+    executor = _clocked_executor(execute, specs, clock, heartbeat_interval=15.0)
+    consumer = asyncio.create_task(_drain(executor, [_call(0, "exec")]))
+    await _until(lambda: entered == ["t0"])
+    clock.now += 10.0  # the batch deadline passes while the operator decides
+    decision.set_result(True)
+    await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert ran == []
+    assert executor.outcomes[0].result.is_error
+    assert executor.outcomes[0].result.content.endswith("timed out after 10.0s")
+
+
 # ---------------------------------------------------------------------------
 # Through the agent loop
 # ---------------------------------------------------------------------------
@@ -636,3 +1062,39 @@ async def test_agent_streams_first_result_before_batch_finishes() -> None:
 
 def test_default_max_tool_concurrency_is_eight() -> None:
     assert AgentConfig().max_safe_tool_concurrency == 8
+
+
+async def test_inline_approval_wait_goes_through_outside_wait_hook() -> None:
+    """An inline approval wait is handed to ``outside_wait`` so the turn can time it."""
+
+    specs = {"exec": _spec("exec")}
+    loop = asyncio.get_running_loop()
+    decision: asyncio.Future[bool] = loop.create_future()
+    seen: list[str] = []
+
+    async def outside_wait(awaitable):  # type: ignore[no-untyped-def]
+        seen.append("enter")
+        try:
+            return await awaitable
+        finally:
+            seen.append("exit")
+
+    async def execute(call: ToolCall) -> ToolResult:
+        approved = await wait_outside_tool_slot(decision)
+        seen.append("body")
+        return _ok(call, "ran" if approved else "denied")
+
+    executor = _executor(execute, specs)
+    executor.outside_wait = outside_wait
+
+    async def _consume() -> None:
+        async for _event in executor.run([_call(0, "exec")]):
+            pass
+
+    consumer = asyncio.create_task(_consume())
+    await _until(lambda: seen == ["enter"])
+    decision.set_result(True)
+    await asyncio.wait_for(consumer, timeout=2.0)
+
+    assert seen == ["enter", "exit", "body"]
+    assert [o.result.content for o in executor.outcomes] == ["ran"]

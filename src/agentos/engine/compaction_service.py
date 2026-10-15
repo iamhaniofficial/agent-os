@@ -76,6 +76,11 @@ _SUMMARY_TIMEOUT_SECONDS = 90.0
 _PREVIEW_CHARS = 240
 _FALLBACK_LINE_CHARS = 200
 _FALLBACK_MAX_CHARS = 12_000
+_FALLBACK_MIN_CHARS = 1_000
+_FALLBACK_FLOOR_CHARS = 512
+# Grace on top of the summarizer's own timeout before the service stops
+# waiting for it and uses the deterministic digest.
+_SUMMARY_TIMEOUT_GRACE_SECONDS = 5.0
 
 _SUMMARY_SYSTEM_PROMPT = (
     "You are a conversation compactor. Summarize the conversation concisely, "
@@ -291,8 +296,45 @@ def render_messages_for_summary(messages: Sequence[Message]) -> str:
     return "\n\n".join(lines)
 
 
-def fallback_summary(messages: Sequence[Message], previous_summary: str | None = None) -> str:
-    """Deterministic digest used when the summarizer provider fails."""
+def fallback_max_chars(window_tokens: int) -> int:
+    """Upper bound on a deterministic digest for a model *window_tokens* wide.
+
+    A digest keeps up to 200 chars per message, so on a history of many
+    short messages it is barely smaller than what it replaces; merged over
+    several chunks, or nested in the next digest as "previous context", it
+    could even outgrow the window. One eighth of the window (in chars, at 4
+    chars per token) and never more than ``_FALLBACK_MAX_CHARS`` keeps a
+    fallback compaction a real reduction.
+    """
+    if window_tokens <= 0:
+        return _FALLBACK_MAX_CHARS
+    return max(_FALLBACK_MIN_CHARS, min(_FALLBACK_MAX_CHARS, window_tokens * 4 // 8))
+
+
+def _clip_middle(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    marker = "\n[...omitted...]\n"
+    keep = max(0, max_chars - len(marker))
+    head = keep // 2
+    return text[:head] + marker + text[len(text) - (keep - head) :]
+
+
+def fallback_summary(
+    messages: Sequence[Message],
+    previous_summary: str | None = None,
+    *,
+    max_chars: int = _FALLBACK_MAX_CHARS,
+) -> str:
+    """Deterministic digest used when the summarizer provider fails.
+
+    The result, previous summary included, never exceeds *max_chars*: the
+    newest lines win, and a carried-over previous summary gets at most half
+    of the room, so repeated fallback compactions cannot grow without bound.
+    """
+    max_chars = max(_FALLBACK_FLOOR_CHARS, max_chars)
+    previous_room = max_chars // 2 if previous_summary else 0
+    previous = _clip_middle(previous_summary, previous_room) if previous_summary else ""
     lines = [f"[Summary of {len(messages)} messages]"]
     for message in messages:
         text = render_messages_for_summary([message])
@@ -302,10 +344,13 @@ def fallback_summary(messages: Sequence[Message], previous_summary: str | None =
         suffix = "..." if len(flat) > _FALLBACK_LINE_CHARS else ""
         lines.append(f"  {flat[:_FALLBACK_LINE_CHARS]}{suffix}")
     body = "\n".join(lines)
-    if len(body) > _FALLBACK_MAX_CHARS:
-        body = "[...older lines omitted...]\n" + body[-_FALLBACK_MAX_CHARS:]
-    if previous_summary:
-        return f"[Previous context]\n{previous_summary}\n\n[New context]\n{body}"
+    framing = len("[Previous context]\n\n\n[New context]\n") if previous else 0
+    body_room = max(256, max_chars - len(previous) - framing)
+    if len(body) > body_room:
+        omitted = "[...older lines omitted...]\n"
+        body = omitted + body[-max(0, body_room - len(omitted)) :]
+    if previous:
+        return f"[Previous context]\n{previous}\n\n[New context]\n{body}"
     return body
 
 
@@ -464,8 +509,9 @@ async def summarize_messages(
     each chunk; after the first failure the remaining chunks use the
     deterministic digest instead of waiting out the timeout again.
     """
+    digest_chars = fallback_max_chars(window_tokens)
     if summarizer is None:
-        return fallback_summary(messages, previous_summary), "fallback"
+        return fallback_summary(messages, previous_summary, max_chars=digest_chars), "fallback"
     chunk_summarizer: ChunkSummarizer
     if hasattr(summarizer, "chat"):
         chunk_summarizer = _provider_chunk_summarizer(summarizer)  # type: ignore[arg-type]
@@ -474,6 +520,9 @@ async def summarize_messages(
     # Keep each summarizer input well inside the model window.
     max_chars = max(8_000, min(400_000, int(window_tokens * 4 * 0.5)))
     chunks = _chunk_messages(messages, max_chars)
+    # The digests of all chunks share one bound, so a fallback over many
+    # chunks is no larger than a fallback over one.
+    chunk_digest_chars = max(_FALLBACK_FLOOR_CHARS, digest_chars // max(1, len(chunks)))
     loop = asyncio.get_running_loop()
     deadline = loop.time() + max(0.01, timeout)
     llm_available = True
@@ -492,7 +541,13 @@ async def summarize_messages(
             summaries.append(result)
             llm_chunks += 1
         else:
-            summaries.append(fallback_summary(chunk, previous_summary if index == 0 else None))
+            summaries.append(
+                fallback_summary(
+                    chunk,
+                    previous_summary if index == 0 else None,
+                    max_chars=chunk_digest_chars,
+                )
+            )
     if len(summaries) == 1:
         merged = summaries[0]
     else:
@@ -505,6 +560,10 @@ async def summarize_messages(
         source = "mixed"
     else:
         source = "fallback"
+        if len(merged) > digest_chars:
+            # Newest context wins, as in a single-chunk digest.
+            omitted = "[...older context omitted...]\n"
+            merged = omitted + merged[-max(0, digest_chars - len(omitted)) :]
     return merged, source
 
 
@@ -553,15 +612,34 @@ class CompactionService:
         previous_summary: str | None,
         window_tokens: int,
     ) -> tuple[str, str]:
-        if self._summarizer is not None:
-            return await self._summarizer(messages, previous_summary)
-        return await summarize_messages(
-            self._chunk_summarizer or self._provider,
+        """Summarize *messages*; a failing or hung summarizer yields the digest.
+
+        The summarizer already falls back per chunk when the provider fails,
+        but an exception or a call that outlives its own timeout used to fail
+        the whole compaction, so the history was not reduced at all. Both now
+        fall back to the bounded deterministic digest.
+        """
+        try:
+            async with asyncio.timeout(self._timeout + _SUMMARY_TIMEOUT_GRACE_SECONDS):
+                if self._summarizer is not None:
+                    return await self._summarizer(messages, previous_summary)
+                return await summarize_messages(
+                    self._chunk_summarizer or self._provider,
+                    messages,
+                    previous_summary,
+                    window_tokens=window_tokens,
+                    timeout=self._timeout,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the digest is the fallback
+            _log_summarizer_failure(exc, timeout=self._timeout, via="service")
+        digest = fallback_summary(
             messages,
             previous_summary,
-            window_tokens=window_tokens,
-            timeout=self._timeout,
+            max_chars=fallback_max_chars(window_tokens),
         )
+        return digest, "fallback"
 
     def _decline(
         self,
@@ -611,6 +689,7 @@ class CompactionService:
         force: bool = False,
         input_entry: dict[str, Any] | None = None,
         budget_tokens: int | None = None,
+        proactive: bool = False,
     ) -> CompactionResult:
         """Compact *messages* when over the trigger (or when *force* is set).
 
@@ -619,6 +698,11 @@ class CompactionService:
         ``estimated_tokens - message_tokens(messages)``. *input_entry* is the
         persisted user row of this turn (``{"role", "content"}``) that a
         durable rewrite keeps; the agent passes it through ``kept_entries``.
+
+        *proactive* is the between-turns background job: it runs below the
+        trigger (the caller already decided it is worth it), keeps every
+        decline rule, and never folds rounds of the kept turn -- that turn is
+        persisted already and stays byte for byte.
         """
         unchanged = CompactionResult(
             status="skipped",
@@ -627,7 +711,11 @@ class CompactionService:
             tokens_before=estimated_tokens,
             tokens_after=estimated_tokens,
         )
-        if not force and not self.should_compact(estimated_tokens, window_tokens, budget_tokens):
+        if (
+            not force
+            and not proactive
+            and not self.should_compact(estimated_tokens, window_tokens, budget_tokens)
+        ):
             unchanged.reason = "under_threshold"
             return unchanged
         compaction_id = new_compaction_id()
@@ -653,7 +741,7 @@ class CompactionService:
         input_end, rounds = _current_turn_rounds(current)
         keep_from = 0
         folded_rounds = 0
-        if message_tokens(current) > budget * 0.75 and len(rounds) > 1:
+        if not proactive and message_tokens(current) > budget * 0.75 and len(rounds) > 1:
             # The current turn alone does not leave room: fold its oldest
             # complete tool rounds, always keeping the input and latest round.
             target = budget * 0.5

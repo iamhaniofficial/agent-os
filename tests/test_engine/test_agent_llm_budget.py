@@ -1167,11 +1167,9 @@ async def test_failed_overflow_compaction_never_replays_a_streamed_response(
     the consumer saw the first reply's text and tool_use twice.
     """
     compact_calls: list[dict[str, Any]] = []
-    _patch_summarizer(
-        monkeypatch,
-        calls=compact_calls,
-        error=RuntimeError("summarizer unavailable"),
-    )
+    # A raising summarizer now falls back to the digest; an empty summary is
+    # what still fails a compaction.
+    _patch_summarizer(monkeypatch, calls=compact_calls, summary="")
     provider = _TextThenToolProvider(tool_rounds=1)
     agent = _overflowing_agent(provider, max_overflow_retries=2)
 
@@ -1309,7 +1307,7 @@ async def test_exhausted_overflow_retries_stop_before_the_provider_call(
     max_overflow_retries: int,
     expected_calls: int,
 ) -> None:
-    _patch_summarizer(monkeypatch, error=RuntimeError("summarizer unavailable"))
+    _patch_summarizer(monkeypatch, summary="")
     provider = _TextThenToolProvider(tool_rounds=3)
     agent = _overflowing_agent(provider, max_overflow_retries=max_overflow_retries)
 
@@ -1317,7 +1315,7 @@ async def test_exhausted_overflow_retries_stop_before_the_provider_call(
 
     assert len(provider.calls) == expected_calls
     error_index = _event_index(events, lambda event: isinstance(event, ErrorEvent))
-    assert events[error_index].code == "compaction_failed"
+    assert events[error_index].code == "compaction_refused_empty_summary"
     # Nothing streams after the terminal error, and nothing streamed twice.
     assert not any(isinstance(event, TextDeltaEvent) for event in events[error_index:])
     texts = [event.text for event in events if isinstance(event, TextDeltaEvent)]

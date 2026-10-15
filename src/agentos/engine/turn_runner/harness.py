@@ -439,6 +439,7 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
         thinking = runner._resolve_turn_thinking(turn)
         return _AgentConfigAuxiliaries(
             thinking=thinking,
+            parallel_tool_calls=runner._resolve_parallel_tool_calls(),
             tool_result_store_dir=str(media_root_from_config(runner._config) / "tool-results"),
             tool_result_store_session_id=session_id_for_log or session_key,
             tool_result_projection_max_inline_chars=getattr(
@@ -484,6 +485,7 @@ class _TurnRunnerMemorySnapshotAdapter(MemorySnapshotPort):
         *,
         agent_id: str,
         session_key: str,
+        warmed: bool = False,
     ) -> _MemorySnapshotResult:
         from agentos.engine.runtime import MemorySnapshot
         from agentos.session.keys import (
@@ -494,7 +496,7 @@ class _TurnRunnerMemorySnapshotAdapter(MemorySnapshotPort):
         sync_manager = (
             runner._memory_sync_managers.get(agent_id) if runner._memory_sync_managers else None
         )
-        if sync_manager is not None:
+        if sync_manager is not None and not warmed:
             await sync_manager.warm_session(session_key)
 
         private_memory_allowed = allows_private_memory_prompt_injection(session_key)

@@ -115,7 +115,7 @@ async def test_summary_runs_on_the_auxiliary_cheap_model_without_thinking(
 
 
 @pytest.mark.asyncio
-async def test_timed_out_summary_that_saves_nothing_is_not_applied_and_not_retried(
+async def test_timed_out_summary_falls_back_to_a_digest_that_still_shrinks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     built = _install_aux(monkeypatch, _HangingProvider())
@@ -136,7 +136,8 @@ async def test_timed_out_summary_that_saves_nothing_is_not_applied_and_not_retri
         tool_handler=_tool,
         session_key="agent:main:main",
     )
-    # Many short lines: the fallback digest is as long as what it replaces.
+    # Many short lines: an unbounded digest used to be as long as what it
+    # replaced, so the compaction was declined and the history never shrank.
     history = [
         Message(
             role="user" if index % 2 == 0 else "assistant", content=f"note {index} " + "n" * 140
@@ -156,13 +157,15 @@ async def test_timed_out_summary_that_saves_nothing_is_not_applied_and_not_retri
     assert failures[0]["error_type"] == "AuxiliaryError"
     assert "timed out after" in failures[0]["error"]
     assert failures[0]["timeout_s"] == 0.2
-    declined = [log for log in logs if log["event"] == "compaction.declined"]
-    assert [log["reason"] for log in declined] == ["compaction_not_smaller"]
-    # Nothing persisted or rewritten; every request carries the full history.
-    assert not any(isinstance(event, CompactionEvent) for event in events)
+    assert not [log for log in logs if log["event"] == "compaction.declined"]
+    # The bounded fallback digest is applied once, before the first request.
+    compactions = [event for event in events if isinstance(event, CompactionEvent)]
+    assert len(compactions) == 1
     assert len(provider.calls) == 3
-    assert all(call[: len(history)] == history for call in provider.calls)
-    assert agent.transcript_record()["mode"] == "append"
+    first = provider.calls[0]
+    assert str(first[0].content).startswith("[Context summary]\n")
+    assert len(first) < len(history)
+    assert agent.transcript_record()["mode"] == "reset"
 
 
 @pytest.mark.asyncio

@@ -64,6 +64,26 @@ Use replay when:
 - a bug report needs concise reproduction evidence;
 - you want to compare transcript output with diagnostics and cost data.
 
+## Where a Turn's Time Goes
+
+Every turn records a wall-clock breakdown. The gateway log gets one
+`turn.timing` line per turn, and the decision log row carries the same data
+under `timing` (schema 16), which `agentos replay` prints:
+
+- `total_ms`: the whole turn; `pre_provider_ms`: turn start to the first
+  provider request; `first_text_ms`: turn start to the first streamed text.
+- `provider_ms`, `tool_ms`, `approval_wait_ms` (time with at least one approval
+  outstanding), `finalize_ms`, and `iterations` (provider calls).
+- per stage (`input`, `provider_and_tools`, `prompt_assembler`,
+  `agent_bootstrap`, `compaction_and_history`, `attachment`, `stream_consumer`,
+  `turn_finalizer`; in the log line as `stage_<name>_ms`);
+- per provider call: start offset, then time to first event, first text and
+  end of stream, with input/output tokens; per tool batch: duration, number of
+  calls and approval wait.
+
+Rows written before schema 16 have no `timing`; replay shows only the total
+latency for them.
+
 ## Pair Replay With Sessions
 
 Find the session first:

@@ -490,6 +490,23 @@ defer_loading = false
 
 `agentos context` shows what a request carries with the current setting.
 
+### Parallel tool calls
+
+When a model has several tool calls that do not depend on each other, issuing
+them in one response saves a full provider round trip per extra call; the
+runtime already runs them concurrently. By default AgentOS asks for this with
+`parallel_tool_calls: true` on the providers whose API is known to accept the
+field (api.openai.com and OpenRouter); every other OpenAI-compatible endpoint
+(OpenCAP, Bankr, Surplus, DeepSeek, Zhipu, Gemini-compatible, Ollama, local
+servers) gets nothing, and Anthropic already allows parallel tool use unless
+told otherwise. The system prompt's tool section carries the matching
+instruction. To send nothing, as before:
+
+```toml
+[tools]
+parallel_calls = false
+```
+
 ## Prompt Cache Configuration
 
 Controls prompt prefix caching for LLM providers that support it (Anthropic, OpenAI, DeepSeek, OpenRouter, etc.):
@@ -549,6 +566,27 @@ classifies each turn:
 ```toml
 [agentos_router]
 strategy = "pilot-v1"   # default; or "llm_judge", or "jev" (experimental)
+```
+
+### Effort by tier
+
+A turn the router sends to a cheap tier also runs with less reasoning: when the
+thinking level is the router's own pick (the shipped tier table's level, or
+the pilot controller's per-turn choice), `c0` turns run at most at `low` and `c1` turns at most at `medium`; `c2`, `c3`
+and the image tier keep their configured level. A level is only ever lowered,
+never raised, and the model choice does not change. It does not apply when
+`[llm] thinking` is set, when an explicit model overrode the route, when the user pinned a route or a model with
+router control, or when `[agentos_router.tiers.<tier>] thinking_level` is set to
+something other than the shipped value. Config files store the whole tier table,
+so a level equal to the shipped one cannot be told apart from a hand-written
+one; use `effort_by_tier = false` to keep it. Only providers with a thinking-level concept are affected
+(Anthropic effort, OpenAI reasoning effort, OpenRouter `reasoning.effort`).
+Each lowered turn logs `turn_runner.effort_by_tier`. To keep the tier's level
+on every turn:
+
+```toml
+[agentos_router]
+effort_by_tier = false
 ```
 
 Jev settings live in their own sub-table (all fields optional; defaults shown):
@@ -912,7 +950,74 @@ Memory can combine Markdown-backed sources with SQLite keyword and semantic
 indexes. The exact memory shape depends on the configured provider and local
 embedding support.
 
+An external memory provider (`[memory.provider]`) is asked for recall before
+every turn. `[memory] recall_timeout_seconds` (default `1.5`) is a hard
+deadline on that recall: a slower recall does not hold the turn, which goes on
+without it and logs `memory.recall_timeout`. The late recall is not cancelled;
+it finishes in the background and its result stands in on the session's next
+turn if that turn's recall is late too.
+
+```toml
+[memory]
+recall_timeout_seconds = 1.5
+```
+
+### Turn setup concurrency
+
+Before a turn's first model request AgentOS reads several independent things:
+the memory-provider recall, the session's project knowledge, the deferred tools
+the session has loaded, the recent transcript for the router, and on the first
+turn of a session the memory index warm-up. `[task_runtime]
+concurrent_turn_setup` (default `true`) runs them concurrently and applies the
+results in the same order as before, so the prompt is byte-identical either
+way. Set it to `false` to go back to running them one after another.
+
+```toml
+[task_runtime]
+concurrent_turn_setup = true
+```
+
 Read: [`features/memory.md`](features/memory.md)
+
+## Context Compaction
+
+When a session's request nears the model's context window, the oldest history
+is folded into one summary exchange. The trigger is `preflight_compact_ratio`
+(default 0.85) of the context window, or the provider's request budget when
+that is tighter.
+
+```toml
+[compaction]
+summary_timeout_seconds = 45.0   # bound on the summary call (auxiliary task "compaction")
+proactive = true                 # compact between turns, in the background
+proactive_ratio = 0.70           # ...once the history reaches 70% of the trigger
+proactive_idle_seconds = 20      # ...after the session has been idle this long
+estimate_calibration = true      # scale the size estimate by what providers report
+```
+
+- **Proactive compaction.** After a turn ends with the history at
+  `proactive_ratio` of the trigger or more, AgentOS compacts the session in the
+  background, so the next turn does not wait for the summarizer. The job waits
+  until the session has been idle for `proactive_idle_seconds` (default 20,
+  0 = at once) before it calls the summarizer, so a quick follow-up does not
+  pay for a summary it throws away. A turn that starts first wins: the
+  background result is dropped and the check runs again when that turn ends.
+  When a turn cancels a summary already in progress, the wait doubles for that
+  session (up to 300 s) until a job completes. A job that has already
+  persisted is never cancelled; one whose session was reset or truncated
+  meanwhile is skipped quietly. Subagent and cron sessions are never compacted this
+  way. The in-turn check stays as the safety net. `proactive = false` turns
+  the background job off.
+- **Estimate calibration.** The request size is estimated as characters / 4,
+  which over-counts against what providers bill. Per provider and model,
+  AgentOS keeps a running ratio of the provider's reported input tokens to its
+  own estimate and, after two calls, scales the estimate by it (clamped to
+  0.7-1.25), so compaction does not fire early. Usage the provider marks as
+  estimated and requests carrying images or documents are not counted. `estimate_calibration = false`
+  uses the raw estimate.
+- When the summarizer fails or times out, a deterministic digest bounded to an
+  eighth of the context window is used instead, so a compaction still shrinks
+  the history.
 
 ## Auxiliary Model
 
