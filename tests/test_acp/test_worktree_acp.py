@@ -154,3 +154,31 @@ async def test_spawn_with_worktree(repo: Path, tmp_path: Path) -> None:
         assert spec.cwd == wt["path"]
         row = await rig.sessions.get_session(out["session_key"])
         assert row.origin["worktree"]["repo_root"] == str(repo.resolve())
+
+
+async def test_failed_spawn_removes_its_worktree(repo: Path, tmp_path: Path) -> None:
+    from acp_s_harness import acp_rig
+
+    from agentos.tools.builtin import sessions as sessions_tool
+    from agentos.tools.types import ToolError
+
+    async def _no_children(_mgr, _agent):
+        return {"max_children_per_session": 0}
+
+    async with acp_rig(tmp_path, allowed_cwds=[str(repo)]):
+        original = sessions_tool._resolve_subagent_policy
+        sessions_tool._resolve_subagent_policy = _no_children  # type: ignore[assignment]
+        try:
+            with pytest.raises(ToolError, match="Max active children"):
+                await sessions_tool.sessions_spawn(
+                    task="x",
+                    runtime="acp",
+                    acp_agent="claude",
+                    cwd=str(repo),
+                    worktree=True,
+                    worktree_name="gone",
+                )
+        finally:
+            sessions_tool._resolve_subagent_policy = original  # type: ignore[assignment]
+        assert list_worktrees(worktrees_root(tmp_path / "state" / "acp")) == []
+        assert _git(repo, "branch", "--list", "gone") == ""

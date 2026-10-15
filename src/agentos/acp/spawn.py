@@ -242,6 +242,16 @@ async def authorize_resume(
 # --------------------------------------------------------------------------
 
 
+async def _discard_worktree(info: dict[str, Any]) -> None:
+    """Remove a worktree created for a spawn that then failed (it is clean)."""
+    from agentos.acp.worktree import WorktreeError, WorktreeInfo, remove_worktree
+
+    try:
+        await remove_worktree(WorktreeInfo(**info), delete_branch=True)
+    except (WorktreeError, TypeError, OSError):
+        log.warning("acp.spawn.worktree_cleanup_failed", path=info.get("path"), exc_info=True)
+
+
 async def spawn_acp_session(
     *,
     task: str,
@@ -368,26 +378,31 @@ async def spawn_acp_session(
     runtime = sessions_tool._get_task_runtime()
     spawn_depth = current_depth + 1
     spawn_lock = sessions_tool._get_spawn_lock(parent_session_key)
-    async with spawn_lock:
-        if isinstance(max_children, int) and max_children >= 0:
-            active = await sessions_tool._count_active_children(mgr, parent_session_key)
-            if active >= max_children:
-                raise ToolError(
-                    f"Max active children ({max_children}) exceeded for session "
-                    f"'{parent_session_key}'"
-                )
-        create = getattr(mgr, "create", None) or getattr(mgr, "create_session")
-        await create(
-            session_key=session_key,
-            agent_id=owner_agent_id,
-            model=model,
-            spawn_depth=spawn_depth,
-            parent_session_key=parent_session_key,
-            spawned_by=parent_session_key,
-            label=f"acp:{harness}",
-            origin=origin,
-        )
-        entry = await mgr.append_message(session_key, role="user", content=task)
+    try:
+        async with spawn_lock:
+            if isinstance(max_children, int) and max_children >= 0:
+                active = await sessions_tool._count_active_children(mgr, parent_session_key)
+                if active >= max_children:
+                    raise ToolError(
+                        f"Max active children ({max_children}) exceeded for session "
+                        f"'{parent_session_key}'"
+                    )
+            create = getattr(mgr, "create", None) or getattr(mgr, "create_session")
+            await create(
+                session_key=session_key,
+                agent_id=owner_agent_id,
+                model=model,
+                spawn_depth=spawn_depth,
+                parent_session_key=parent_session_key,
+                spawned_by=parent_session_key,
+                label=f"acp:{harness}",
+                origin=origin,
+            )
+            entry = await mgr.append_message(session_key, role="user", content=task)
+    except BaseException:
+        if worktree_info is not None:
+            await _discard_worktree(worktree_info)
+        raise
     envelope = build_subagent_route_envelope(
         session_key=session_key,
         parent_session_key=parent_session_key,
