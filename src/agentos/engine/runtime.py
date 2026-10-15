@@ -110,6 +110,7 @@ from agentos.engine.turn_runner.harness import (
     _TurnRunnerTurnMemoryCaptureAdapter,
 )
 from agentos.engine.turn_runner.stream_consumer_stage import _StreamState
+from agentos.engine.turn_timing import TurnTiming, emit_turn_timing_log
 from agentos.engine.types import (
     AgentConfig,
     AgentEvent,
@@ -2677,6 +2678,7 @@ class TurnRunner:
         # Observability: bracket turn setup + stream loop with monotonic clock
         # so latency_ms reflects the full turn.
         turn_started_at = time.monotonic()
+        timing = TurnTiming()
         turn_id = uuid.uuid4().hex
         resolved_model = ""
         final_prompt_str = ""
@@ -2763,6 +2765,7 @@ class TurnRunner:
                 yield self._handle_runtime_warning(
                     WarningEvent(code="budget_warning", message=budget_message)
                 )
+            timing.stage_start("input")
             input_out = await self._input_stage.run(
                 InputStageInput(
                     message=message,
@@ -2775,6 +2778,7 @@ class TurnRunner:
                     session_append=self._session_manager,
                 )
             )
+            timing.stage_end("input")
             runtime_message = input_out.runtime_message
             semantic_input = input_out.semantic_input
             extra_prompt_context = input_out.extra_prompt_context
@@ -2805,6 +2809,7 @@ class TurnRunner:
             from agentos.tools.deferred import hydrate_loaded_tools
 
             await hydrate_loaded_tools(self._session_manager, session_key)
+            timing.stage_start("provider_and_tools")
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
                     session_key=session_key,
@@ -2814,6 +2819,7 @@ class TurnRunner:
                     input_mode=input_mode,
                 )
             )
+            timing.stage_end("provider_and_tools")
             if pt_outcome.terminate:
                 # Harness performs the legacy observability + persist +
                 # yield sequence in the legacy ORDER (trace-emit, persist,
@@ -2846,6 +2852,7 @@ class TurnRunner:
             tool_context = pt_out.effective_tool_context
             tool_metadata = pt_out.tool_metadata
 
+            timing.stage_start("prompt_assembler")
             pa_outcome = await self._prompt_assembler_stage.run(
                 PromptAssemblerStageInput(
                     runtime_message=runtime_message,
@@ -2875,6 +2882,7 @@ class TurnRunner:
                     normalization_metadata=normalization_metadata,
                 )
             )
+            timing.stage_end("prompt_assembler")
             pa_out = pa_outcome.require_output()
             provider = pa_out.provider
             turn = pa_out.turn
@@ -2942,6 +2950,7 @@ class TurnRunner:
             router_event = build_router_decision_event(turn)
             if router_event is not None:
                 yield router_event
+            timing.stage_start("agent_bootstrap")
             ab_outcome = await self._agent_bootstrap_stage.run(
                 AgentBootstrapStageInput(
                     provider=provider,
@@ -2966,8 +2975,10 @@ class TurnRunner:
                     length_capped_continuations=length_capped_continuations,
                 )
             )
+            timing.stage_end("agent_bootstrap")
             ab_out = ab_outcome.require_output()
             agent = ab_out.agent
+            agent.turn_timing = timing
             agent_config = ab_out.agent_config  # noqa: F841
             # These locals are read by the test_agent_bootstrap_stage_snapshot
             # frame-walking probe. Do not remove.
@@ -2994,6 +3005,7 @@ class TurnRunner:
             # before-turn step any more: the agent's CompactionService checks
             # the live request before every provider call (first one included)
             # with the configured ratio, and persists via CompactionEvent.
+            timing.stage_start("compaction_and_history")
             ch_outcome = await self._compaction_and_history_stage.run(
                 CompactionAndHistoryStageInput(
                     agent=agent,
@@ -3006,6 +3018,7 @@ class TurnRunner:
                     ),
                 )
             )
+            timing.stage_end("compaction_and_history")
             ch_out = ch_outcome.require_output()
             agent.config.request_context_prompt = ch_out.final_request_context_prompt
             agent.config.context_overflow_threshold = self._preflight_compact_ratio()
@@ -3021,12 +3034,14 @@ class TurnRunner:
 
             # 8. Build extra messages for attachments + turn_input rebind.
             # AttachmentStage owns the slice.
+            timing.stage_start("attachment")
             att_outcome = await self._attachment_stage.run(
                 AttachmentStageInput(
                     effective_runtime_message=effective_runtime_message,
                     attachments=attachments,
                 )
             )
+            timing.stage_end("attachment")
             att_out = att_outcome.require_output()
             extra_msgs = att_out.extra_messages
 
@@ -3072,12 +3087,14 @@ class TurnRunner:
                 tool_context=tool_context,
             )
             router_control_replay_event: RouterControlReplayEvent | None = None
+            timing.stage_start("stream_consumer")
             async for event in self._stream_consumer_stage.run(stream_inp):
                 if isinstance(event, RouterControlReplayEvent):
                     router_control_replay_event = event
                     yield event
                     break
                 yield event
+            timing.stage_end("stream_consumer")
             if router_control_replay_event is not None:
                 async for replayed_event in self._run_turn(
                     message,
@@ -3129,6 +3146,7 @@ class TurnRunner:
             # fire in legacy order: heartbeat normalize -> transcript
             # append -> memory capture (try/except) -> error persist ->
             # session totals rollup (try/except).
+            timing.stage_start("turn_finalizer")
             fin_outcome = await self._turn_finalizer_stage.run(
                 TurnFinalizerStageInput(
                     final_text_parts=final_text_parts,
@@ -3150,6 +3168,7 @@ class TurnRunner:
                     provider_messages=transcript_record_of(agent, artifacts=turn_artifacts),
                 )
             )
+            timing.stage_end("turn_finalizer")
             fin_out = fin_outcome.require_output()
             final_text = fin_out.final_text
             turn_segments = fin_out.turn_segments
@@ -3226,6 +3245,7 @@ class TurnRunner:
                 done_event=done_event,
                 trace_id=trace_context.trace_id if trace_context is not None else None,
                 skills_invoked=collect_invoked_skills(turn_segments),
+                timing=timing.summary(),
             )
             if pending_error_event is not None:
                 yield pending_error_event
@@ -3354,6 +3374,7 @@ class TurnRunner:
             # here. A reservation that outlived its turn would permanently
             # shrink the ceiling for everyone else.
             self._release_spend_budget(budget_reservation)
+            emit_turn_timing_log(timing, session_key=session_key, turn_id=turn_id)
 
     @staticmethod
     def _write_trace_event(
@@ -5066,6 +5087,7 @@ class TurnRunner:
         done_event: DoneEvent | None = None,
         trace_id: str | None = None,
         skills_invoked: list[str] | None = None,
+        timing: dict[str, Any] | None = None,
     ) -> None:
         """Write one DecisionEntry for this turn (best-effort, never raises).
 
@@ -5322,6 +5344,7 @@ class TurnRunner:
                     if done_event is not None and done_event.stop_reason == "refusal"
                     else None
                 ),
+                timing=timing or {},
             )
             write_decision_entry(entry)
         except Exception as exc:  # pragma: no cover — observability must not break turns

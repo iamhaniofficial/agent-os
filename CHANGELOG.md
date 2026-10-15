@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
+- Turn timing trace. Every turn now records where its wall-clock time goes:
+  per stage, per provider call (time to first event, first text, end of
+  stream, tokens) and per tool batch (duration, calls, approval wait), plus
+  totals (`pre_provider_ms`, `first_text_ms`, `provider_ms`, `tool_ms`,
+  `approval_wait_ms`, `finalize_ms`, `total_ms`, `iterations`). It is logged
+  as one `turn.timing` line per turn, stored under `timing` in the decision
+  log (schema 16), and printed by `agentos replay`.
 - Suggested next prompt. When a turn finishes, the chat input in the web
   console, the desktop app and `agentos chat` shows the message the user is
   most likely to send next as grey placeholder text; `Tab` takes it into the
