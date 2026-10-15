@@ -36,6 +36,12 @@ class PendingApproval:
     resolved: bool = False
     approved: bool = False
     consumed: bool = False
+    #: Optional answer data attached by the resolver (ACP elicitation forms
+    #: carry their field values here). Never part of ``params``.
+    payload: dict | None = None
+    #: Per-row lifespan end (epoch seconds); ``None`` = ``created_at`` plus
+    #: the queue's ``default_timeout``.
+    expires_at: float | None = None
     _event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -76,6 +82,24 @@ class ApprovalQueueOwnedByGatewayError(RuntimeError):
 #: enough that an approved row is always consumed first, short enough that
 #: the queue file stops growing for the lifetime of the install.
 DEFAULT_RESOLVED_RETENTION_SECONDS = 24 * 60 * 60.0
+
+# A row without ``expires_at`` lives ``default_timeout`` from creation (the
+# original rule); a row with one lives until then. Parameters: the
+# default-timeout cutoff, then "now".
+_EXPIRED_SQL = (
+    "((expires_at IS NULL AND created_at <= ?) OR (expires_at IS NOT NULL AND expires_at <= ?))"
+)
+# Resolved rows are pruned once both creation and lifespan end are older than
+# the retention window, so a long-lived row is never pruned before it expires.
+_PRUNABLE_SQL = "MAX(created_at, COALESCE(expires_at, created_at)) <= ?"
+
+#: Namespaces whose resolve can carry "remember this for the session"
+#: (``allow_always`` / ``remember_intent`` / a bypass elevation) as a flag in
+#: the row's params instead of the exec intent cache or the session's
+#: elevated mode.
+SESSION_REMEMBER_NAMESPACES = frozenset({"acp"})
+#: Namespaces whose resolve never changes the session's elevated mode.
+NO_ELEVATION_NAMESPACES = frozenset({"acp", "acp_elicitation"})
 
 
 class ApprovalQueue:
@@ -141,6 +165,15 @@ class ApprovalQueue:
             ON approval_queue(namespace, resolved);
             """
         )
+        # Additive columns (ACP bridge): a resolver payload and a per-row
+        # lifespan. Older queue files get them on first open.
+        columns = {
+            str(row["name"]) for row in self._conn.execute("PRAGMA table_info(approval_queue)")
+        }
+        if "payload" not in columns:
+            self._conn.execute("ALTER TABLE approval_queue ADD COLUMN payload TEXT")
+        if "expires_at" not in columns:
+            self._conn.execute("ALTER TABLE approval_queue ADD COLUMN expires_at REAL")
         self._conn.commit()
 
     def _serialize_params(self, params: dict | None) -> str:
@@ -158,6 +191,9 @@ class ApprovalQueue:
     def _row_to_entry(self, row: sqlite3.Row) -> PendingApproval:
         aid = str(row["approval_id"])
         existing = self._pending.get(aid)
+        keys = row.keys()
+        raw_payload = row["payload"] if "payload" in keys else None
+        raw_expires = row["expires_at"] if "expires_at" in keys else None
         return PendingApproval(
             approval_id=aid,
             namespace=str(row["namespace"]),
@@ -166,13 +202,16 @@ class ApprovalQueue:
             resolved=bool(row["resolved"]),
             approved=bool(row["approved"]),
             consumed=bool(row["consumed"]),
+            payload=self._deserialize_params(raw_payload) if raw_payload is not None else None,
+            expires_at=float(raw_expires) if raw_expires is not None else None,
             _event=existing._event if existing is not None else asyncio.Event(),
         )
 
     def _load_pending(self) -> None:
         self._pending = {}
         for row in self._conn.execute(
-            "SELECT approval_id, namespace, params, created_at, resolved, approved, consumed "
+            "SELECT approval_id, namespace, params, created_at, resolved, approved, consumed, "
+            "payload, expires_at "
             "FROM approval_queue WHERE resolved = 0"
         ):
             entry = self._row_to_entry(row)
@@ -182,7 +221,8 @@ class ApprovalQueue:
         return cast(
             sqlite3.Row | None,
             self._conn.execute(
-                "SELECT approval_id, namespace, params, created_at, resolved, approved, consumed "
+                "SELECT approval_id, namespace, params, created_at, resolved, approved, consumed, "
+                "payload, expires_at "
                 "FROM approval_queue WHERE approval_id = ?",
                 (approval_id,),
             ).fetchone(),
@@ -206,9 +246,10 @@ class ApprovalQueue:
         # a plain read rather than queue behind a writer in another process.
         due = self._conn.execute(
             "SELECT 1 FROM approval_queue "
-            "WHERE (resolved = 0 AND created_at <= ?) OR (resolved = 1 AND created_at <= ?) "
+            f"WHERE (resolved = 0 AND {_EXPIRED_SQL}) "
+            f"OR (resolved = 1 AND {_PRUNABLE_SQL}) "
             "LIMIT 1",
-            (expired_before, prune_before),
+            (expired_before, now, prune_before),
         ).fetchone()
         if due is None:
             return
@@ -217,26 +258,27 @@ class ApprovalQueue:
             expired = [
                 str(row["approval_id"])
                 for row in self._conn.execute(
-                    "SELECT approval_id FROM approval_queue WHERE resolved = 0 AND created_at <= ?",
-                    (expired_before,),
+                    f"SELECT approval_id FROM approval_queue WHERE resolved = 0 AND {_EXPIRED_SQL}",
+                    (expired_before, now),
                 ).fetchall()
             ]
             if expired:
                 self._conn.execute(
                     "UPDATE approval_queue SET resolved = 1, approved = 0 "
-                    "WHERE resolved = 0 AND created_at <= ?",
-                    (expired_before,),
+                    f"WHERE resolved = 0 AND {_EXPIRED_SQL}",
+                    (expired_before, now),
                 )
             pruned = [
                 str(row["approval_id"])
                 for row in self._conn.execute(
-                    "SELECT approval_id FROM approval_queue WHERE resolved = 1 AND created_at <= ?",
+                    "SELECT approval_id FROM approval_queue "
+                    f"WHERE resolved = 1 AND {_PRUNABLE_SQL}",
                     (prune_before,),
                 ).fetchall()
             ]
             if pruned:
                 self._conn.execute(
-                    "DELETE FROM approval_queue WHERE resolved = 1 AND created_at <= ?",
+                    f"DELETE FROM approval_queue WHERE resolved = 1 AND {_PRUNABLE_SQL}",
                     (prune_before,),
                 )
             self._conn.commit()
@@ -261,7 +303,15 @@ class ApprovalQueue:
             return None
         return live_gateway_pid(self._db_path.parent)
 
-    def request(self, namespace: str = "exec", params: dict | None = None) -> str:
+    def request(
+        self,
+        namespace: str = "exec",
+        params: dict | None = None,
+        *,
+        ttl: float | None = None,
+    ) -> str:
+        """Queue an approval; ``ttl`` (seconds) overrides ``default_timeout``
+        as this row's lifespan."""
         gateway_pid = self._foreign_live_gateway()
         if gateway_pid is not None:
             raise ApprovalQueueOwnedByGatewayError(
@@ -272,13 +322,15 @@ class ApprovalQueue:
         while True:
             approval_id = uuid.uuid4().hex[:12]
             now = time.time()
+            expires_at = now + max(0.0, float(ttl)) if ttl is not None else None
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 self._conn.execute(
                     "INSERT INTO approval_queue "
-                    "(approval_id, namespace, params, created_at, resolved, approved, consumed) "
-                    "VALUES (?, ?, ?, ?, 0, 0, 0)",
-                    (approval_id, namespace, payload, now),
+                    "(approval_id, namespace, params, created_at, resolved, approved, consumed, "
+                    "expires_at) "
+                    "VALUES (?, ?, ?, ?, 0, 0, 0, ?)",
+                    (approval_id, namespace, payload, now, expires_at),
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError:
@@ -291,6 +343,7 @@ class ApprovalQueue:
             namespace=namespace,
             params=params or {},
             created_at=now,
+            expires_at=expires_at,
         )
         self._pending[approval_id] = entry
         return approval_id
@@ -316,7 +369,10 @@ class ApprovalQueue:
         # loop. Windows' wall clock ticks at ~15.6ms; read afresh after a 20ms
         # monotonic wait it can still show the approval as younger than its
         # lifespan and leave a timed-out approval pending forever.
-        lifespan_deadline = now + max(0.0, entry.created_at + self._timeout - time.time())
+        lifespan_end = (
+            entry.expires_at if entry.expires_at is not None else entry.created_at + self._timeout
+        )
+        lifespan_deadline = now + max(0.0, lifespan_end - time.time())
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -372,7 +428,13 @@ class ApprovalQueue:
         allow_always: bool = False,
         remember_intent: bool = False,
         elevated_mode: str | None = None,
+        payload: dict | None = None,
     ) -> None:
+        """Resolve a pending approval.
+
+        ``payload`` (optional) is answer data stored beside the row (ACP
+        elicitation answers); read it back with :meth:`take_payload`.
+        """
         self._conn.execute("BEGIN IMMEDIATE")
         row = self._get_row(approval_id)
         if row is None:
@@ -391,13 +453,24 @@ class ApprovalQueue:
         # the row, so anything written only onto the in-memory entry is lost on
         # the very next lookup (and on restart).
         params = dict(entry.params)
+        if entry.namespace in NO_ELEVATION_NAMESPACES:
+            # An ACP prompt is not an exec prompt: "bypass" on it means "stop
+            # asking for this harness session", never "elevate the session".
+            if (
+                approved
+                and entry.namespace in SESSION_REMEMBER_NAMESPACES
+                and (allow_always or remember_intent or elevated_mode in ("bypass", "full"))
+            ):
+                params["rememberDecision"] = True
+            elevated_mode = None
         if approved and elevated_mode in VALID_ELEVATED_MODES:
             params["elevatedMode"] = elevated_mode
+        payload_json = self._serialize_params(payload) if isinstance(payload, dict) else None
         cursor = self._conn.execute(
             "UPDATE approval_queue "
-            "SET resolved = 1, approved = ?, params = ? "
+            "SET resolved = 1, approved = ?, params = ?, payload = COALESCE(?, payload) "
             "WHERE approval_id = ? AND resolved = 0",
-            (1 if approved else 0, self._serialize_params(params), approval_id),
+            (1 if approved else 0, self._serialize_params(params), payload_json, approval_id),
         )
         if cursor.rowcount != 1:
             self._conn.rollback()
@@ -423,6 +496,35 @@ class ApprovalQueue:
 
         if approved and entry.namespace == "exec" and (allow_always or remember_intent):
             self._persist_command_intent(entry.params, allow_always=allow_always)
+
+    def take_payload(self, approval_id: str) -> dict | None:
+        """Return the resolver payload once and clear it from the row.
+
+        Elicitation answers can hold secrets; they are read by the waiting
+        bridge and must not linger in the queue file for the retention window.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT payload FROM approval_queue WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            raw = row["payload"] if row is not None else None
+            if raw is not None:
+                self._conn.execute(
+                    "UPDATE approval_queue SET payload = NULL WHERE approval_id = ?",
+                    (approval_id,),
+                )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+        if row is None:
+            raise KeyError(f"Approval not found: {approval_id}")
+        entry = self._pending.get(approval_id)
+        if entry is not None:
+            entry.payload = None
+        return self._deserialize_params(raw) if raw is not None else None
 
     def _persist_command_intent(self, params: dict, allow_always: bool = False) -> None:
         if not isinstance(params, dict):
@@ -483,20 +585,22 @@ class ApprovalQueue:
             "resolved": entry.resolved,
             "approved": entry.approved,
             "consumed": entry.consumed,
+            "expires_at": entry.expires_at,
+            "has_payload": entry.payload is not None,
         }
 
     def list_pending(self, namespace: str | None = None) -> list[dict]:
         self._sweep()
         if namespace:
             rows = self._conn.execute(
-                "SELECT approval_id, namespace, params, created_at "
+                "SELECT approval_id, namespace, params, created_at, expires_at "
                 "FROM approval_queue "
                 "WHERE resolved = 0 AND namespace = ?",
                 (namespace,),
             )
         else:
             rows = self._conn.execute(
-                "SELECT approval_id, namespace, params, created_at "
+                "SELECT approval_id, namespace, params, created_at, expires_at "
                 "FROM approval_queue "
                 "WHERE resolved = 0",
             )
@@ -506,6 +610,7 @@ class ApprovalQueue:
                 "namespace": str(row["namespace"]),
                 "params": self._deserialize_params(row["params"]),
                 "created_at": float(row["created_at"]),
+                "expires_at": (float(row["expires_at"]) if row["expires_at"] is not None else None),
             }
             for row in rows
         ]
@@ -539,7 +644,8 @@ class ApprovalQueue:
             return 0
         count = 0
         for row in self._conn.execute(
-            "SELECT approval_id, namespace, params, created_at, resolved, approved, consumed "
+            "SELECT approval_id, namespace, params, created_at, resolved, approved, consumed, "
+            "payload, expires_at "
             "FROM approval_queue "
             "WHERE resolved = 0 AND namespace = 'exec'",
         ).fetchall():
