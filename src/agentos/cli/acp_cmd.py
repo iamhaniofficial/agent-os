@@ -382,6 +382,23 @@ def stats_line(agent_id: str, result: AcpTurnResult) -> str:
     return "Stats: " + " • ".join(parts)
 
 
+def _quiet_logs() -> None:
+    """Keep info-level harness logs out of interactive output.
+
+    ``agentos acp run`` streams the reply on stdout while the runtime logs on
+    stderr; in a terminal the two interleave. Unless the operator asked for a
+    level explicitly (``AGENTOS_LOG_LEVEL``), only warnings and above show.
+    """
+    import logging
+    import os
+
+    if os.environ.get("AGENTOS_LOG_LEVEL"):
+        return
+    import structlog
+
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.WARNING))
+
+
 def _render_event(event: AcpEvent, *, verbose: bool) -> None:
     if event.kind == "text_delta" and event.text:
         sys.stdout.write(event.text)
@@ -498,6 +515,8 @@ def acp_run(
     workdir = (cwd or Path.cwd()).expanduser().resolve()
     if not workdir.is_dir():
         raise typer.BadParameter(f"{workdir} is not a directory", param_hint="--cwd")
+    if not verbose and not json_output:
+        _quiet_logs()
     turn_timeout = (
         float(timeout) if timeout is not None else float(acp_cfg.turn_timeout_s if acp_cfg else 0)
     )
