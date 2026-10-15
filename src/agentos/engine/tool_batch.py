@@ -223,6 +223,9 @@ class _Admission:
     holds_key: bool = False
     holds_permit: bool = False
     yielded: bool = False
+    # The running call's own timeout, so time spent queueing to be admitted
+    # again does not count against it (a call is not timed while queued).
+    timeout_scope: asyncio.Timeout | None = None
 
     async def acquire(self) -> None:
         await self.slot.future
@@ -259,9 +262,15 @@ class _Admission:
     async def _readmit(self) -> None:
         # Queue again behind whatever was admitted meanwhile; the call runs
         # its tool only once it is admitted under its own policy again.
+        loop = asyncio.get_running_loop()
+        queued_at = loop.time()
         self.slot = self.gate.reserve(exclusive=self.exclusive)
         await self.acquire()
         self.yielded = False
+        scope = self.timeout_scope
+        when = scope.when() if scope is not None else None
+        if scope is not None and when is not None:
+            scope.reschedule(when + (loop.time() - queued_at))
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +418,7 @@ class ToolBatchExecutor:
         key_locks: dict[Hashable, asyncio.Lock] = {}
         tasks: dict[asyncio.Task[ToolResult], _Job] = {}
 
-        async def _run_one(call: ToolCall) -> ToolResult:
+        async def _run_one(call: ToolCall, admission: _Admission) -> ToolResult:
             started = time.monotonic()
             self.call_log(
                 "tool_request",
@@ -430,7 +439,9 @@ class ToolBatchExecutor:
                 result = _timeout_result(call, self.iteration_timeout)
             else:
                 try:
-                    result = await asyncio.wait_for(self.execute(call), timeout=tool_timeout)
+                    async with asyncio.timeout(tool_timeout) as scope:
+                        admission.timeout_scope = scope
+                        result = await self.execute(call)
                 except TimeoutError:
                     result = _timeout_result(call, tool_timeout)
             self.call_log(
@@ -463,7 +474,7 @@ class ToolBatchExecutor:
             token = current_admission.set(admission)
             try:
                 await admission.acquire()
-                return await _run_one(call)
+                return await _run_one(call, admission)
             finally:
                 admission.release()
                 current_admission.reset(token)

@@ -18,6 +18,7 @@ import agentos.engine.runtime as runtime_module
 from agentos.engine import Agent, AgentConfig, ToolResult
 from agentos.engine.tool_batch import (
     ToolBatchExecutor,
+    _Admission,
     _OrderedGate,
     registry_spec_lookup,
     resolve_tool_concurrency,
@@ -741,6 +742,36 @@ async def test_batch_deadline_while_waiting_outside_the_slot_pairs_every_call() 
     assert sorted(_result_ids(events)) == ["t0", "t1"]
     assert all("timed out" in o.result.content for o in executor.outcomes)
     never.cancel()
+
+
+async def test_time_queued_for_readmission_does_not_count_against_the_call_timeout() -> None:
+    """Like a CLI retry, whose timer starts once admitted: waiting for another
+    call's command to finish before running is not the call's own run time."""
+
+    gate = _OrderedGate()
+    admission = _Admission(gate=gate, slot=gate.reserve(exclusive=True), exclusive=True)
+    await admission.acquire()
+    held_for = 0.02
+
+    async def _other_call() -> None:
+        other = gate.reserve(exclusive=True)
+        await other.future  # admitted once ``admission`` steps out
+        await _until(lambda: bool(gate._queue))  # ``admission`` queued again
+        await asyncio.sleep(held_for)  # the other call's command runs
+        gate.release(other)
+
+    other_task = asyncio.create_task(_other_call())
+    async with asyncio.timeout(30.0) as scope:
+        admission.timeout_scope = scope
+        original = scope.when()
+        assert original is not None
+        await admission.wait_outside(asyncio.sleep(0))
+        extended = scope.when()
+    await other_task
+
+    assert extended is not None and extended - original >= held_for
+    assert not admission.yielded
+    admission.release()
 
 
 async def test_wait_outside_tool_slot_is_a_plain_await_outside_a_batch() -> None:
