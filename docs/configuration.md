@@ -490,6 +490,23 @@ defer_loading = false
 
 `agentos context` shows what a request carries with the current setting.
 
+### Parallel tool calls
+
+When a model has several tool calls that do not depend on each other, issuing
+them in one response saves a full provider round trip per extra call; the
+runtime already runs them concurrently. By default AgentOS asks for this with
+`parallel_tool_calls: true` on the providers whose API is known to accept the
+field (api.openai.com and OpenRouter); every other OpenAI-compatible endpoint
+(OpenCAP, Bankr, Surplus, DeepSeek, Zhipu, Gemini-compatible, Ollama, local
+servers) gets nothing, and Anthropic already allows parallel tool use unless
+told otherwise. The system prompt's tool section carries the matching
+instruction. To send nothing, as before:
+
+```toml
+[tools]
+parallel_calls = false
+```
+
 ## Prompt Cache Configuration
 
 Controls prompt prefix caching for LLM providers that support it (Anthropic, OpenAI, DeepSeek, OpenRouter, etc.):
@@ -549,6 +566,24 @@ classifies each turn:
 ```toml
 [agentos_router]
 strategy = "pilot-v1"   # default; or "llm_judge", or "jev" (experimental)
+```
+
+### Effort by tier
+
+A turn the router sends to a cheap tier also runs with less reasoning: when the
+thinking level comes from the routed tier's own config, `c0` turns run at most
+at `low` and `c1` turns at most at `medium`; `c2`, `c3` and the image tier keep
+their configured level. A level is only ever lowered, never raised, and the
+model choice does not change. It does not apply when `[llm] thinking` is set,
+when the router's controller picked the level, or when an explicit model
+overrode the route. Only providers with a thinking-level concept are affected
+(Anthropic effort, OpenAI reasoning effort, OpenRouter `reasoning.effort`).
+Each lowered turn logs `turn_runner.effort_by_tier`. To keep the tier's level
+on every turn:
+
+```toml
+[agentos_router]
+effort_by_tier = false
 ```
 
 Jev settings live in their own sub-table (all fields optional; defaults shown):

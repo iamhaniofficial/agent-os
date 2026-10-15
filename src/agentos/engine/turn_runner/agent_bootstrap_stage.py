@@ -73,6 +73,8 @@ class _AgentConfigAuxiliaries:
     tool_result_store_max_bytes: int
     tool_result_store_disk_budget_bytes: int
     tool_result_store_retention_seconds: int
+    # ``[tools] parallel_calls``
+    parallel_tool_calls: bool = True
 
 @dataclass(frozen=True)
 class _MemorySnapshotResult:
@@ -407,6 +409,7 @@ class AgentBootstrapStage:
             max_history_turns=_route_max_history_turns(inp.turn.metadata),
             model_capabilities=catalog.capabilities,
             thinking=aux.thinking,
+            parallel_tool_calls=aux.parallel_tool_calls,
             tool_result_projection_max_inline_chars=(
                 aux.tool_result_projection_max_inline_chars
             ),

@@ -14,6 +14,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `approval_wait_ms`, `finalize_ms`, `total_ms`, `iterations`). It is logged
   as one `turn.timing` line per turn, stored under `timing` in the decision
   log (schema 16), and printed by `agentos replay`.
+- Parallel tool calls by default. Every agent request now asks for several
+  independent tool calls in one response (`parallel_tool_calls: true`), sent
+  only where the API is known to accept it: api.openai.com (not the o-series
+  reasoning models) and OpenRouter. Other OpenAI-compatible endpoints
+  (OpenCAP, Bankr, Surplus, DeepSeek, Zhipu, Gemini-compatible, Ollama, local
+  servers) get nothing, and Anthropic already allows parallel tool use, so no
+  field is sent there. Subagents inherit the setting. `[tools] parallel_calls
+  = false` sends nothing, as before.
+- Effort by router tier. When the thinking level comes from the routed tier's
+  own config, turns routed to `c0` run at most at `low` and turns routed to
+  `c1` at most at `medium`; `c2`, `c3` and the image tier are unchanged. A
+  level is only lowered, never raised, the model choice never changes, and
+  `[llm] thinking`, a router-controller level or an explicit model override
+  are left alone. Lowered turns log `turn_runner.effort_by_tier`.
+  `[agentos_router] effort_by_tier = false` keeps each tier's level.
 - Suggested next prompt. When a turn finishes, the chat input in the web
   console, the desktop app and `agentos chat` shows the message the user is
   most likely to send next as grey placeholder text; `Tab` takes it into the

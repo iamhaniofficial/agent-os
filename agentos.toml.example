@@ -347,6 +347,10 @@ max_pending_per_session = 64
 [agentos_router]
 enabled = true           # auto tier router
 auto_thinking = true
+# Lower the tier's thinking level on cheap tiers (c0 -> at most low, c1 -> at
+# most medium) when the level comes from the tier config. Never raises a level
+# and never changes the model. false keeps each tier's own level.
+effort_by_tier = true
 rollout_phase = "full"
 strategy = "pilot-v1"    # "pilot-v1" (default; local ONNX+MiniLM router,
                          # English-optimized, no LLM call). Needs the
@@ -518,6 +522,11 @@ enabled = true
 # loaded for the rest of the session. Set false to send every tool on every
 # request. A surface narrowed by an allowlist or profile defers nothing.
 defer_loading = true
+
+# Ask the model for several independent tool calls in one response
+# (parallel_tool_calls), sent only to api.openai.com and OpenRouter; other
+# OpenAI-compatible endpoints get nothing. false sends nothing, as before.
+parallel_calls = true
 
 # Base allowlist. Tool schemas are the fixed overhead on every provider call in
 # every turn — on a stock install roughly 7,300 tokens — so this is usually the

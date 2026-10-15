@@ -1422,6 +1422,8 @@ class Agent:
             ),
             provider_request_max_chars=self._provider_request_proof_max_chars(),
             tool_choice=None,
+            # Only an opt-in: the providers drop it where the API would reject it.
+            parallel_tool_calls=True if self.config.parallel_tool_calls else None,
             context_window_tokens=self.config.context_window_tokens,
         )
         _thinking_fallback_done = False
@@ -4240,6 +4242,7 @@ class Agent:
             tool_use_argument_projection_enabled=(self.config.tool_use_argument_projection_enabled),
             tool_failure_loop_block_threshold=(self.config.tool_failure_loop_block_threshold),
             max_safe_tool_concurrency=self.config.max_safe_tool_concurrency,
+            parallel_tool_calls=self.config.parallel_tool_calls,
             tool_result_store_dir=self.config.tool_result_store_dir,
             tool_result_store_session_id=self.config.tool_result_store_session_id,
             tool_result_store_session_key=self.config.tool_result_store_session_key,

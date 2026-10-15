@@ -776,6 +776,7 @@ def _record_thinking_metadata(ctx: TurnContext, router_cfg: object, tier_cfg: di
         return
     ctx.metadata["thinking_requested"] = True
     ctx.metadata["thinking_level"] = level
+    ctx.metadata["thinking_level_source"] = "tier"
 
 
 def _record_controller_thinking_metadata(
@@ -794,6 +795,7 @@ def _record_controller_thinking_metadata(
         return
     ctx.metadata["thinking_requested"] = True
     ctx.metadata["thinking_level"] = level
+    ctx.metadata["thinking_level_source"] = "controller" if thinking_mode is not None else "tier"
 
 
 def _inject_prompt_hint(message: str, hint: str) -> str:

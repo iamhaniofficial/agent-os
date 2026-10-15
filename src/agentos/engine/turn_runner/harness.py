@@ -439,6 +439,7 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
         thinking = runner._resolve_turn_thinking(turn)
         return _AgentConfigAuxiliaries(
             thinking=thinking,
+            parallel_tool_calls=runner._resolve_parallel_tool_calls(),
             tool_result_store_dir=str(media_root_from_config(runner._config) / "tool-results"),
             tool_result_store_session_id=session_id_for_log or session_key,
             tool_result_projection_max_inline_chars=getattr(

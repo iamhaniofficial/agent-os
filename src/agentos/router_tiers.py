@@ -99,3 +99,41 @@ def tier_index(value: object) -> int:
         return TEXT_TIERS.index(tier)
     except ValueError:
         return -1
+
+
+# Effort by tier ([agentos_router] effort_by_tier): the highest thinking level
+# a turn routed to a text tier runs at. The router picks c0 for trivial turns
+# and c1 for ordinary ones, where long reasoning mostly adds latency; c2, c3
+# and the image tier keep whatever level their tier config asks for.
+TIER_EFFORT_CEILING: dict[str, str] = {
+    "c0": "low",
+    "c1": "medium",
+}
+
+# Thinking levels from least to most effort. ``adaptive`` is left out on
+# purpose: it hands the choice to the provider and some models accept only
+# that mode, so it is never rewritten.
+_EFFORT_ORDER: tuple[str, ...] = ("off", "minimal", "low", "medium", "high", "xhigh")
+
+
+def tier_effort_ceiling(tier: object) -> str | None:
+    """Return the thinking-level ceiling for a routed tier, or None for none."""
+
+    text_tier = normalize_text_tier(tier)
+    if text_tier is None:
+        return None
+    return TIER_EFFORT_CEILING.get(text_tier)
+
+
+def effort_for_tier(tier: object, level: str) -> str:
+    """Return *level* lowered to the tier's ceiling; never raises a level.
+
+    Unknown tiers and unknown levels come back unchanged.
+    """
+
+    ceiling = tier_effort_ceiling(tier)
+    if ceiling is None or level not in _EFFORT_ORDER:
+        return level
+    if _EFFORT_ORDER.index(level) > _EFFORT_ORDER.index(ceiling):
+        return ceiling
+    return level
