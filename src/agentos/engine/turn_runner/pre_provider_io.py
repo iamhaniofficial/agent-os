@@ -26,10 +26,12 @@ Data dependencies between the pre-provider stages of ``TurnRunner._run_turn``
 * ``CompactionAndHistoryStage``: agent -> history (transcript read).
 * ``AttachmentStage``: post-pipeline message, attachments -> extra messages.
 
-So recall, project knowledge, hydrate and the router-context read are mutually
-independent and can all start right after ``InputStage``; the memory warm can
-start as soon as the provider is known and only has to be done before the
-snapshot capture. :class:`PreProviderIO` starts those as tasks and hands the
+So recall, project knowledge, hydrate, the router-context read and the memory
+warm are mutually independent and can all start right after ``InputStage``;
+the warm only has to be done before the snapshot capture. (The one visible
+difference: a turn that fails before ``AgentBootstrapStage``, e.g. "no
+provider", still warms the index. The warm is idempotent per session and the
+next turn would run it anyway.) :class:`PreProviderIO` starts those as tasks and hands the
 results back at the exact point the serial code used them, in the same order,
 so the assembled prompt is unchanged. With ``concurrent=False`` it runs each
 piece lazily at its old call site, i.e. the previous serial behaviour.
@@ -195,6 +197,7 @@ class PreProviderIO:
         project_knowledge: Callable[[], Coroutine[Any, Any, str | None]],
         hydrate_tools: Callable[[], Coroutine[Any, Any, Any]],
         router_context: Callable[[], Coroutine[Any, Any, dict[str, Any]]] | None = None,
+        memory_warm: Callable[[], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
         self._concurrent = concurrent
         self._recall = recall
@@ -209,6 +212,8 @@ class PreProviderIO:
             self._start("hydrate_tools", hydrate_tools)
             if router_context is not None:
                 self._start("router_context", router_context)
+            if memory_warm is not None:
+                self._start("memory_warm", memory_warm)
 
     @property
     def concurrent(self) -> bool:
@@ -245,11 +250,6 @@ class PreProviderIO:
         """The prefetched router-context task, or ``None`` to fetch it in-stage."""
         return self._tasks.pop("router_context", None)
 
-    def start_memory_warm(
-        self,
-        warm: Callable[[], Coroutine[Any, Any, None]] | None,
-    ) -> Awaitable[None] | None:
-        """Start the memory index warm early; ``None`` keeps it in-stage."""
-        if not self._concurrent or warm is None:
-            return None
-        return self._start("memory_warm", warm)
+    def memory_warm(self) -> Awaitable[None] | None:
+        """The running memory index warm, or ``None`` to warm in-stage."""
+        return self._tasks.pop("memory_warm", None)

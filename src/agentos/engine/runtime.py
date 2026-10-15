@@ -2108,6 +2108,7 @@ class TurnRunner:
                 if concurrent
                 else None
             ),
+            memory_warm=self._memory_warm_for(agent_id, session_key) if concurrent else None,
         )
 
     def _memory_warm_for(
@@ -2928,9 +2929,6 @@ class TurnRunner:
             tool_context = pt_out.effective_tool_context
             tool_metadata = pt_out.tool_metadata
 
-            pending_memory_warm = pre_io.start_memory_warm(
-                self._memory_warm_for(agent_id, session_key)
-            )
             pa_outcome = await self._prompt_assembler_stage.run(
                 PromptAssemblerStageInput(
                     runtime_message=runtime_message,
@@ -3050,7 +3048,7 @@ class TurnRunner:
                     request_timeout=request_timeout,
                     max_provider_retries=max_provider_retries,
                     length_capped_continuations=length_capped_continuations,
-                    pending_memory_warm=pending_memory_warm,
+                    pending_memory_warm=pre_io.memory_warm(),
                 )
             )
             ab_out = ab_outcome.require_output()
