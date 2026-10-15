@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+- ACP sessions: `sessions_spawn(runtime="acp")` hands a task to a coding harness
+  and pushes the result back to the parent with a `Stats:` line (runtime,
+  tokens, cost when the harness reports it); `sessions_send` follows up or
+  steers a persistent one, `subagents` lists and kills them, the new `acp`
+  tool inspects and controls them, `worktree=true` gives the harness its own
+  git worktree, and `[acp] allowed_cwds` lets it work outside the workspace.
+
 ## [2026.10.13] - 2026-10-13
 
 ### Added

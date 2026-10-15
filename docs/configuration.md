@@ -1100,6 +1100,18 @@ suggest_next_timeout_seconds = 15.0
 model = "openai/gpt-4o-mini"         # or AGENTOS_SUGGEST_NEXT_MODEL
 ```
 
+## ACP Coding Harnesses
+
+`sessions_spawn(runtime="acp")` delegates a task to an external coding harness
+(Claude Code, Codex, Gemini CLI, ...). The harness runs in the agent workspace
+unless the spawn passes a `cwd`, which must be inside the workspace, inside a
+managed worktree, or under one of `allowed_cwds`:
+
+```toml
+[acp]
+allowed_cwds = ["~/Code/my-app"]   # default []
+```
+
 ## Sandbox and Permissions
 
 Inspect or change posture:

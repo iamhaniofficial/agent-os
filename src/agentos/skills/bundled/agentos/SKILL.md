@@ -240,6 +240,7 @@ Main `agentos.toml` sections (full commented reference:
 | `[auth]` | gateway admission: `mode` (`none` on loopback or `token`), `token` |
 | `[control_ui]` | `allowed_origins` for reverse-proxy setups; `show_thinking` (default true) streams model reasoning to the WebUI as collapsible blocks — WebUI-only, channels never receive it |
 | `[updates]` | `notify` (default true) — the once-per-24h "new release available" notice |
+| `[acp]` | ACP coding harnesses spawned with `sessions_spawn(runtime="acp")`: `allowed_cwds` (default `[]`) lists extra directories a harness may use as `cwd` besides the agent workspace and managed worktrees |
 | `[channels]` | messaging channels (`[[channels.channels]]` entries) |
 | `[auxiliary]` | model for work AgentOS runs itself, not the agent's turn (document analysis, image description): `provider`, `model`, `timeout_seconds`, `[auxiliary.tasks.<task>]`. Empty = reuse `[llm]` |
 | `[sessions]` | `auto_title` (name a new session from its first message) and `suggest_next` (after each turn the chat input shows the likely next prompt as grey text; Tab takes it, Enter sends it), each with a `*_timeout_seconds`; both default on and run on the `[auxiliary]` model (`session_title` / `suggest_next` tasks) |

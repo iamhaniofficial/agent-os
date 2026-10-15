@@ -353,6 +353,30 @@ class AcpSessionManager:
         attachments: list[dict[str, Any]] | None = None,
         on_event: EventCallback | None = None,
     ) -> AcpTurnResult:
+        try:
+            return await self._run_turn(
+                session_key, text, spec=spec, attachments=attachments, on_event=on_event
+            )
+        finally:
+            # The session just went idle (or away): a turn waiting for a
+            # harness slot may now evict it.
+            await self._notify_slot_waiters()
+
+    async def _notify_slot_waiters(self) -> None:
+        if self._slot_cond is None:
+            return
+        async with self._slot_cond:
+            self._slot_cond.notify_all()
+
+    async def _run_turn(
+        self,
+        session_key: str,
+        text: str,
+        *,
+        spec: AcpSessionSpec | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        on_event: EventCallback | None = None,
+    ) -> AcpTurnResult:
         """Run one harness turn and return its result.
 
         Events are delivered to ``on_event`` as they arrive. Raises
