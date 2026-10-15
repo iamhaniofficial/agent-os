@@ -357,8 +357,9 @@ max_pending_per_session = 64
 enabled = true           # auto tier router
 auto_thinking = true
 # Lower the tier's thinking level on cheap tiers (c0 -> at most low, c1 -> at
-# most medium) when the level comes from the tier config. Never raises a level
-# and never changes the model. false keeps each tier's own level.
+# most medium) when the level is the shipped tier default. Never raises a
+# level, never changes the model, and skips router-control pins and tier levels
+# set to something other than the shipped value. false keeps each tier's level.
 effort_by_tier = true
 rollout_phase = "full"
 strategy = "pilot-v1"    # "pilot-v1" (default; local ONNX+MiniLM router,
@@ -577,8 +578,14 @@ enabled = true
 # for the summarizer.
 # proactive = true
 # proactive_ratio = 0.70
+# Seconds the session must stay idle after the turn before the background
+# summarizer starts (a turn that starts first cancels it for free). A job
+# cancelled mid-summary doubles the wait for that session, up to 300 s, until
+# one completes. 0 = start at once.
+# proactive_idle_seconds = 20
 # Scale the request-size estimate by the input tokens providers report
-# (per provider/model, clamped 0.5-1.25); false = raw chars/4 estimate.
+# (per provider/model, clamped 0.7-1.25; estimated usage and requests with
+# images/documents are not counted); false = raw chars/4 estimate.
 # estimate_calibration = true
 
 [auxiliary]

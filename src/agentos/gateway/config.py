@@ -1593,6 +1593,11 @@ class CompactionLlmConfig(BaseSettings):
     # ``false`` leaves compaction to the in-turn preflight only.
     proactive: bool = True
     proactive_ratio: float = Field(default=0.70, gt=0.0, le=1.0)
+    # Seconds the session must stay idle after a turn before the proactive job
+    # calls the summarizer; a turn that starts first cancels it for free. A job
+    # cancelled mid-summary doubles the wait for that session (up to 300 s)
+    # until one completes. 0 starts at once.
+    proactive_idle_seconds: float = Field(default=20.0, ge=0.0, le=300.0)
     # Scale the compaction trigger's request-size estimate by the observed
     # provider_input_tokens / estimate ratio per (provider, model).
     # ``false`` uses the raw chars/4 estimate.

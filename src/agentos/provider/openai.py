@@ -436,6 +436,11 @@ class _UsageAccumulator:
             self._values[index] = value
             self._estimated[index] = estimated
 
+    @property
+    def input_estimated(self) -> bool:
+        """Whether the input count came only from an ``estimated`` usage chunk."""
+        return bool(self._values[0]) and self._estimated[0]
+
     def fields(self) -> tuple[int, int, int, int, int, float]:
         values = self._values
         return (
@@ -1740,6 +1745,7 @@ class OpenAIProvider:
                     cost_source=cost_source,
                     reasoning_details=reasoning_details or None,
                     cache_usage_reported=usage_acc.cache_reads_reported,
+                    usage_estimated=usage_acc.input_estimated,
                 )
 
         except StreamIdleTimeoutError as exc:
@@ -1917,6 +1923,7 @@ class OpenAIProvider:
             cost_source=cost_source,
             reasoning_details=message_reasoning_details or None,
             cache_usage_reported=cache_usage_reported,
+            usage_estimated=isinstance(raw_usage, Mapping) and bool(raw_usage.get("estimated")),
         )
 
     async def list_models(self) -> list[ModelInfo]:

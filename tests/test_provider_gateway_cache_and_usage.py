@@ -348,6 +348,35 @@ def test_estimated_usage_never_overrides_the_real_count(
     done = _usage_done(monkeypatch, [_TEXT, estimated, real])
 
     assert (done.input_tokens, done.output_tokens, done.cached_tokens) == (20750, 176, 16805)
+    assert done.usage_estimated is False
+
+
+def test_a_stream_whose_only_input_count_is_estimated_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    estimated = {
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 25746, "completion_tokens": 3, "estimated": True},
+    }
+
+    done = _usage_done(monkeypatch, [_TEXT, estimated])
+
+    assert done.input_tokens == 25746
+    assert done.usage_estimated is True
+
+
+def test_a_trailing_estimated_chunk_does_not_mark_real_usage_estimated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trailing = {
+        "choices": [],
+        "usage": {"prompt_tokens": 99999, "completion_tokens": 1, "estimated": True},
+    }
+
+    done = _usage_done(monkeypatch, [_TEXT, _CLAUDE_FINISH, trailing])
+
+    assert done.input_tokens == 36456
+    assert done.usage_estimated is False
 
 
 def test_usage_without_any_cache_figure_is_reported_as_unknown(

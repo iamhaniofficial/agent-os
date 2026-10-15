@@ -4120,17 +4120,21 @@ class TurnRunner:
     def _effort_by_tier(self, level: ThinkingLevel, metadata: Mapping[str, Any]) -> ThinkingLevel:
         """Cap a router-chosen thinking level at the routed tier's ceiling.
 
-        Only the tier's own level is capped: a controller-chosen level, an
-        explicit ``[llm] thinking`` (handled before this) or a route the turn
-        did not honor stay as they are. ``[agentos_router] effort_by_tier =
-        false`` turns it off. The model choice is never touched.
+        Only the shipped tier level is capped (``tier_default``): an
+        operator-configured tier level, a controller-chosen level, a
+        router-control hold (the user picked the route), an explicit
+        ``[llm] thinking`` (handled before this) or a route the turn did not
+        honor stay as they are. ``[agentos_router] effort_by_tier = false``
+        turns it off. The model choice is never touched.
         """
         from agentos.router_tiers import effort_for_tier
 
         router_cfg = getattr(self._config, "agentos_router", None) if self._config else None
         if not getattr(router_cfg, "effort_by_tier", True):
             return level
-        if metadata.get("thinking_level_source") != "tier":
+        if metadata.get("router_control_hold_applied"):
+            return level
+        if metadata.get("thinking_level_source") != "tier_default":
             return level
         if metadata.get("routing_applied") is False:
             return level

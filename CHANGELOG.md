@@ -22,20 +22,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   servers) get nothing, and Anthropic already allows parallel tool use, so no
   field is sent there. Subagents inherit the setting. `[tools] parallel_calls
   = false` sends nothing, as before.
-- Effort by router tier. When the thinking level comes from the routed tier's
-  own config, turns routed to `c0` run at most at `low` and turns routed to
-  `c1` at most at `medium`; `c2`, `c3` and the image tier are unchanged. A
-  level is only lowered, never raised, the model choice never changes, and
-  `[llm] thinking`, a router-controller level or an explicit model override
-  are left alone. Lowered turns log `turn_runner.effort_by_tier`.
-  `[agentos_router] effort_by_tier = false` keeps each tier's level.
+- Effort by router tier. When a turn runs at the thinking level the shipped
+  tier table gives the routed tier, turns routed to `c0` run at most at `low`
+  and turns routed to `c1` at most at `medium`; `c2`, `c3` and the image tier
+  are unchanged. A level is only lowered, never raised, and the model choice
+  never changes. Left alone: `[llm] thinking`, a router-controller level, an
+  explicit model override, a route or model the user pinned with router
+  control, and a tier level the operator set to something other than the
+  shipped value. Lowered turns log `turn_runner.effort_by_tier`.
+  `[agentos_router] effort_by_tier = false` keeps each tier's level (needed to
+  keep a cheap tier at a level equal to the shipped one, since config files
+  store the whole tier table).
 - Proactive compaction. When a turn ends with the session's history at
-  `[compaction] proactive_ratio` (default 0.70) of the compaction trigger, the
-  session is compacted in the background between turns with the same
+  `[compaction] proactive_ratio` (default 0.70) of the compaction trigger and
+  the session then stays idle for `[compaction] proactive_idle_seconds`
+  (default 20), the session is compacted in the background with the same
   summarizer and persisted like an in-turn compaction (checkpoint, summary,
   `reset` record, notifications with phase `proactive_background`), so the
   next turn no longer waits for the summarizer. A turn that starts first
-  makes the job persist nothing; subagent and cron sessions are skipped; the
+  makes the job persist nothing (and when it cancels a summary already in
+  progress, the idle wait doubles for that session, up to 300 s, until a job
+  completes); a job that has persisted is never cancelled, and one whose
+  session was reset or truncated meanwhile is skipped without a failure
+  notice; subagent and cron sessions are skipped; the
   in-turn check stays as the safety net. `[compaction] proactive = false`
   turns it off.
 - Suggested next prompt. When a turn finishes, the chat input in the web
@@ -97,8 +106,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   over-counted 1.6-2x against provider-reported input tokens, so compaction
   fired far too early. Per provider and model, a running ratio of reported
   input tokens to the estimate now scales the estimate after two calls
-  (clamped 0.5-1.25; logged on `agent.context_estimate_vs_provider` as
-  `calibration_factor`). `[compaction] estimate_calibration = false` keeps the
+  (clamped 0.7-1.25; logged on `agent.context_estimate_vs_provider` as
+  `calibration_factor`). Usage the provider marks `"estimated": true`
+  (OpenCAP) and requests carrying image or document blocks are not used as
+  samples. `[compaction] estimate_calibration = false` keeps the
   raw estimate.
 - Turn setup runs its independent reads concurrently: the external memory
   provider's recall, the session's project knowledge, the deferred-tool

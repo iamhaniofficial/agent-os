@@ -505,7 +505,10 @@ agentos config set compaction.summary_timeout_seconds 30
 
 Once a turn ends with the history at `compaction.proactive_ratio` (default
 0.70) of the compaction trigger, the session is compacted in the background
-before the next turn; `compaction.proactive false` turns that off. The
+before the next turn, once the session has been idle for
+`compaction.proactive_idle_seconds` (default 20; doubled per session, up to
+300, after a turn cancels a running summary); `compaction.proactive false`
+turns that off. The
 trigger's size estimate is calibrated per provider/model against the input
 tokens providers report; `compaction.estimate_calibration false` uses the raw
 estimate:
@@ -513,6 +516,7 @@ estimate:
 ```sh
 agentos config set compaction.proactive false
 agentos config set compaction.proactive_ratio 0.6
+agentos config set compaction.proactive_idle_seconds 60
 agentos config set compaction.estimate_calibration false
 ```
 
