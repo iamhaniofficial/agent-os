@@ -125,7 +125,7 @@ The main agent delegates with `sessions_spawn`:
   "task": "Fix the failing test in tests/test_api.py and run pytest.",
   "runtime": "acp",
   "acp_agent": "claude",
-  "cwd": "/Users/me/code/app",
+  "cwd": "/path/to/app",
   "mode": "oneshot"
 }
 ```

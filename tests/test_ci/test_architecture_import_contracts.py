@@ -29,6 +29,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("channels", "gateway"),
     ("channels", "session"),
     ("channels", "tools"),
+    # The ACP consumer (agentos.acp) depends only on stdlib + typing at its
+    # core; the CLI and the acp.* RPC read its registry and contract types.
+    ("cli", "acp"),
     ("cli", "agents"),
     ("cli", "compat"),
     ("cli", "contracts"),
@@ -83,6 +86,7 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # is pulled in until a surface actually asks for a listing.
     ("env_catalog.py", "onboarding"),
     ("env_catalog.py", "skills"),
+    ("gateway", "acp"),
     ("gateway", "agentos_router"),
     ("gateway", "compat"),
     ("onboarding", "agentos_router"),

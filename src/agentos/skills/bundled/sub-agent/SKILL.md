@@ -75,7 +75,7 @@ the error and ask; do not silently switch harness or do the work yourself.
   "task": "Fix the failing test in tests/test_api.py. Run pytest -q before you finish and report what changed.",
   "runtime": "acp",
   "acp_agent": "codex",
-  "cwd": "/Users/me/code/app",
+  "cwd": "/path/to/app",
   "mode": "oneshot"
 }
 ```
