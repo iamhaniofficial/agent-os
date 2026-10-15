@@ -530,21 +530,25 @@ def test_stats_line_without_cost_or_tokens() -> None:
 def test_sessions_reads_store_when_gateway_is_down(config_file: Path, tmp_path: Path) -> None:
     folder = tmp_path / "acp-state" / "sessions"
     folder.mkdir(parents=True)
+
+    def _record(record_id: str, **handle: Any) -> str:
+        base = {
+            "record_id": record_id,
+            "argv": ["fake"],
+            "argv_hash": "x",
+            "created_at": 1,
+            "last_used_at": 1,
+            "status": "idle",
+            "mode": "persistent",
+        }
+        base.update(handle)
+        return json.dumps({"schema": 1, "session_key": None, "closed_at": None, "handle": base})
+
     (folder / "r-old.json").write_text(
-        json.dumps({"record_id": "r-old", "agent_id": "codex", "cwd": "/a", "last_used_at": 1}),
-        encoding="utf-8",
+        _record("r-old", agent_id="codex", cwd="/a", last_used_at=1), encoding="utf-8"
     )
     (folder / "r-new.json").write_text(
-        json.dumps(
-            {
-                "agent_id": "claude",
-                "cwd": "/b",
-                "status": "idle",
-                "last_used_at": 5,
-                "mode": "persistent",
-            }
-        ),
-        encoding="utf-8",
+        _record("r-new", agent_id="claude", cwd="/b", last_used_at=5), encoding="utf-8"
     )
     (folder / "junk.json").write_text("{not json", encoding="utf-8")
 

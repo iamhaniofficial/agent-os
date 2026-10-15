@@ -171,7 +171,7 @@ def get_harness(agent_id: str) -> HarnessDefinition | None:
 class ResolvedLaunch:
     agent_id: str
     argv: list[str]
-    source: str  # installed | package-exec | override
+    source: str  # installed | package-exec | native | override
     missing_commands: list[str] = field(default_factory=list)
 
 
@@ -196,4 +196,5 @@ def resolve_launch(
     missing = [c for c in h.required_commands if which(c) is None]
     if h.installed_argv and which(h.installed_argv[0]) is not None:
         return ResolvedLaunch(aid, list(h.installed_argv), "installed", missing)
-    return ResolvedLaunch(aid, list(h.argv), "package-exec", missing)
+    source = "package-exec" if h.argv[0] in ("npx", "uvx", "npm", "pnpm", "bunx") else "native"
+    return ResolvedLaunch(aid, list(h.argv), source, missing)

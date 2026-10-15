@@ -952,11 +952,18 @@ async def _emit_task_runtime_stream_events(
             code_text = str(code or "").lower()
             is_timeout = "timeout" in code_text or "stream idle" in error_message.lower()
             is_output_truncated = code_text == "provider_output_truncated"
+            is_cancelled = "cancelled" in code_text
             terminal_reason = (
-                "timeout" if is_timeout else "output_truncated" if is_output_truncated else "error"
+                "timeout"
+                if is_timeout
+                else "cancelled"
+                if is_cancelled
+                else "output_truncated"
+                if is_output_truncated
+                else "error"
             )
             terminal_payload = {
-                "status": "timeout" if is_timeout else "failed",
+                "status": "timeout" if is_timeout else "cancelled" if is_cancelled else "failed",
                 "terminal_reason": terminal_reason,
                 "error_class": code,
                 "error_message": error_message,

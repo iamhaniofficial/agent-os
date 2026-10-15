@@ -237,3 +237,13 @@ def test_projected_records_map_one_to_one_onto_engine_events() -> None:
     assert [e.kind for e in engine] == [e.kind for e in projected]
     assert engine[2].arguments == {"p": 1}
     assert engine[3].cost_source == "harness" and engine[4].code == "ACP_TURN_TIMEOUT"
+
+
+def test_distinct_harness_messages_are_separated() -> None:
+    from agentos.acp.projector import AcpProjector
+    from agentos.acp.types import AcpEvent
+
+    p = AcpProjector(stream_delivery="final_only")
+    p.feed(AcpEvent(kind="text_delta", text="I'll create the file now.", raw={"message_id": "m1"}))
+    p.feed(AcpEvent(kind="text_delta", text="Done.", raw={"message_id": "m2"}))
+    assert "".join(p._text_parts) == "I'll create the file now.\n\nDone."

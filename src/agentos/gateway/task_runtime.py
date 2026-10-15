@@ -983,9 +983,14 @@ class TaskRuntime:
             )
         except Exception as exc:  # noqa: BLE001 - runtime ledger records the class.
             terminal_reason = str(getattr(exc, "terminal_reason", None) or "error")
-            status = (
-                AgentTaskStatus.TIMEOUT if terminal_reason == "timeout" else AgentTaskStatus.FAILED
-            )
+            if terminal_reason == "timeout":
+                status = AgentTaskStatus.TIMEOUT
+            elif terminal_reason == "cancelled":
+                # An operator or agent cancel surfaced through the turn stream
+                # (ACP harness turns): not a failure, do not invite a retry.
+                status = AgentTaskStatus.CANCELLED
+            else:
+                status = AgentTaskStatus.FAILED
             await self._mark_terminal(
                 task,
                 status,

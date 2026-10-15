@@ -271,7 +271,10 @@ async def _projected_turn_stream(
         return
 
     if result.stop_reason == "cancelled":
-        cancelled = AcpTurnError("Harness turn was cancelled", code="ACP_TURN_CANCELLED")
+        cancelled = AcpTurnError(
+            "Harness turn was cancelled by an operator or the parent agent; do not retry it",
+            code="ACP_TURN_CANCELLED",
+        )
         await _persist_turn(
             session_manager=session_manager,
             session_key=session_key,

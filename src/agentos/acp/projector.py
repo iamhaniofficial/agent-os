@@ -138,6 +138,7 @@ class AcpProjector:
     max_text_chars: int = MAX_ASSISTANT_TEXT_CHARS
     show_thoughts: bool = False
     _text_parts: list[str] = field(default_factory=list)
+    _last_message_id: str | None = None
     _text_len: int = 0
     _dropped_chars: int = 0
     _current_segment_text: list[str] = field(default_factory=list)
@@ -154,7 +155,7 @@ class AcpProjector:
         """Map one harness event to zero or more engine events."""
         kind = event.kind
         if kind == "text_delta":
-            return self._on_text(event.text or "")
+            return self._on_text(event.text or "", message_id=_message_id(event))
         if kind == "tool_call":
             return self._on_tool_call(event)
         if kind == "tool_call_update":
@@ -172,9 +173,20 @@ class AcpProjector:
         # :meth:`error_event` once ``result`` resolves.
         return []
 
-    def _on_text(self, text: str) -> list[EngineEvent]:
+    def _on_text(self, text: str, *, message_id: str | None = None) -> list[EngineEvent]:
         if not text:
             return []
+        if (
+            message_id
+            and self._last_message_id
+            and message_id != self._last_message_id
+            and self._text_parts
+            and not "".join(self._text_parts[-2:]).endswith("\n")
+        ):
+            # A new harness message: keep it from gluing onto the previous one.
+            text = "\n\n" + text
+        if message_id:
+            self._last_message_id = message_id
         room = self.max_text_chars - self._text_len
         if room <= 0:
             self._dropped_chars += len(text)
@@ -374,6 +386,12 @@ class AcpProjector:
             model=usage.model or model,
             reasoning_content="".join(self._thoughts) or None,
         )
+
+
+def _message_id(event: AcpEvent) -> str | None:
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    value = raw.get("message_id") or raw.get("messageId")
+    return str(value) if value else None
 
 
 def error_event(exc: BaseException) -> ErrorEvent:

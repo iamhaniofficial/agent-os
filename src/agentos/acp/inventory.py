@@ -106,8 +106,8 @@ def harness_row(agent_id: str, config: Any = None, *, which: Which | None = None
 
     problems: list[str] = []
     for cmd in launch.missing_commands:
-        problems.append(f"`{cmd}` is not on PATH; install the {_name(definition, aid)} CLI")
-    if not launcher_found:
+        problems.append(f"`{cmd}` is not on PATH; install {_name(definition, aid)} first")
+    if not launcher_found and launcher not in launch.missing_commands:
         problems.append(f"launcher `{launcher}` is not on PATH")
     elif launch.source == "package-exec" and launcher in _PACKAGE_LAUNCHERS and not install_missing:
         problems.append(

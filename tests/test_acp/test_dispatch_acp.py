@@ -220,3 +220,20 @@ async def test_oneshot_followup_is_refused(tmp_path) -> None:
             assert "closed" in str(exc) or "oneshot" in str(exc)
         else:  # pragma: no cover
             raise AssertionError("expected refusal")
+
+
+async def test_operator_cancel_ends_task_as_cancelled_not_failed(tmp_path) -> None:
+    """``acp cancel`` (manager.cancel, not task_runtime.cancel) must not read as a
+    failure to the parent: live testing showed the parent retrying the task."""
+    runtime = FakeRuntime([Script(block=True)])
+    async with acp_rig(tmp_path, runtime) as rig:
+        out = await _spawn(task="long", acp_agent="claude", mode="persistent")
+        await asyncio.wait_for(runtime.turn_started.wait(), timeout=5)
+        await asyncio.sleep(0)
+        assert await rig.manager.cancel(out["session_key"], reason="operator_cancel")
+        record = await rig.task_runtime.wait(out["task_id"], timeout=5)
+        assert str(getattr(record.status, "value", record.status)) == "cancelled"
+        assert record.terminal_reason == "cancelled"
+        errors = [p for k, n, p in rig.events if n == "session.event.error"]
+        assert errors and errors[0]["code"] == "ACP_TURN_CANCELLED"
+        assert errors[0]["terminal_reason"] == "cancelled"
