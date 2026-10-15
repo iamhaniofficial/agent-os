@@ -207,6 +207,7 @@ def _save_http_response_body(raw_body: bytes, output_path: str | None) -> tuple[
     },
     required=["url"],
     result_budget_class="external",
+    defer_loading=True,
 )
 @sandboxed(
     kind="network.http",
@@ -743,6 +744,8 @@ def _search_error_payload(
 
 @tool(
     name="web_search",
+    concurrency="parallel",
+    read_only=True,
     description="Search the web and return results with titles, URLs, and snippets.",
     params={
         "query": {"type": "string", "description": "Search query."},

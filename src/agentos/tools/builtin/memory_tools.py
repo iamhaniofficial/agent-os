@@ -883,6 +883,8 @@ def create_memory_tools(
 
     @tool(
         name="memory_search",
+        concurrency="parallel",
+        read_only=True,
         description=(
             "Recall step for prior work, decisions, dated history, todos, and "
             "historical memory not already present in injected context. By default, "
@@ -1220,6 +1222,8 @@ def create_memory_tools(
 
     @tool(
         name="memory_get",
+        concurrency="parallel",
+        read_only=True,
         description=(
             "Read curated memory source files (MEMORY.md or memory/**/*.md) with optional "
             "from/lines. Use after memory_search for curated file results; indexed sessions "

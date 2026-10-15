@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import Hashable, Mapping
+from typing import Any
 
 import structlog
 
@@ -222,6 +224,29 @@ def evict_spawn_lock(parent_session_key: str) -> bool:
     return _spawn_locks.pop(parent_session_key, None) is not None
 
 
+def _sessions_send_concurrency_key(
+    arguments: Mapping[str, Any], _session_key: str | None
+) -> Hashable | None:
+    """Serialise sends to one target session; different targets may overlap."""
+    target = arguments.get("session_key")
+    if isinstance(target, str) and target.strip():
+        return ("sessions_send", target.strip())
+    return None
+
+
+def _sessions_spawn_concurrency_key(
+    _arguments: Mapping[str, Any], session_key: str | None
+) -> Hashable | None:
+    """Serialise spawns per parent session rather than across all sessions."""
+    parent_key = session_key
+    if not parent_key:
+        ctx = current_tool_context.get()
+        parent_key = ctx.session_key if ctx is not None else None
+    if parent_key:
+        return ("sessions_spawn", parent_key)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # sessions_send
 # ---------------------------------------------------------------------------
@@ -229,6 +254,8 @@ def evict_spawn_lock(parent_session_key: str) -> bool:
 
 @tool(
     name="sessions_send",
+    concurrency="keyed",
+    concurrency_key=_sessions_send_concurrency_key,
     description="Send a message to another session (inter-session communication).",
     params={
         "session_key": {
@@ -298,6 +325,8 @@ async def sessions_send(session_key: str, message: str) -> str:
 
 @tool(
     name="sessions_spawn",
+    concurrency="keyed",
+    concurrency_key=_sessions_spawn_concurrency_key,
     description=(
         "Spawn an isolated subagent session with its own context window and transcript. "
         "This returns immediately; after spawning one or more subagents, call "
@@ -506,6 +535,8 @@ async def sessions_spawn(
 
 @tool(
     name="sessions_list",
+    concurrency="parallel",
+    read_only=True,
     description="List active sessions with optional filters.",
     params={
         "agent_id": {
@@ -551,6 +582,8 @@ async def sessions_list(
 
 @tool(
     name="sessions_history",
+    concurrency="parallel",
+    read_only=True,
     description="Retrieve conversation history from a session's transcript.",
     params={
         "session_key": {
@@ -746,6 +779,8 @@ async def sessions_yield(
 
 @tool(
     name="session_status",
+    concurrency="parallel",
+    read_only=True,
     description="Show current session usage, cost, and model information.",
     params={},
     required=[],
@@ -810,6 +845,7 @@ async def session_status() -> str:
         },
     },
     required=["name"],
+    defer_loading=True,
 )
 async def session_rename(name: str) -> str:
     """Set (or clear) the calling session's ``display_name``.

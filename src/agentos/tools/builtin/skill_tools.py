@@ -397,6 +397,32 @@ def _skill_setup_note(skill: Any) -> str:
     return f"\n\n[Skill setup note: {body}]"
 
 
+async def _load_required_tools_note(skill: Any) -> str:
+    """Load the deferred tools a skill requires; say so in one line.
+
+    A skill that lists a deferred tool in ``requires_tools`` is about to tell
+    the model to call it, so loading the skill loads the tool too — the same
+    on-demand step, not a second one through ``tool_search``.
+    """
+
+    required = [str(name) for name in (getattr(skill, "requires_tools", None) or []) if name]
+    if not required:
+        return ""
+    from agentos.tools.deferred import load_for_current_session
+
+    try:
+        loaded = await load_for_current_session(required)
+    except Exception:  # noqa: BLE001 - reading the skill must not fail on this
+        return ""
+    if not loaded:
+        return ""
+    names = ", ".join(loaded)
+    return (
+        f"[Just loaded the tools this skill uses: {names}. They are available now; "
+        "prefer calling them over running this skill's scripts with exec_command.]\n\n"
+    )
+
+
 def _skill_dir_note(skill: Any) -> str:
     """Return leading ``[Skill directory: ...]`` / ``[Skill interpreter: ...]`` lines, or ``""``.
 
@@ -449,6 +475,8 @@ def create_skill_tools(loader: SkillLoader) -> None:
 
     @tool(
         name="skill_list",
+        concurrency="parallel",
+        read_only=True,
         description="List all available skills with name, description, and eligibility.",
     )
     async def skill_list() -> str:
@@ -799,6 +827,9 @@ def create_skill_tools(loader: SkillLoader) -> None:
 
     @tool(
         name="skill_view",
+        # Not read-only: reading a skill loads the deferred tools it requires,
+        # so it runs alone and a tool call batched after it sees the load.
+        concurrency="exclusive",
         description=(
             "Read a skill's SKILL.md content by name. A large skill comes back as its "
             "opening sections plus an index of the rest — pass section to read one of "
@@ -875,7 +906,7 @@ def create_skill_tools(loader: SkillLoader) -> None:
             # Expand before slicing or budgeting, so an outline's character offsets
             # and a section lookup both run over the exact text the model receives.
             raw = expand_skill_placeholders(skill.content or "", skill.base_dir)
-            note = _skill_dir_note(skill)
+            note = _skill_dir_note(skill) + await _load_required_tools_note(skill)
             if section:
                 return note + _skill_section(skill, raw, section)
 
@@ -893,6 +924,8 @@ def create_skill_tools(loader: SkillLoader) -> None:
 
     @tool(
         name="skill_search_community",
+        concurrency="parallel",
+        read_only=True,
         description=(
             "Search Community skill sources such as ClawHub. Use this when the user asks to "
             "find, search, browse, or locate installable skills from the community marketplace. "
@@ -920,6 +953,7 @@ def create_skill_tools(loader: SkillLoader) -> None:
             },
         },
         required=["query"],
+        defer_loading=True,
     )
     async def skill_search_community(
         query: str,
@@ -1111,6 +1145,7 @@ def create_skill_tools(loader: SkillLoader) -> None:
             },
         },
         required=["name", "description", "content"],
+        defer_loading=True,
     )
     async def skill_create(
         name: str,
@@ -1196,6 +1231,7 @@ def create_skill_tools(loader: SkillLoader) -> None:
             },
         },
         required=["name"],
+        defer_loading=True,
     )
     async def skill_edit(
         name: str,
@@ -1251,6 +1287,7 @@ def create_skill_tools(loader: SkillLoader) -> None:
             },
         },
         required=["name"],
+        defer_loading=True,
     )
     async def skill_delete(name: str) -> str:
         import shutil

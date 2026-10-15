@@ -301,3 +301,51 @@ def test_clear_drops_reset_flags() -> None:
     monitor.notify_compaction("s1")
     monitor.clear()
     assert "s1" not in monitor._baselines
+
+
+def test_prompt_state_hashes_each_sealed_message_once(monkeypatch) -> None:
+    """Measurement: recording consecutive requests re-hashes only new messages."""
+    from agentos.engine import cache_break_monitor as monitor_module
+
+    hashed: list[Message] = []
+    real_hash = monitor_module._stable_hash
+
+    def _counting_hash(value):
+        if isinstance(value, Message):
+            hashed.append(value)
+        return real_hash(value)
+
+    monkeypatch.setattr(monitor_module, "_stable_hash", _counting_hash)
+    monitor = monitor_module.CacheBreakMonitor()
+    history = [Message(role="user", content=f"m{index}") for index in range(50)]
+    config = ChatConfig(system="stable")
+
+    first = monitor.record_prompt_state(messages=history, tools=None, config=config, model="m")
+    grown = [*history, Message(role="assistant", content="new"), Message(role="user", content="q")]
+    second = monitor.record_prompt_state(messages=grown, tools=None, config=config, model="m")
+
+    # 48 prefix messages hashed for the first request, then only the 2 that
+    # newly entered the prefix -- not all 50 again.
+    assert len(hashed) == 48 + 2
+    assert second.messages_prefix_item_hashes[:48] == first.messages_prefix_item_hashes
+
+
+def test_prompt_state_memo_does_not_keep_messages_alive() -> None:
+    """The process-wide memo holds hashes and weak references, not messages."""
+    import gc
+    import weakref
+
+    monitor = CacheBreakMonitor()
+    big = Message(role="user", content="r" * 200_000)
+    probe = weakref.ref(big)
+    monitor.record_prompt_state(
+        messages=[big, Message(role="assistant", content="a"), Message(role="user", content="q")],
+        tools=None,
+        config=ChatConfig(system="s"),
+        model="m",
+    )
+
+    del big
+    gc.collect()
+
+    assert probe() is None

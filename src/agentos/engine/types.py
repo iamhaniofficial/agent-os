@@ -240,8 +240,9 @@ class CompactionOutcome:
     kept_entries: list[dict] = field(default_factory=list)
     removed_count: int = 0
     compaction_id: str | None = None
-    request_context_insert_index: int | None = None
-    runtime_context_insert_index: int | None = None
+    # Index of the current turn's first input message in ``messages``
+    # (2 after a compaction: the summary exchange comes first).
+    turn_input_index: int = 0
 
 
 AgentEvent = (
@@ -292,7 +293,10 @@ class AgentConfig:
     tool_timeout: float = 60.0
     # Upper bound for same-turn safe tool execution. Safe tools can overlap, but
     # unbounded fan-out can overload local/network resources.
-    max_safe_tool_concurrency: int = 6
+    max_safe_tool_concurrency: int = 8
+    # Ask the provider for several tool calls per response
+    # (``[tools] parallel_calls``). ``False`` sends nothing, as before.
+    parallel_tool_calls: bool = True
     max_tokens: int = 16384
     # Optional per-turn operator budgets. 0 disables the corresponding budget.
     max_turn_llm_calls: int = 0
@@ -312,6 +316,15 @@ class AgentConfig:
     context_overflow_threshold: float = 0.85  # trigger at 85%
     max_overflow_retries: int = 2
     max_history_turns: int = 0  # 0 = unlimited; compaction handles oversized history
+    # Tool results / tool-call arguments over this many chars are shortened to
+    # head/tail + store handle when their turn ends ([compaction]
+    # history_tool_result_max_chars). 0 = 2% of the window, clamped 4k-12k.
+    history_tool_result_max_chars: int = 0
+    # Inline compaction summarizer: auxiliary-client timeout ([compaction]
+    # summary_timeout_seconds) and the (provider, model) hint for it -- the
+    # router's cheapest text tier, filled in by the runtime.
+    compaction_summary_timeout_seconds: float = 45.0
+    compaction_summary_model_hint: tuple[str, str] = ("", "")
     # Retry policy for transient LLM errors (429, 500, 503)
     max_provider_retries: int = 3
     length_capped_continuations: int = 1
@@ -325,6 +338,8 @@ class AgentConfig:
     # Prompt caching breakpoints (list of {"text": ..., "cache": "true"})
     cache_breakpoints: list[dict[str, str]] | None = None
     cache_mode: Literal["off", "auto", "on"] = "off"
+    # Prompt-cache TTL for the stable prefix (``[prompt_cache] ttl``).
+    cache_ttl: Literal["5m", "1h"] | None = None
     # Per-turn volatile request context injected after persisted history
     # and before the current user turn. It is not persisted to history.
     request_context_prompt: str | None = None
@@ -349,7 +364,6 @@ class AgentConfig:
     provider_request_proof_max_chars: int = 0
     tool_use_argument_provider_request_max_chars: int = 0
     tool_use_argument_projection_enabled: bool = False
-    tool_result_external_keep_recent: int = 2
     tool_failure_loop_block_threshold: int = 3
     tool_result_store_dir: str | None = None
     tool_result_store_session_id: str | None = None

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import contextvars
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Hashable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from agentos.channel_pairing import ChannelAdmission
 
@@ -178,6 +178,22 @@ CRON_ELEVATED_ALLOW: frozenset[str] = CRON_AGENT_ALLOW | CRON_ELEVATED_EXTRA_ALL
 CRON_ELEVATED_DENY: frozenset[str] = CRON_AGENT_DENY - CRON_ELEVATED_EXTRA_ALLOW
 
 
+# How calls to one tool may overlap with other calls in the same model turn.
+#
+# ``parallel``  - may run alongside any other non-exclusive call.
+# ``keyed``     - like ``parallel``, but calls that share a concurrency key run
+#                 one at a time (e.g. two sends to the same session).
+# ``exclusive`` - runs alone: every earlier call finishes first and every later
+#                 call waits for it. The default, so a tool that declares
+#                 nothing keeps the serial behaviour it always had.
+ToolConcurrency = Literal["parallel", "keyed", "exclusive"]
+
+# Computes the serialisation key of a ``keyed`` call from the model's arguments
+# and the calling session key. Returning ``None`` means no key can be derived,
+# and the call then runs ``exclusive``.
+ToolConcurrencyKey = Callable[[Mapping[str, Any], str | None], Hashable | None]
+
+
 # Internal tool spec
 @dataclass
 class ToolSpec:
@@ -190,6 +206,23 @@ class ToolSpec:
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
     result_budget_class: str | None = None
+    # Declared behaviour. Defaults describe an unknown tool conservatively:
+    # it may write, it runs alone, and it does not declare an approval step.
+    concurrency: ToolConcurrency = "exclusive"
+    concurrency_key: ToolConcurrencyKey | None = None
+    read_only: bool = False
+    # The tool may stop and ask the operator for approval (it then returns an
+    # ``approval_required`` envelope). Descriptive only: whether a given call
+    # needs approval is still decided inside the tool.
+    requires_approval: bool = False
+    # Scheduling contract, not a description: the tool raises any approval
+    # prompt before it acts and calls
+    # ``agentos.tools.batch_slot.wait_for_batch_turn()`` before acting. An
+    # ``exclusive`` call of such a tool may then be started while earlier
+    # calls of its batch still wait for their approvals, so every prompt of
+    # the batch is pending at once while the bodies still run in order.
+    early_approval: bool = False
+    defer_loading: bool = False  # left out of requests until tool_search loads it
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

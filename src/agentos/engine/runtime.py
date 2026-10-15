@@ -19,12 +19,11 @@ import os
 import platform
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Hashable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Final, Literal, SupportsInt, TypeGuard, cast
+from typing import Any, Final, SupportsInt, TypeGuard, cast
 
 import structlog
 
@@ -35,7 +34,6 @@ from agentos.attachment_refs import (
     transcript_material_path,
 )
 from agentos.bootstrap_types import BootstrapFileReport
-from agentos.compat.inspect_utils import accepts_keyword_arg
 from agentos.contracts.attachments import (
     ALLOWED_MEDIA_TYPES as _ALLOWED_ENGINE_MEDIA_TYPES,
 )
@@ -61,7 +59,9 @@ from agentos.engine.hooks import (
 from agentos.engine.outcome import outcome_from_error, turn_outcome_details
 from agentos.engine.pipeline import TurnContext
 from agentos.engine.pricing import PriceEntry, lookup_price
+from agentos.engine.proactive_compaction import ProactiveCompactionScheduler
 from agentos.engine.router_decision import build_router_decision_event
+from agentos.engine.transcript import transcript_record_of
 from agentos.engine.turn_policy import resolve_turn_policy
 from agentos.engine.turn_runner import (
     AgentBootstrapStage,
@@ -98,22 +98,27 @@ from agentos.engine.turn_runner.harness import (
     _TurnRunnerMemorySyncNotifyAdapter,
     _TurnRunnerModelCatalogAdapter,
     _TurnRunnerPipelineExecutionAdapter,
-    _TurnRunnerPreflightCompactionAdapter,
     _TurnRunnerPromptAssemblerAdapter,
     _TurnRunnerPromptConfigResolverAdapter,
     _TurnRunnerProviderResolverAdapter,
     _TurnRunnerRouterContextAdapter,
     _TurnRunnerSessionIdResolverAdapter,
     _TurnRunnerSessionTotalsAdapter,
-    _TurnRunnerSystemPromptRefreshAdapter,
-    _TurnRunnerT3UpgradeCompactionAdapter,
     _TurnRunnerTimeoutBudgetAdapter,
     _TurnRunnerToolBuilderAdapter,
     _TurnRunnerTranscriptAppendAdapter,
     _TurnRunnerTurnErrorPersistAdapter,
     _TurnRunnerTurnMemoryCaptureAdapter,
 )
+from agentos.engine.turn_runner.pre_provider_io import (
+    MEMORY_CONTEXT_KEY,
+    PROJECT_KNOWLEDGE_KEY,
+    PreProviderIO,
+    RecallBudget,
+    merge_extra_context_block,
+)
 from agentos.engine.turn_runner.stream_consumer_stage import _StreamState
+from agentos.engine.turn_timing import TurnTiming, emit_turn_timing_log
 from agentos.engine.types import (
     AgentConfig,
     AgentEvent,
@@ -158,17 +163,10 @@ from agentos.router_control import (
     RouterControlHoldStore,
     render_router_control_prompt_block,
 )
-from agentos.router_tiers import HIGHEST_TEXT_TIER, normalize_text_tier, tier_index
 from agentos.safety import injection_guard, permission_matrix, sandbox, tool_tiers
 from agentos.session.compaction_lifecycle import (
-    COMPACTION_CHUNK_SUMMARIZED_EVENT,
-    COMPACTION_PERSISTED_EVENT,
     COMPACTION_REPLAYED_EVENT,
-    COMPACTION_SUMMARY_VERIFIED_EVENT,
-    COMPACTION_TRIGGERED_EVENT,
-    compaction_effect_payload,
     compaction_lifecycle_payload,
-    compaction_result_payload,
     durable_receipt_allows_destructive_compaction,
     flush_receipt_allows_destructive_compaction,
     flush_receipt_is_successful_flush,
@@ -207,16 +205,18 @@ _DEFAULT_LLM_TIMEOUT_SECONDS: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
 _ROUTER_PREV_ASSISTANT_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_TURNS: Final[int] = 4
+# Newest transcript rows read for the router context before falling back to
+# the whole transcript (only when the window lacks what the context needs).
+_ROUTER_CONTEXT_WINDOW_ENTRIES: Final[int] = 128
 _CONTEXT_SUMMARY_MARKER: Final[str] = "[Context Summary]"
+# Extra-context keys whose value is fixed for the life of a session (or changes
+# only on an explicit edit); rendered into the cached system prompt.
+_SESSION_FROZEN_EXTRA_CONTEXT_KEYS: Final[frozenset[str]] = frozenset(
+    {"Project Knowledge", "Subagent Task Protocol"}
+)
 _COMPACTION_SUMMARY_CONTEXT_HEADER: Final[str] = "[Compacted Session Summaries]"
 _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS: Final[int] = 16_000
 _DEFAULT_PREFLIGHT_COMPACT_RATIO: Final[float] = 0.85
-_COMPACTION_FAILURE_LIMIT: Final[int] = 3
-_COMPACTION_CIRCUIT_COOLDOWN_SECONDS: Final[float] = 300.0
-_T3_NOT_APPLICABLE: Final[str] = "not_applicable"
-_T3_HANDLED: Final[str] = "handled"
-_T3_FLUSH_FAILED: Final[str] = "flush_failed"
-_T3_COMPACT_FAILED: Final[str] = "compact_failed"
 _IMAGE_GENERATION_TOOL_NAMES: Final[frozenset[str]] = frozenset({"image_generate"})
 _ARTIFACT_DELIVERY_FAILURE_MARKER: Final[str] = "File delivery failed:"
 _ARTIFACT_DELIVERY_TOOL_NAME: Final[str] = "publish_artifact"
@@ -271,82 +271,6 @@ def _is_deepseek_model_id(model: str) -> bool:
     return normalized.startswith("deepseek") or "/deepseek" in normalized
 
 
-# Tools that are safe to run concurrently within a single LLM turn.
-# Any tool name absent from this set is treated as mutex (serial dispatch).
-_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "agents_list",
-        "git_diff",
-        "git_log",
-        "git_status",
-        "glob_search",
-        "grep_search",
-        "image",
-        "list_dir",
-        "memory_get",
-        "memory_search",
-        "pdf",
-        "projects_list",
-        "read_file",
-        "read_spreadsheet",
-        "session_search",
-        "session_status",
-        "sessions_history",
-        "sessions_list",
-        "skill_list",
-        "skill_search_community",
-        "skill_view",
-        "tts",
-        "web_fetch",
-        "web_search",
-    }
-)
-
-_ToolConcurrencyMode = Literal["mutex", "concurrent", "keyed", "predicate"]
-
-
-@dataclass(frozen=True)
-class _ToolConcurrencyPolicy:
-    mode: _ToolConcurrencyMode
-    key: Hashable | None = None
-    max_inflight: int | None = None
-    limit_key: Hashable | None = None
-
-
-_MUTEX_TOOL_POLICY = _ToolConcurrencyPolicy(mode="mutex")
-_CONCURRENT_TOOL_POLICY = _ToolConcurrencyPolicy(mode="concurrent")
-
-
-def _get_tool_concurrency_policy(
-    tool_name: str,
-    arguments: Mapping[str, Any] | None = None,
-    *,
-    parent_session_key: str | None = None,
-) -> _ToolConcurrencyPolicy:
-    if tool_name in _SAFE_TOOL_NAMES:
-        return _CONCURRENT_TOOL_POLICY
-    if tool_name == "sessions_send":
-        session_key = (arguments or {}).get("session_key")
-        if isinstance(session_key, str) and session_key.strip():
-            return _ToolConcurrencyPolicy(
-                mode="keyed",
-                key=("sessions_send", session_key.strip()),
-            )
-        return _MUTEX_TOOL_POLICY
-    if tool_name == "sessions_spawn":
-        from agentos.tools.types import current_tool_context  # noqa: PLC0415
-
-        ctx = current_tool_context.get()
-        parent_key = parent_session_key or (ctx.session_key if ctx is not None else None)
-        if parent_key:
-            return _ToolConcurrencyPolicy(
-                mode="keyed",
-                key=("sessions_spawn", parent_key),
-            )
-        return _MUTEX_TOOL_POLICY
-    return _MUTEX_TOOL_POLICY
-
-
 # Per-call-chain owner tracking for session-lock re-entry detection.
 # A ContextVar is copied into child asyncio Tasks created while a turn is
 # running, which matters for stream wrappers such as heartbeat_stream. Treating
@@ -384,20 +308,6 @@ class _ComprehensiveTurnSavings:
     baseline_model: str = ""
     baseline_cost_usd: float = 0.0
     actual_cost_usd: float = 0.0
-
-
-@dataclass
-class _CompactionFailureState:
-    count: int = 0
-    opened_at: float | None = None
-
-
-@dataclass
-class _EmergencyCompactionOverride:
-    summary: str
-    kept_entries: list[Any]
-    reason: str
-    compaction_id: str
 
 
 def _refusal_category_from_details(stop_details: object) -> str | None:
@@ -734,6 +644,9 @@ _HEARTBEAT_ACK_TOKEN: Final[str] = "HEARTBEAT_OK"
 # Markdown a model puts around a bare token. The system prompt itself shows the
 # sentinels as code spans, so `NO_REPLY` and **HEARTBEAT_OK** are ordinary replies.
 _SENTINEL_WRAPPERS: Final[str] = "`*_~"
+# Thinking-level sources the router owns; effort-by-tier may cap these.
+_EFFORT_BY_TIER_SOURCES: frozenset[str] = frozenset({"tier_default", "controller"})
+
 _THINKING_ALIASES: Final[dict[str, str]] = {
     "x-high": "xhigh",
     "x_high": "xhigh",
@@ -1881,29 +1794,9 @@ class TurnRunner:
         )
         # User turns since the last memory review, keyed (agent_id, session_key).
         self._memory_nudge_counters: dict[tuple[str, str], int] = {}
-        # Consecutive-failure circuit state, keyed by session_key. Only cleared
-        # on the next compaction *success* (#2399) -- a session that fails once
-        # and is never revisited would otherwise pin this entry forever, the
-        # same "nothing notifies this runner when a session ends" gap
-        # _memory_snapshots/_bootstrap_snapshots are already bounded against.
-        self._compaction_failures: BoundedRegistry[str, _CompactionFailureState] = BoundedRegistry(
-            name="TurnRunner._compaction_failures",
-            session_of=lambda key, _value: key,
-        )
-        self._turn_compaction_attempted_sessions: set[str] = set()
         self._turn_compacted_sessions: set[str] = set()
         self._active_pre_compaction_flush_tasks: dict[str, asyncio.Task] = {}
         self._background_tasks: set[asyncio.Task] = set()
-        # Emergency-compaction result awaiting the session's next turn, keyed by
-        # session_key. Only popped when that next turn loads history (#2399) --
-        # each entry carries a full kept-transcript slice, so an abandoned
-        # session leaks more than a counter would.
-        self._emergency_compaction_overrides: BoundedRegistry[str, _EmergencyCompactionOverride] = (
-            BoundedRegistry(
-                name="TurnRunner._emergency_compaction_overrides",
-                session_of=lambda key, _value: key,
-            )
-        )
         # Last persisted row each session's loaded history covers, keyed by
         # session key; anchors inline compaction persistence so rows appended
         # mid-turn (queued follow-ups) are never overwritten or archived.
@@ -1939,12 +1832,12 @@ class TurnRunner:
         )
         # TurnRunner stage decomposition CompactionAndHistoryStage instance. Holds no
         # per-turn state. Active unconditionally as of.
+        # Between-turns (proactive) compaction + estimator calibration.
+        self._proactive_compaction = ProactiveCompactionScheduler(self)
         self._compaction_and_history_stage = CompactionAndHistoryStage(
-            t3_upgrade=_TurnRunnerT3UpgradeCompactionAdapter(self),
-            preflight=_TurnRunnerPreflightCompactionAdapter(self),
             history_loader=_TurnRunnerHistoryLoaderAdapter(self),
             request_context_prepender=_RequestContextPrependAdapter(),
-            compaction_hooks=self._compaction_hooks,
+            turn_start_observer=self._proactive_compaction,
         )
         # TurnRunner stage decomposition AttachmentStage instance. Holds no per-turn
         # state. Active unconditionally as of.
@@ -1960,7 +1853,6 @@ class TurnRunner:
             agent_run=_TurnRunnerAgentRunAdapter(),
             compaction_persist=_TurnRunnerCompactionPersistAdapter(self),
             memory_snapshot_refresh=_TurnRunnerMemorySnapshotRefreshAdapter(self),
-            system_prompt_refresh=_TurnRunnerSystemPromptRefreshAdapter(self),
             memory_sync_notify=_TurnRunnerMemorySyncNotifyAdapter(),
             warning_transformer=self._handle_runtime_warning,
             compaction_hooks=self._compaction_hooks,
@@ -1982,6 +1874,7 @@ class TurnRunner:
             session_totals=_TurnRunnerSessionTotalsAdapter(self),
             turn_error_persist=_TurnRunnerTurnErrorPersistAdapter(self),
             memory_nudge=_TurnRunnerMemoryNudgeAdapter(self),
+            proactive_compaction=self._proactive_compaction,
         )
 
     @property
@@ -2001,21 +1894,18 @@ class TurnRunner:
     def mark_compacted_this_turn(self, session_key: str) -> None:
         self._turn_compacted_sessions.add(session_key)
 
-    def has_attempted_compaction_this_turn(self, session_key: str) -> bool:
-        return session_key in self._turn_compaction_attempted_sessions
-
-    def mark_compaction_attempted_this_turn(self, session_key: str) -> None:
-        self._turn_compaction_attempted_sessions.add(session_key)
-
     def clear_compacted_this_turn(self, session_key: str) -> None:
         self._turn_compacted_sessions.discard(session_key)
 
     def clear_compaction_turn_state(self, session_key: str) -> None:
-        self._turn_compaction_attempted_sessions.discard(session_key)
         self._turn_compacted_sessions.discard(session_key)
         # The anchor only means something for the turn that loaded the history;
         # the next turn's _load_history records a fresh one.
         self._compaction_snapshots.pop(session_key, None)
+        # The turn is over: a proactive compaction it scheduled may start.
+        proactive = getattr(self, "_proactive_compaction", None)
+        if proactive is not None:
+            proactive.turn_ended(session_key)
 
     def refresh_memory_snapshot(self, agent_id: str) -> None:
         """Refresh frozen snapshots for all sessions of the given agent.
@@ -2140,6 +2030,110 @@ class TurnRunner:
             return ""
         return str(getattr(session, "session_id", "") or "")
 
+    # Default hard deadline for provider recall; ``[memory]
+    # recall_timeout_seconds`` overrides it.
+    RECALL_TIMEOUT_SECONDS_DEFAULT = 1.5
+    _recall_budget_state: RecallBudget | None = None
+
+    def _recall_budget(self) -> RecallBudget:
+        budget = self._recall_budget_state
+        if budget is None:
+            budget = self._recall_budget_state = RecallBudget()
+        return budget
+
+    def _recall_timeout_seconds(self) -> float:
+        value = getattr(getattr(self._config, "memory", None), "recall_timeout_seconds", None)
+        if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+            return self.RECALL_TIMEOUT_SECONDS_DEFAULT
+        return float(value)
+
+    async def _fetch_prefetch_block(
+        self,
+        *,
+        agent_id: str,
+        session_id: str,
+        message: str,
+        timeout: float | None = None,
+    ) -> str:
+        """Return the provider's fenced recall block for ``message``, or ``""``.
+
+        Bounded by ``[memory] recall_timeout_seconds``: a recall that misses
+        the deadline is not cancelled; it finishes in the background and its
+        block can stand in on the session's next turn (see ``RecallBudget``).
+        """
+        manager = self._provider_manager_for(agent_id)
+        if manager is None or not message:
+            return ""
+        return await self._recall_budget().recall(
+            (agent_id, session_id) if session_id else None,
+            lambda: manager.prefetch_all(message, session_id=session_id),
+            timeout=self._recall_timeout_seconds() if timeout is None else timeout,
+            log_fields={"agent_id": agent_id},
+        )
+
+    async def _recall_block_for_turn(self, *, agent_id: str, session_key: str, message: str) -> str:
+        return await self._fetch_prefetch_block(
+            agent_id=agent_id,
+            session_id=await self._resolve_session_id_for_prefetch(session_key),
+            message=message,
+        )
+
+    def _concurrent_turn_setup(self) -> bool:
+        task_runtime = getattr(self._config, "task_runtime", None)
+        return getattr(task_runtime, "concurrent_turn_setup", True) is not False
+
+    def _start_pre_provider_io(
+        self,
+        *,
+        agent_id: str,
+        session_key: str,
+        runtime_message: str,
+        router_exclude_last_user: bool,
+    ) -> PreProviderIO:
+        """Start the independent pre-provider reads (see ``pre_provider_io``)."""
+        from agentos.tools.deferred import hydrate_loaded_tools
+
+        concurrent = self._concurrent_turn_setup()
+        return PreProviderIO(
+            concurrent=concurrent,
+            # Gated on provider presence so the disabled default adds only a
+            # dict lookup.
+            recall=(
+                (
+                    lambda: self._recall_block_for_turn(
+                        agent_id=agent_id,
+                        session_key=session_key,
+                        message=runtime_message,
+                    )
+                )
+                if self._provider_manager_for(agent_id) is not None
+                else None
+            ),
+            project_knowledge=lambda: self._project_knowledge_block(session_key),
+            hydrate_tools=lambda: hydrate_loaded_tools(self._session_manager, session_key),
+            router_context=(
+                (
+                    lambda: self._router_previous_assistant_context(
+                        session_key,
+                        exclude_last_user=router_exclude_last_user,
+                    )
+                )
+                if concurrent
+                else None
+            ),
+            memory_warm=self._memory_warm_for(agent_id, session_key) if concurrent else None,
+        )
+
+    def _memory_warm_for(
+        self, agent_id: str, session_key: str
+    ) -> Callable[[], Coroutine[Any, Any, None]] | None:
+        sync_manager = (
+            self._memory_sync_managers.get(agent_id) if self._memory_sync_managers else None
+        )
+        if sync_manager is None:
+            return None
+        return lambda: sync_manager.warm_session(session_key)
+
     async def _augment_extra_context_with_prefetch(
         self,
         *,
@@ -2147,7 +2141,7 @@ class TurnRunner:
         session_id: str,
         message: str,
         extra_context: dict[str, str] | None,
-        timeout: float = 3.0,
+        timeout: float | None = None,
     ) -> dict[str, str] | None:
         """Return ``extra_context`` with the provider's fenced recall injected.
 
@@ -2158,33 +2152,13 @@ class TurnRunner:
         inject nothing, returning the context unchanged. No-op (returns the
         input object) when no provider is configured.
         """
-        manager = self._provider_manager_for(agent_id)
-        if manager is None or not message:
-            return extra_context
-        try:
-            block = await asyncio.wait_for(
-                manager.prefetch_all(message, session_id=session_id),
-                timeout=timeout,
-            )
-        except TimeoutError:
-            log.warning(
-                "turn_runner.memory_prefetch_timeout",
-                agent_id=agent_id,
-                timeout_seconds=timeout,
-            )
-            return extra_context
-        except Exception as exc:  # noqa: BLE001 — recall is best-effort
-            log.warning(
-                "turn_runner.memory_prefetch_failed",
-                agent_id=agent_id,
-                error=str(exc),
-            )
-            return extra_context
-        if not block:
-            return extra_context
-        merged = dict(extra_context) if extra_context else {}
-        merged["Memory Context"] = block
-        return merged
+        block = await self._fetch_prefetch_block(
+            agent_id=agent_id,
+            session_id=session_id,
+            message=message,
+            timeout=timeout,
+        )
+        return merge_extra_context_block(extra_context, MEMORY_CONTEXT_KEY, block)
 
     # Injection ceiling for project knowledge. Kept equal to
     # SessionManager.PROJECT_KNOWLEDGE_MAX_CHARS (a release-consistency test
@@ -2199,7 +2173,12 @@ class TurnRunner:
         session_key: str,
         extra_context: dict[str, str] | None,
     ) -> dict[str, str] | None:
-        """Return ``extra_context`` with the session's project knowledge injected.
+        """Return ``extra_context`` with the session's project knowledge injected."""
+        block = await self._project_knowledge_block(session_key)
+        return merge_extra_context_block(extra_context, PROJECT_KNOWLEDGE_KEY, block)
+
+    async def _project_knowledge_block(self, session_key: str) -> str | None:
+        """Return the session's wrapped project-knowledge block, or ``None``.
 
         Sessions grouped into a project share the project's free-form
         knowledge text: it is read fresh from storage each turn (an edit is
@@ -2210,10 +2189,10 @@ class TurnRunner:
         file content. Best-effort: any failure injects nothing.
         """
         if self._session_manager is None or not session_key:
-            return extra_context
+            return None
         getter = getattr(self._session_manager, "get_project_knowledge_for_session", None)
         if not callable(getter):
-            return extra_context
+            return None
         try:
             knowledge = await getter(session_key)
         except Exception as exc:  # noqa: BLE001 — knowledge injection is best-effort
@@ -2222,17 +2201,13 @@ class TurnRunner:
                 session_key=session_key,
                 error=str(exc),
             )
-            return extra_context
+            return None
         if not knowledge:
-            return extra_context
+            return None
         cap = self.PROJECT_KNOWLEDGE_INJECT_MAX_CHARS
         if len(knowledge) > cap:
             knowledge = knowledge[:cap] + "\n... [project knowledge truncated]"
-        merged = dict(extra_context) if extra_context else {}
-        merged["Project Knowledge"] = injection_guard.wrap_untrusted(
-            knowledge, source="project:knowledge"
-        )
-        return merged
+        return injection_guard.wrap_untrusted(knowledge, source="project:knowledge")
 
     async def _capture_turn_memory(
         self,
@@ -2629,12 +2604,6 @@ class TurnRunner:
             return
         yield
 
-    def _session_write_context_factory(
-        self,
-        session_key: str,
-    ) -> Callable[[], contextlib.AbstractAsyncContextManager[None]]:
-        return lambda: self._session_write_context(session_key)
-
     async def _append_session_message(self, session_key: str, **append_kwargs: Any) -> Any:
         if self._session_manager is None:
             return None
@@ -2672,6 +2641,7 @@ class TurnRunner:
         no_memory_capture: bool = False,
         ingress_pipeline_steps: list[PipelineStepRecord] | None = None,
         router_control_replay_depth: int = 0,
+        persisted_user_message_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn with full orchestration.
 
@@ -2734,6 +2704,7 @@ class TurnRunner:
                     no_memory_capture=no_memory_capture,
                     ingress_pipeline_steps=ingress_pipeline_steps,
                     router_control_replay_depth=router_control_replay_depth,
+                    persisted_user_message_id=persisted_user_message_id,
                 ):
                     yield event
             finally:
@@ -2774,6 +2745,7 @@ class TurnRunner:
                         no_memory_capture=no_memory_capture,
                         ingress_pipeline_steps=ingress_pipeline_steps,
                         router_control_replay_depth=router_control_replay_depth,
+                        persisted_user_message_id=persisted_user_message_id,
                     ):
                         yield event
                 finally:
@@ -2808,10 +2780,12 @@ class TurnRunner:
         no_memory_capture: bool = False,
         ingress_pipeline_steps: list[PipelineStepRecord] | None = None,
         router_control_replay_depth: int = 0,
+        persisted_user_message_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         # Observability: bracket turn setup + stream loop with monotonic clock
         # so latency_ms reflects the full turn.
         turn_started_at = time.monotonic()
+        timing = TurnTiming()
         turn_id = uuid.uuid4().hex
         resolved_model = ""
         final_prompt_str = ""
@@ -2898,6 +2872,7 @@ class TurnRunner:
                 yield self._handle_runtime_warning(
                     WarningEvent(code="budget_warning", message=budget_message)
                 )
+            timing.stage_start("input")
             input_out = await self._input_stage.run(
                 InputStageInput(
                     message=message,
@@ -2910,31 +2885,26 @@ class TurnRunner:
                     session_append=self._session_manager,
                 )
             )
+            timing.stage_end("input")
             runtime_message = input_out.runtime_message
             semantic_input = input_out.semantic_input
             extra_prompt_context = input_out.extra_prompt_context
             normalization_metadata = input_out.normalization_metadata
 
-            # External memory provider PREFETCH (Plan B): inject this turn's
-            # recalled context as a per-turn volatile block. Gated on provider
-            # presence first so the disabled default adds only a dict lookup;
-            # bounded by a modest timeout so a slow provider cannot stall turns.
-            if self._provider_manager_for(agent_id) is not None:
-                extra_prompt_context = await self._augment_extra_context_with_prefetch(
-                    agent_id=agent_id,
-                    session_id=await self._resolve_session_id_for_prefetch(session_key),
-                    message=runtime_message,
-                    extra_context=extra_prompt_context,
-                )
-
-            # Project knowledge: sessions grouped into a project share the
-            # project's knowledge text as a per-turn prompt block. Read fresh
-            # each turn so a knowledge edit lands on the next turn.
-            extra_prompt_context = await self._augment_extra_context_with_project_knowledge(
+            # Provider recall (deadline-bounded), project knowledge, the
+            # deferred-tool hydrate and the router-context read do not depend
+            # on each other: they start together here and are applied at their
+            # old points in the old order (recall block, then project
+            # knowledge; hydrate before the tool list is built).
+            pre_io = self._start_pre_provider_io(
+                agent_id=agent_id,
                 session_key=session_key,
-                extra_context=extra_prompt_context,
+                runtime_message=runtime_message,
+                router_exclude_last_user=history_has_persisted_user or persist_input,
             )
-
+            extra_prompt_context = await pre_io.extra_prompt_context(extra_prompt_context)
+            await pre_io.hydrate_tools()
+            timing.stage_start("provider_and_tools")
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
                     session_key=session_key,
@@ -2944,6 +2914,7 @@ class TurnRunner:
                     input_mode=input_mode,
                 )
             )
+            timing.stage_end("provider_and_tools")
             if pt_outcome.terminate:
                 # Harness performs the legacy observability + persist +
                 # yield sequence in the legacy ORDER (trace-emit, persist,
@@ -2976,6 +2947,7 @@ class TurnRunner:
             tool_context = pt_out.effective_tool_context
             tool_metadata = pt_out.tool_metadata
 
+            timing.stage_start("prompt_assembler")
             pa_outcome = await self._prompt_assembler_stage.run(
                 PromptAssemblerStageInput(
                     runtime_message=runtime_message,
@@ -3003,8 +2975,10 @@ class TurnRunner:
                     ),
                     ingress_pipeline_steps=ingress_pipeline_steps,
                     normalization_metadata=normalization_metadata,
+                    router_context=pre_io.router_context(),
                 )
             )
+            timing.stage_end("prompt_assembler")
             pa_out = pa_outcome.require_output()
             provider = pa_out.provider
             turn = pa_out.turn
@@ -3072,6 +3046,7 @@ class TurnRunner:
             router_event = build_router_decision_event(turn)
             if router_event is not None:
                 yield router_event
+            timing.stage_start("agent_bootstrap")
             ab_outcome = await self._agent_bootstrap_stage.run(
                 AgentBootstrapStageInput(
                     provider=provider,
@@ -3094,11 +3069,14 @@ class TurnRunner:
                     request_timeout=request_timeout,
                     max_provider_retries=max_provider_retries,
                     length_capped_continuations=length_capped_continuations,
+                    pending_memory_warm=pre_io.memory_warm(),
                 )
             )
+            timing.stage_end("agent_bootstrap")
             ab_out = ab_outcome.require_output()
             agent = ab_out.agent
-            agent_config = ab_out.agent_config
+            agent.turn_timing = timing
+            agent_config = ab_out.agent_config  # noqa: F841
             # These locals are read by the test_agent_bootstrap_stage_snapshot
             # frame-walking probe. Do not remove.
             effective_runtime_timeout = ab_out.effective_runtime_timeout  # noqa: F841
@@ -3120,32 +3098,47 @@ class TurnRunner:
                     },
                 )
 
-            # 6. Compaction (t3 + preflight) + history load + request-context
-            # prepend. CompactionAndHistoryStage owns the four-call sequence
-            # (t3_upgrade → preflight → load_history → prepend_request_context_prompt).
+            # 6. History load + request-context prepend. Compaction is not a
+            # before-turn step any more: the agent's CompactionService checks
+            # the live request before every provider call (first one included)
+            # with the configured ratio, and persists via CompactionEvent.
+            timing.stage_start("compaction_and_history")
             ch_outcome = await self._compaction_and_history_stage.run(
                 CompactionAndHistoryStageInput(
                     agent=agent,
-                    context_window_tokens=agent_config.context_window_tokens,
-                    provider=provider,
-                    resolved_model=resolved_model,
-                    turn=turn,
                     session_key=session_key,
                     agent_id=agent_id,
                     history_has_persisted_user=history_has_persisted_user,
+                    input_message_id=(
+                        persisted_user_message_id
+                        or getattr(input_out.persisted_entry, "message_id", None)
+                    ),
                 )
             )
+            timing.stage_end("compaction_and_history")
             ch_out = ch_outcome.require_output()
             agent.config.request_context_prompt = ch_out.final_request_context_prompt
+            agent.config.context_overflow_threshold = self._preflight_compact_ratio()
+            agent.config.history_tool_result_max_chars = int(
+                getattr(
+                    getattr(self._config, "compaction", None),
+                    "history_tool_result_max_chars",
+                    0,
+                )
+                or 0
+            )
+            self._apply_compaction_summary_settings(agent)
 
             # 8. Build extra messages for attachments + turn_input rebind.
             # AttachmentStage owns the slice.
+            timing.stage_start("attachment")
             att_outcome = await self._attachment_stage.run(
                 AttachmentStageInput(
                     effective_runtime_message=effective_runtime_message,
                     attachments=attachments,
                 )
             )
+            timing.stage_end("attachment")
             att_out = att_outcome.require_output()
             extra_msgs = att_out.extra_messages
 
@@ -3191,12 +3184,14 @@ class TurnRunner:
                 tool_context=tool_context,
             )
             router_control_replay_event: RouterControlReplayEvent | None = None
+            timing.stage_start("stream_consumer")
             async for event in self._stream_consumer_stage.run(stream_inp):
                 if isinstance(event, RouterControlReplayEvent):
                     router_control_replay_event = event
                     yield event
                     break
                 yield event
+            timing.stage_end("stream_consumer")
             if router_control_replay_event is not None:
                 async for replayed_event in self._run_turn(
                     message,
@@ -3248,6 +3243,7 @@ class TurnRunner:
             # fire in legacy order: heartbeat normalize -> transcript
             # append -> memory capture (try/except) -> error persist ->
             # session totals rollup (try/except).
+            timing.stage_start("turn_finalizer")
             fin_outcome = await self._turn_finalizer_stage.run(
                 TurnFinalizerStageInput(
                     final_text_parts=final_text_parts,
@@ -3266,8 +3262,10 @@ class TurnRunner:
                     run_kind=run_kind,
                     heartbeat_ack_max_chars=heartbeat_ack_max_chars,
                     no_memory_capture=no_memory_capture,
+                    provider_messages=transcript_record_of(agent, artifacts=turn_artifacts),
                 )
             )
+            timing.stage_end("turn_finalizer")
             fin_out = fin_outcome.require_output()
             final_text = fin_out.final_text
             turn_segments = fin_out.turn_segments
@@ -3344,6 +3342,7 @@ class TurnRunner:
                 done_event=done_event,
                 trace_id=trace_context.trace_id if trace_context is not None else None,
                 skills_invoked=collect_invoked_skills(turn_segments),
+                timing=timing.summary(),
             )
             if pending_error_event is not None:
                 yield pending_error_event
@@ -3472,6 +3471,7 @@ class TurnRunner:
             # here. A reservation that outlived its turn would permanently
             # shrink the ceiling for everyone else.
             self._release_spend_budget(budget_reservation)
+            emit_turn_timing_log(timing, session_key=session_key, turn_id=turn_id)
 
     @staticmethod
     def _write_trace_event(
@@ -4116,7 +4116,51 @@ class TurnRunner:
             metadata.get("thinking_level", "medium"),
             source="agentos_router",
         )
+        if isinstance(parsed, ThinkingLevel):
+            parsed = self._effort_by_tier(parsed, metadata)
         return parsed if parsed is not None else False
+
+    def _effort_by_tier(self, level: ThinkingLevel, metadata: Mapping[str, Any]) -> ThinkingLevel:
+        """Cap a router-chosen thinking level at the routed tier's ceiling.
+
+        Router-owned levels are capped: the shipped tier level
+        (``tier_default``) and the pilot controller's per-turn pick
+        (``controller``), which is what the default ``pilot-v1`` strategy
+        uses on every routed turn. User intent is never capped: an
+        operator-configured tier level (``tier_config``), a router-control
+        hold (the user picked the route), an explicit ``[llm] thinking``
+        (handled before this) or a route the turn did not honor stay as they
+        are. ``[agentos_router] effort_by_tier = false``
+        turns it off. The model choice is never touched.
+        """
+        from agentos.router_tiers import effort_for_tier
+
+        router_cfg = getattr(self._config, "agentos_router", None) if self._config else None
+        if not getattr(router_cfg, "effort_by_tier", True):
+            return level
+        if metadata.get("router_control_hold_applied"):
+            return level
+        if metadata.get("thinking_level_source") not in _EFFORT_BY_TIER_SOURCES:
+            return level
+        if metadata.get("routing_applied") is False:
+            return level
+        tier = metadata.get("routed_tier")
+        capped = ThinkingLevel(effort_for_tier(tier, level.value))
+        if capped is not level:
+            log.info(
+                "turn_runner.effort_by_tier",
+                tier=tier,
+                thinking_level=capped.value,
+                tier_level=level.value,
+                source=metadata.get("thinking_level_source"),
+            )
+        return capped
+
+    def _resolve_parallel_tool_calls(self) -> bool:
+        """``[tools] parallel_calls``: ask providers for parallel tool calls."""
+
+        tools_cfg = getattr(self._config, "tools", None) if self._config else None
+        return bool(getattr(tools_cfg, "parallel_calls", True))
 
     @staticmethod
     def _parse_thinking_level(value: Any, *, source: str) -> bool | ThinkingLevel | None:
@@ -4163,6 +4207,14 @@ class TurnRunner:
     ) -> tuple[list, ToolHandler | None]:
         """Build tool definitions and handler from registry, filtered by ToolContext."""
         tools_config = getattr(self._config, "tools", None)
+        if (tools_config is not None and not getattr(tools_config, "enabled", True)) or (
+            self._tool_registry is None
+        ):
+            # No tools this turn: drop a deferred-tool surface left by an
+            # earlier one, or the prompt would still advertise tool_search.
+            from agentos.tools.deferred import forget_surface
+
+            forget_surface(ctx.session_key if ctx is not None else None)
         if tools_config is not None and not getattr(tools_config, "enabled", True):
             if metadata is not None:
                 metadata["tool_profile"] = "disabled"
@@ -4210,7 +4262,21 @@ class TurnRunner:
             caller_kind=ctx.caller_kind if ctx else "none",
             denied_count=len(ctx.denied_tools) if ctx else 0,
         )
-        tool_defs = self._tool_registry.to_tool_definitions(ctx)
+        # Deferred tool loading: the request carries the always-loaded tools,
+        # tool_search, and whatever the session has loaded through it.
+        from agentos.tools.deferred import surface_for_turn
+
+        deferred_surface = surface_for_turn(
+            self._tool_registry,
+            ctx,
+            config=self._config,
+            session_manager=self._session_manager,
+        )
+        tool_defs = (
+            deferred_surface.tool_definitions()
+            if deferred_surface is not None
+            else self._tool_registry.request_tool_definitions(ctx, defer_loading=False)
+        )
         profile = resolve_profile(ctx)
         log.debug(
             "tool_policy.profile_post",
@@ -4231,6 +4297,8 @@ class TurnRunner:
             known_skill_names=known_skill_names,
             tool_hooks=self._tool_hooks,
         )
+        if deferred_surface is not None:
+            tool_handler = deferred_surface.guard(tool_handler)
         return tool_defs, tool_handler
 
     def _filter_tool_defs_by_capability(self, tool_defs: list) -> list:
@@ -4625,9 +4693,13 @@ class TurnRunner:
         unattended_context = bool(
             getattr(getattr(self._config, "heartbeat", None), "enabled", False)
         ) or bootstrap_context_mode in {"heartbeat_light", "unattended"}
+        from agentos.tools.deferred import prompt_tool_names
+
+        prompt_tools, deferred_prompt_tools = prompt_tool_names(tool_defs, session_key)
         base_prompt = assemble_system_prompt(
             agent_profile,
-            tools=[td.name for td in tool_defs] if tool_defs else None,
+            tools=prompt_tools or None,
+            deferred_tools=deferred_prompt_tools,
             memory=memory_text,
             runtime_info=runtime_info,
             docs_path=self._resolve_docs_path(),
@@ -4635,33 +4707,58 @@ class TurnRunner:
             channels_enabled=channels_enabled,
             unattended_context=unattended_context,
         )
-        # daily_notes, workspace_files, and extra_context are per-turn /
-        # per-day volatile content. Keeping them in the cacheable base
-        # invalidates the prompt-cache prefix every time any of them
-        # changes (every day for daily_notes, every workspace edit for
-        # workspace_files, every tool_context shift for extra_context).
-        # Render them into the dynamic suffix instead so the base hash
-        # stays stable across those rotations.
-        dynamic_blocks: list[str] = []
-        volatile_block = self._render_volatile_block(
+        # Session-frozen content -- workspace files (snapshotted per session),
+        # daily notes, project knowledge, the subagent protocol and the
+        # router-control block (config) -- joins the cached system prompt: it
+        # does not change from one request to the next, and carrying it with
+        # every user turn would re-append tens of KB into the append-only
+        # transcript. Only genuinely per-turn keys (memory recall, internal
+        # event mode, ...) ride in the dynamic suffix, which the agent sends
+        # as section-diffed trailing context of the user turn.
+        frozen_extra = {
+            key: value
+            for key, value in (extra_context or {}).items()
+            if key in _SESSION_FROZEN_EXTRA_CONTEXT_KEYS
+        }
+        turn_extra = {
+            key: value
+            for key, value in (extra_context or {}).items()
+            if key not in _SESSION_FROZEN_EXTRA_CONTEXT_KEYS
+        }
+        wrap_untrusted_workspace = getattr(
+            getattr(self._config, "safety", None),
+            "wrap_untrusted_workspace",
+            True,
+        )
+        frozen_blocks: list[str] = []
+        frozen_block = self._render_volatile_block(
             daily_notes=daily,
             workspace_files=workspace_files,
-            extra_context=extra_context,
+            extra_context=frozen_extra,
             prompt_mode=prompt_mode,
-            wrap_untrusted_workspace=getattr(
-                getattr(self._config, "safety", None),
-                "wrap_untrusted_workspace",
-                True,
-            ),
+            wrap_untrusted_workspace=wrap_untrusted_workspace,
         )
-        if volatile_block:
-            dynamic_blocks.append(volatile_block)
+        if frozen_block:
+            frozen_blocks.append(frozen_block)
         if tool_defs and any(getattr(td, "name", "") == "router_control" for td in tool_defs):
             router_block = render_router_control_prompt_block(
                 getattr(self._config, "agentos_router", None)
             )
             if router_block:
-                dynamic_blocks.append(f"## Router Control\n\n{router_block}")
+                frozen_blocks.append(f"## Router Control\n\n{router_block}")
+        if frozen_blocks:
+            base_prompt = "\n\n".join([base_prompt, *frozen_blocks])
+
+        dynamic_blocks: list[str] = []
+        volatile_block = self._render_volatile_block(
+            daily_notes=None,
+            workspace_files=None,
+            extra_context=turn_extra,
+            prompt_mode=prompt_mode,
+            wrap_untrusted_workspace=wrap_untrusted_workspace,
+        )
+        if volatile_block:
+            dynamic_blocks.append(volatile_block)
 
         if dynamic_blocks:
             return base_prompt, "\n\n".join(dynamic_blocks)
@@ -5012,9 +5109,34 @@ class TurnRunner:
         *,
         exclude_last_user: bool = False,
     ) -> dict[str, Any]:
-        """Return transcript context for the V4 router, excluding the current user turn."""
+        """Return transcript context for the V4 router, excluding the current user turn.
+
+        Reads the newest ``_ROUTER_CONTEXT_WINDOW_ENTRIES`` rows first: the
+        context only needs the last few user texts and the last assistant
+        text, and deserializing a long session's whole transcript on every
+        turn is the expensive part. When the window does not hold all of
+        that, the whole transcript is read as before, so the result is the
+        same either way.
+        """
         if self._session_manager is None:
             return {}
+        get_recent = getattr(type(self._session_manager), "get_recent_transcript", None)
+        if get_recent is not None:
+            try:
+                recent = list(
+                    await self._session_manager.get_recent_transcript(
+                        session_key, _ROUTER_CONTEXT_WINDOW_ENTRIES
+                    )
+                    or []
+                )
+            except Exception:  # noqa: BLE001 - fall back to the full read below
+                recent = None
+            if recent is not None:
+                context, complete = self._router_context_from_entries(
+                    recent, exclude_last_user=exclude_last_user
+                )
+                if complete or len(recent) < _ROUTER_CONTEXT_WINDOW_ENTRIES:
+                    return context
         get_transcript = getattr(self._session_manager, "get_transcript", None)
         if not callable(get_transcript):
             return {}
@@ -5025,7 +5147,23 @@ class TurnRunner:
         except Exception:  # noqa: BLE001 - router context must never block a turn
             log.debug("turn_runner.router_context_failed", session_key=session_key)
             return {}
-        entries = list(transcript or [])
+        context, _complete = self._router_context_from_entries(
+            list(transcript or []), exclude_last_user=exclude_last_user
+        )
+        return context
+
+    def _router_context_from_entries(
+        self,
+        entries: list[Any],
+        *,
+        exclude_last_user: bool,
+    ) -> tuple[dict[str, Any], bool]:
+        """Build the router context from ``entries`` (oldest first).
+
+        The flag says whether ``entries`` held everything the context can use
+        (a full set of recent user texts and an assistant text), i.e. whether
+        any older rows could still change the result.
+        """
         user_texts: list[str] = []
         for index, entry in enumerate(entries):
             if getattr(entry, "role", None) != "user":
@@ -5044,6 +5182,7 @@ class TurnRunner:
         context: dict[str, Any] = {}
         if user_texts:
             context["history_user_texts"] = user_texts[-_ROUTER_HISTORY_USER_MAX_TURNS:]
+        users_complete = len(user_texts) >= _ROUTER_HISTORY_USER_MAX_TURNS
 
         for entry in reversed(entries):
             if getattr(entry, "role", None) != "assistant":
@@ -5062,8 +5201,8 @@ class TurnRunner:
                 and token_count > 0
             ):
                 context["prev_assistant_usage"] = {"output_tokens": token_count}
-            return context
-        return context
+            return context, users_complete
+        return context, False
 
     def _resolve_prompt_config(self, turn: Any) -> tuple[str, list | None, str | None]:
         """Resolve final system prompt and cache breakpoints from pipeline output."""
@@ -5131,6 +5270,7 @@ class TurnRunner:
         done_event: DoneEvent | None = None,
         trace_id: str | None = None,
         skills_invoked: list[str] | None = None,
+        timing: dict[str, Any] | None = None,
     ) -> None:
         """Write one DecisionEntry for this turn (best-effort, never raises).
 
@@ -5387,560 +5527,11 @@ class TurnRunner:
                     if done_event is not None and done_event.stop_reason == "refusal"
                     else None
                 ),
+                timing=timing or {},
             )
             write_decision_entry(entry)
         except Exception as exc:  # pragma: no cover — observability must not break turns
             log.warning("decision_log.write_failed", error=str(exc))
-
-    async def _maybe_compact_on_t3_upgrade(
-        self,
-        session_key: str,
-        turn: TurnContext,
-        context_window_tokens: int,
-        *,
-        compaction_provider: Any | None = None,
-        compaction_model: str | None = None,
-    ) -> str:
-        """Flush memory and compact transcript when the router upgrades into t3.
-
-        Returns a status string so the caller can distinguish non-applicable
-        routes, flush failures that may still fall back to generic preflight,
-        and compact failures that should trip the circuit without retrying.
-        """
-        router_cfg = getattr(self._config, "agentos_router", None)
-        upgrade_compaction_enabled = getattr(
-            router_cfg,
-            "upgrade_to_c3_compaction_enabled",
-            getattr(router_cfg, "upgrade_to_t3_compaction_enabled", False),
-        )
-        if not upgrade_compaction_enabled:
-            return _T3_NOT_APPLICABLE
-
-        routed_tier = normalize_text_tier(turn.metadata.get("routed_tier"))
-        if routed_tier != HIGHEST_TEXT_TIER:
-            return _T3_NOT_APPLICABLE
-
-        if not turn.metadata.get("routing_applied", False):
-            return _T3_NOT_APPLICABLE
-
-        routing_extra = turn.metadata.get("routing_extra", {})
-        previous = normalize_text_tier(routing_extra.get("previous_tier"))
-        if previous is None:
-            final = normalize_text_tier(routing_extra.get("final_tier"))
-            base = normalize_text_tier(routing_extra.get("base_tier"))
-            if final == HIGHEST_TEXT_TIER and tier_index(base) in {0, 1, 2}:
-                previous = base
-            else:
-                return _T3_NOT_APPLICABLE
-
-        if tier_index(previous) not in {0, 1, 2}:
-            return _T3_NOT_APPLICABLE
-
-        if session_key.startswith(("cron:", "subagent:")):
-            return _T3_NOT_APPLICABLE
-
-        if self._session_manager is None:
-            return _T3_NOT_APPLICABLE
-
-        if self.has_compacted_this_turn(session_key):
-            log.info(
-                "t3_upgrade_compaction.skipped",
-                session_key=session_key,
-                reason="already_compacted_this_turn",
-            )
-            return _T3_HANDLED
-        if self.has_attempted_compaction_this_turn(session_key):
-            log.info(
-                "t3_upgrade_compaction.skipped",
-                session_key=session_key,
-                reason="already_attempted_this_turn",
-            )
-            return _T3_HANDLED
-
-        try:
-            transcript = await self._session_manager.get_transcript(session_key)
-        except KeyError:
-            return _T3_HANDLED
-        if not transcript:
-            return _T3_HANDLED
-
-        compaction_config = None
-        if compaction_provider is not None or compaction_model:
-            from agentos.session.compaction import build_compaction_config_from_provider
-
-            compaction_config = build_compaction_config_from_provider(
-                compaction_provider,
-                model_override=compaction_model,
-                compaction_config=getattr(getattr(self, "_config", None), "compaction", None),
-            )
-
-        from agentos.session.compaction import CompactionConfig, estimate_entry_replay_tokens
-
-        total_tokens = sum(estimate_entry_replay_tokens(e) for e in transcript)
-        safety_margin = float(
-            getattr(compaction_config or CompactionConfig(), "safety_margin", 1.2) or 1.2
-        )
-        if total_tokens * safety_margin <= context_window_tokens:
-            log.info(
-                "t3_upgrade_compaction.skipped",
-                session_key=session_key,
-                reason="within_budget",
-                total_tokens=total_tokens,
-                context_window_tokens=context_window_tokens,
-                safety_margin=safety_margin,
-            )
-            return _T3_HANDLED
-        if self._compaction_circuit_open(session_key):
-            self.mark_compaction_attempted_this_turn(session_key)
-            await self._record_emergency_ephemeral_compaction(
-                session_key,
-                transcript,
-                context_window_tokens,
-                compaction_id=new_compaction_id(),
-                phase="t3_upgrade",
-                reason="durable_compaction_circuit_open",
-            )
-            return _T3_HANDLED
-
-        log.info(
-            "t3_upgrade_compaction.triggered",
-            session_key=session_key,
-            previous_tier=previous,
-            final_tier=HIGHEST_TEXT_TIER,
-            context_window_tokens=context_window_tokens,
-        )
-        self.mark_compaction_attempted_this_turn(session_key)
-        compaction_id = new_compaction_id()
-        notify_compaction(
-            session_key,
-            source="automatic",
-            phase="t3_upgrade",
-            status="started",
-            previous_tier=previous,
-            context_window_tokens=context_window_tokens,
-            **compaction_effect_payload(status="started"),
-            **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-        )
-
-        # Still recorded: the checkpoint is the pre-image compaction repairs
-        # from. Its result is no longer consulted here now that the flush
-        # receipt it gated is gone.
-        await self._record_checkpoint_before_compaction(
-            session_key,
-            transcript,
-            turn_id=compaction_id,
-            source="t3_upgrade_compaction",
-        )
-        flush_receipt_status = "not_required"
-
-        try:
-            from agentos.session.compaction import call_compact_with_optional_config
-
-            compaction_result = None
-            compact_with_result = getattr(type(self._session_manager), "compact_with_result", None)
-            if callable(compact_with_result):
-                compact_method = self._session_manager.compact_with_result
-                compact_kwargs: dict[str, Any] = {}
-                if accepts_keyword_arg(compact_method, "compaction_id"):
-                    compact_kwargs["compaction_id"] = compaction_id
-                if accepts_keyword_arg(compact_method, "trigger_reason"):
-                    compact_kwargs["trigger_reason"] = "t3_upgrade"
-                if accepts_keyword_arg(compact_method, "flush_receipt_status"):
-                    compact_kwargs["flush_receipt_status"] = flush_receipt_status
-                if accepts_keyword_arg(compact_method, "mutation_context"):
-                    compact_kwargs["mutation_context"] = self._session_write_context_factory(
-                        session_key
-                    )
-                compaction_result = await self._session_manager.compact_with_result(
-                    session_key,
-                    context_window_tokens,
-                    compaction_config,
-                    **compact_kwargs,
-                )
-                result = getattr(compaction_result, "summary", "") or ""
-            else:
-                result = await call_compact_with_optional_config(
-                    self._session_manager.compact,
-                    session_key,
-                    context_window_tokens,
-                    compaction_config,
-                )
-            if (
-                compaction_result is not None
-                and int(getattr(compaction_result, "removed_count", 0) or 0) > 0
-                and bool(getattr(compaction_result, "summary", "") or "")
-            ):
-                for event in (
-                    COMPACTION_CHUNK_SUMMARIZED_EVENT,
-                    COMPACTION_SUMMARY_VERIFIED_EVENT,
-                ):
-                    observed_payload = compaction_lifecycle_payload(compaction_id, event)
-                    observed_payload.update(compaction_result_payload(compaction_result))
-                    notify_compaction(
-                        session_key,
-                        source="automatic",
-                        phase="t3_upgrade",
-                        status="observed",
-                        context_window_tokens=context_window_tokens,
-                        flush_receipt_status=flush_receipt_status,
-                        **compaction_effect_payload(status="observed"),
-                        **observed_payload,
-                    )
-            if result:
-                self.mark_compacted_this_turn(session_key)
-                self._record_compaction_success(session_key)
-                completed_payload = {"summary_len": len(result)}
-                if compaction_result is not None:
-                    completed_payload.update(compaction_result_payload(compaction_result))
-                notify_compaction(
-                    session_key,
-                    source="automatic",
-                    phase="t3_upgrade",
-                    status="completed",
-                    context_window_tokens=context_window_tokens,
-                    flush_receipt_status=flush_receipt_status,
-                    **compaction_effect_payload(status="completed"),
-                    **completed_payload,
-                    **compaction_lifecycle_payload(compaction_id, COMPACTION_PERSISTED_EVENT),
-                )
-            else:
-                skip_reason = str(
-                    getattr(compaction_result, "skip_reason", None) or "empty_summary"
-                )
-                if skip_reason != "stale_preimage":
-                    emergency_applied = await self._record_emergency_ephemeral_compaction(
-                        session_key,
-                        transcript,
-                        context_window_tokens,
-                        compaction_id=compaction_id,
-                        phase="t3_upgrade",
-                        reason=skip_reason,
-                    )
-                    if emergency_applied:
-                        return _T3_HANDLED
-                notify_compaction(
-                    session_key,
-                    source="automatic",
-                    phase="t3_upgrade",
-                    status="skipped",
-                    reason=skip_reason,
-                    context_window_tokens=context_window_tokens,
-                    flush_receipt_status=flush_receipt_status,
-                    **compaction_effect_payload(
-                        status="skipped",
-                        reason=skip_reason,
-                    ),
-                    **compaction_lifecycle_payload(
-                        compaction_id,
-                        COMPACTION_TRIGGERED_EVENT,
-                    ),
-                )
-            log.info(
-                "t3_upgrade_compaction.compact_done",
-                session_key=session_key,
-                summary_produced=bool(result),
-                summary_length=len(result) if result else 0,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "t3_upgrade_compaction.compact_failed",
-                session_key=session_key,
-                error=str(exc),
-            )
-            self._record_compaction_failure(session_key)
-            emergency_applied = await self._record_emergency_ephemeral_compaction(
-                session_key,
-                transcript,
-                context_window_tokens,
-                compaction_id=compaction_id,
-                phase="t3_upgrade",
-                reason="compact_failed",
-            )
-            if emergency_applied:
-                return _T3_COMPACT_FAILED
-            notify_compaction(
-                session_key,
-                source="automatic",
-                phase="t3_upgrade",
-                status="failed",
-                message=str(exc),
-                context_window_tokens=context_window_tokens,
-                flush_receipt_status=flush_receipt_status,
-                **compaction_effect_payload(status="failed"),
-                **compaction_lifecycle_payload(
-                    compaction_id,
-                    COMPACTION_TRIGGERED_EVENT,
-                ),
-            )
-            return _T3_COMPACT_FAILED
-
-        return _T3_HANDLED
-
-    async def _maybe_preflight_compact(
-        self,
-        session_key: str,
-        context_window_tokens: int,
-        *,
-        compaction_provider: Any | None = None,
-        compaction_model: str | None = None,
-    ) -> None:
-        """Compact proactively if session history exceeds token budget.
-
-        Called before _load_history(). Uses SessionManager.compact() directly
-        because no Agent state exists yet — the DB is the sole source of truth.
-        Safe to re-compact from DB at this point (no double-compaction risk).
-        """
-        if self._session_manager is None:
-            return
-        # Skip ephemeral sessions
-        if session_key.startswith(("cron:", "subagent:")):
-            return
-        if self.has_compacted_this_turn(session_key):
-            log.info(
-                "preflight_compaction.skipped",
-                session_key=session_key,
-                reason="already_compacted_this_turn",
-            )
-            return
-        if self.has_attempted_compaction_this_turn(session_key):
-            log.info(
-                "preflight_compaction.skipped",
-                session_key=session_key,
-                reason="already_attempted_this_turn",
-            )
-            return
-        try:
-            transcript = await self._session_manager.get_transcript(session_key)
-        except KeyError:
-            return  # session doesn't exist yet
-        if not transcript:
-            return
-
-        from agentos.session.compaction import estimate_entry_model_replay_tokens
-
-        total_tokens = sum(estimate_entry_model_replay_tokens(e) for e in transcript)
-        ratio = self._preflight_compact_ratio()
-        threshold = int(context_window_tokens * ratio)
-        if total_tokens <= threshold:
-            return
-        if self._compaction_circuit_open(session_key):
-            self.mark_compaction_attempted_this_turn(session_key)
-            await self._record_emergency_ephemeral_compaction(
-                session_key,
-                transcript,
-                context_window_tokens,
-                compaction_id=new_compaction_id(),
-                phase="preflight",
-                reason="durable_compaction_circuit_open",
-            )
-            return
-
-        log.info(
-            "preflight_compaction.triggered",
-            session_key=session_key,
-            total_tokens=total_tokens,
-            threshold=threshold,
-            ratio=ratio,
-        )
-        self.mark_compaction_attempted_this_turn(session_key)
-        compaction_id = new_compaction_id()
-        notify_compaction(
-            session_key,
-            source="automatic",
-            phase="preflight",
-            status="started",
-            tokens_before=total_tokens,
-            context_window_tokens=context_window_tokens,
-            **compaction_effect_payload(status="started"),
-            **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-        )
-        # Still recorded: the checkpoint is the pre-image compaction repairs
-        # from, independent of the removed flush receipt.
-        await self._record_checkpoint_before_compaction(
-            session_key,
-            transcript,
-            turn_id=compaction_id,
-            source="preflight_compaction",
-        )
-        flush_receipt_status = "not_required"
-        compaction_config = None
-        skip_reason = "empty_summary"
-        if compaction_provider is not None or compaction_model:
-            from agentos.session.compaction import build_compaction_config_from_provider
-
-            compaction_config = build_compaction_config_from_provider(
-                compaction_provider,
-                model_override=compaction_model,
-                compaction_config=getattr(getattr(self, "_config", None), "compaction", None),
-            )
-        from agentos.session.compaction import call_compact_with_optional_config
-
-        try:
-            compaction_result = None
-            compact_with_result = getattr(type(self._session_manager), "compact_with_result", None)
-            if callable(compact_with_result):
-                compact_method = self._session_manager.compact_with_result
-                compact_kwargs: dict[str, Any] = {}
-                if accepts_keyword_arg(compact_method, "compaction_id"):
-                    compact_kwargs["compaction_id"] = compaction_id
-                if accepts_keyword_arg(compact_method, "trigger_reason"):
-                    compact_kwargs["trigger_reason"] = "preflight"
-                if accepts_keyword_arg(compact_method, "flush_receipt_status"):
-                    compact_kwargs["flush_receipt_status"] = flush_receipt_status
-                if accepts_keyword_arg(compact_method, "mutation_context"):
-                    compact_kwargs["mutation_context"] = self._session_write_context_factory(
-                        session_key
-                    )
-                compaction_result = await self._session_manager.compact_with_result(
-                    session_key,
-                    context_window_tokens,
-                    compaction_config,
-                    **compact_kwargs,
-                )
-                result = getattr(compaction_result, "summary", "") or ""
-            else:
-                result = await call_compact_with_optional_config(
-                    self._session_manager.compact,
-                    session_key,
-                    context_window_tokens,
-                    compaction_config,
-                )
-            if (
-                compaction_result is not None
-                and int(getattr(compaction_result, "removed_count", 0) or 0) > 0
-                and bool(getattr(compaction_result, "summary", "") or "")
-            ):
-                for event in (
-                    COMPACTION_CHUNK_SUMMARIZED_EVENT,
-                    COMPACTION_SUMMARY_VERIFIED_EVENT,
-                ):
-                    observed_payload = compaction_lifecycle_payload(compaction_id, event)
-                    observed_payload.update(
-                        compaction_result_payload(
-                            compaction_result,
-                            tokens_before=total_tokens,
-                        )
-                    )
-                    notify_compaction(
-                        session_key,
-                        source="automatic",
-                        phase="preflight",
-                        status="observed",
-                        context_window_tokens=context_window_tokens,
-                        flush_receipt_status=flush_receipt_status,
-                        **compaction_effect_payload(status="observed"),
-                        **observed_payload,
-                    )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "preflight_compaction.compact_failed",
-                session_key=session_key,
-                error=str(exc),
-            )
-            self._record_compaction_failure(session_key)
-            emergency_applied = await self._record_emergency_ephemeral_compaction(
-                session_key,
-                transcript,
-                context_window_tokens,
-                compaction_id=compaction_id,
-                phase="preflight",
-                reason="compact_failed",
-            )
-            if emergency_applied:
-                return
-            notify_compaction(
-                session_key,
-                source="automatic",
-                phase="preflight",
-                status="failed",
-                message=str(exc),
-                tokens_before=total_tokens,
-                context_window_tokens=context_window_tokens,
-                flush_receipt_status=flush_receipt_status,
-                **compaction_effect_payload(status="failed"),
-                **compaction_lifecycle_payload(
-                    compaction_id,
-                    COMPACTION_TRIGGERED_EVENT,
-                ),
-            )
-            return
-        if not result:
-            skip_reason = str(getattr(compaction_result, "skip_reason", None) or "empty_summary")
-            if skip_reason == "stale_preimage":
-                notify_compaction(
-                    session_key,
-                    source="automatic",
-                    phase="preflight",
-                    status="skipped",
-                    reason=skip_reason,
-                    tokens_before=total_tokens,
-                    context_window_tokens=context_window_tokens,
-                    flush_receipt_status=flush_receipt_status,
-                    **compaction_effect_payload(
-                        status="skipped",
-                        reason=skip_reason,
-                    ),
-                    **compaction_lifecycle_payload(
-                        compaction_id,
-                        COMPACTION_TRIGGERED_EVENT,
-                    ),
-                )
-                return
-            emergency_applied = await self._record_emergency_ephemeral_compaction(
-                session_key,
-                transcript,
-                context_window_tokens,
-                compaction_id=compaction_id,
-                phase="preflight",
-                reason=skip_reason,
-            )
-            if emergency_applied:
-                return
-        if result:
-            self.mark_compacted_this_turn(session_key)
-            self._record_compaction_success(session_key)
-            completed_payload = {"tokens_before": total_tokens}
-            if compaction_result is not None:
-                completed_payload.update(
-                    compaction_result_payload(
-                        compaction_result,
-                        tokens_before=total_tokens,
-                    )
-                )
-            notify_compaction(
-                session_key,
-                source="automatic",
-                phase="preflight",
-                status="completed",
-                context_window_tokens=context_window_tokens,
-                flush_receipt_status=flush_receipt_status,
-                **compaction_effect_payload(status="completed"),
-                **completed_payload,
-                **compaction_lifecycle_payload(compaction_id, COMPACTION_PERSISTED_EVENT),
-            )
-        else:
-            notify_compaction(
-                session_key,
-                source="automatic",
-                phase="preflight",
-                status="skipped",
-                reason=skip_reason,
-                tokens_before=total_tokens,
-                context_window_tokens=context_window_tokens,
-                flush_receipt_status=flush_receipt_status,
-                **compaction_effect_payload(
-                    status="skipped",
-                    reason=skip_reason,
-                ),
-                **compaction_lifecycle_payload(
-                    compaction_id,
-                    COMPACTION_TRIGGERED_EVENT,
-                ),
-            )
 
     def _pre_compaction_flush_timeout_seconds(self) -> float:
         memory_cfg = getattr(self._config, "memory", None)
@@ -6087,144 +5678,22 @@ class TurnRunner:
     def _flush_receipt_allows_destructive_compaction(self, receipt: Any) -> bool:
         return flush_receipt_allows_destructive_compaction(receipt)
 
-    def _compaction_circuit_open(self, session_key: str) -> bool:
-        state = getattr(self, "_compaction_failures", {}).get(session_key)
-        if state is None or state.count < _COMPACTION_FAILURE_LIMIT:
-            return False
-        opened_at = state.opened_at if state.opened_at is not None else time.monotonic()
-        cooldown_elapsed = time.monotonic() - opened_at
-        if cooldown_elapsed >= _COMPACTION_CIRCUIT_COOLDOWN_SECONDS:
-            log.info(
-                "compaction_circuit.half_open",
-                session_key=session_key,
-                consecutive_failures=state.count,
-                cooldown_elapsed_s=round(cooldown_elapsed, 1),
-            )
-            return False
-        log.warning(
-            "compaction_circuit.open",
-            session_key=session_key,
-            consecutive_failures=state.count,
-            cooldown_remaining_s=round(
-                _COMPACTION_CIRCUIT_COOLDOWN_SECONDS - cooldown_elapsed,
-                1,
-            ),
-        )
-        return True
+    def _apply_compaction_summary_settings(self, agent: Any) -> None:
+        """Point the in-turn summarizer at the cheap side-task model."""
+        from agentos.gateway.session_titler import fast_model_hint
 
-    def _record_compaction_failure(self, session_key: str) -> None:
-        if not hasattr(self, "_compaction_failures"):
-            self._compaction_failures = BoundedRegistry(
-                name="TurnRunner._compaction_failures",
-                session_of=lambda key, _value: key,
-            )
-        state = self._compaction_failures.setdefault(session_key, _CompactionFailureState())
-        state.count += 1
-        state.opened_at = time.monotonic() if state.count >= _COMPACTION_FAILURE_LIMIT else None
-
-    def _record_compaction_success(self, session_key: str) -> None:
-        if not hasattr(self, "_compaction_failures"):
-            self._compaction_failures = BoundedRegistry(
-                name="TurnRunner._compaction_failures",
-                session_of=lambda key, _value: key,
-            )
-        self._compaction_failures.pop(session_key, None)
-
-    @staticmethod
-    def _entry_for_emergency_compaction(entry: Any) -> dict[str, Any]:
-        return {
-            "role": getattr(entry, "role", "user"),
-            "content": getattr(entry, "content", "") or "",
-            "token_count": getattr(entry, "token_count", None),
-            "tool_calls": getattr(entry, "tool_calls", None),
-            "tool_call_id": getattr(entry, "tool_call_id", None),
-            "reasoning_content": getattr(entry, "reasoning_content", None),
-            "turn_usage": getattr(entry, "turn_usage", None),
-        }
-
-    @staticmethod
-    def _emergency_replay_entry(raw: Mapping[str, Any]) -> Any:
-        return SimpleNamespace(
-            role=str(raw.get("role") or "user"),
-            content=str(raw.get("content") or ""),
-            token_count=raw.get("token_count"),
-            tool_calls=raw.get("tool_calls"),
-            tool_call_id=raw.get("tool_call_id"),
-            reasoning_content=raw.get("reasoning_content"),
-            turn_usage=raw.get("turn_usage"),
-        )
-
-    async def _record_emergency_ephemeral_compaction(
-        self,
-        session_key: str,
-        transcript: Sequence[Any],
-        context_window_tokens: int,
-        *,
-        compaction_id: str,
-        phase: str,
-        reason: str,
-    ) -> bool:
-        if not transcript:
-            return False
+        compaction_cfg = getattr(self._config, "compaction", None)
         try:
-            from agentos.session.compaction import (
-                CompactionConfig,
-                CompactionRequest,
-                compact_context,
+            timeout = float(getattr(compaction_cfg, "summary_timeout_seconds", 45.0) or 45.0)
+        except (TypeError, ValueError):
+            timeout = 45.0
+        agent.config.compaction_summary_timeout_seconds = timeout
+        try:
+            agent.config.compaction_summary_model_hint = fast_model_hint(
+                self._config, task="compaction"
             )
-
-            raw_entries = [self._entry_for_emergency_compaction(entry) for entry in transcript]
-            session_id = str(getattr(transcript[0], "session_id", "") or session_key)
-            result = await compact_context(
-                CompactionRequest(
-                    session_id=session_id,
-                    entries=raw_entries,
-                    context_window_tokens=context_window_tokens,
-                    config=CompactionConfig(model=None, api_key=""),
-                )
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "compaction.emergency_ephemeral_failed",
-                session_key=session_key,
-                phase=phase,
-                error=str(exc),
-            )
-            return False
-
-        if not result.summary or result.removed_count <= 0:
-            return False
-        kept_entries = [self._emergency_replay_entry(raw) for raw in result.kept_entries]
-        if not kept_entries or len(kept_entries) >= len(transcript):
-            return False
-        summary = f"Emergency request-scoped compaction\nReason: {reason}\n\n{result.summary}"
-        self._emergency_compaction_overrides[session_key] = _EmergencyCompactionOverride(
-            summary=summary,
-            kept_entries=kept_entries,
-            reason=reason,
-            compaction_id=compaction_id,
-        )
-        self.mark_compacted_this_turn(session_key)
-        notify_compaction(
-            session_key,
-            source="automatic",
-            phase=phase,
-            status="emergency_ephemeral",
-            reason=reason,
-            removed_count=result.removed_count,
-            kept_count=len(kept_entries),
-            tokens_before=result.tokens_before,
-            tokens_after=result.tokens_after,
-            flush_receipt_status="emergency_ephemeral",
-            **compaction_effect_payload(
-                status="emergency_ephemeral",
-                reason=reason,
-            ),
-            **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-        )
-        return True
+        except Exception:  # noqa: BLE001 - a hint is optional
+            agent.config.compaction_summary_model_hint = ("", "")
 
     def _preflight_compact_ratio(self) -> float:
         raw_ratio = getattr(self._config, "preflight_compact_ratio", None)
@@ -6244,62 +5713,74 @@ class TurnRunner:
         session_key: str,
         *,
         trim_last_user: bool = True,
+        input_message_id: str | None = None,
     ) -> str | None:
-        """Load existing transcript as agent history."""
+        """Load existing transcript as agent history.
+
+        *input_message_id* names the persisted user row this turn answers
+        (``sessions.send`` / the input stage persist it before the run). It is
+        taken out of the history wherever it sits -- a follow-up queued while
+        the previous turn ran is persisted before that turn's reply -- and
+        recorded as the turn's input. Without it the trailing user row is
+        trimmed, as before.
+        """
         if self._session_manager is None:
             return None
 
         transcript = await self._session_manager.get_transcript(session_key)
         await self._remember_compaction_snapshot(session_key, transcript)
 
-        from agentos.engine.history import reconstruct_messages_from_entry
-        from agentos.provider import Message
-
-        history: list[Message] = []
-        summary_markers: list[str] = []
-        emergency_override = getattr(self, "_emergency_compaction_overrides", {}).pop(
-            session_key,
-            None,
+        from agentos.engine.transcript import (
+            build_history_from_transcript,
+            legacy_migration_for,
         )
-        if emergency_override is not None:
-            transcript = list(emergency_override.kept_entries)
-            summary_markers.append(emergency_override.summary)
-        last_entry_was_user = False
-        for entry in transcript:
-            if (
-                entry.role == "system"
-                and entry.content
-                and entry.content.startswith(_CONTEXT_SUMMARY_MARKER)
-            ):
-                summary_markers.append(_strip_context_summary_marker(entry.content))
-                continue
-            if entry.role not in ("user", "assistant"):
-                continue
-            raw_content = entry.content or ""
-            # User messages may carry attachment envelopes; assistant messages
-            # may carry artifact metadata. Both become text-only safe markers
-            # for model-context replay.
-            if raw_content and entry.role == "user":
-                content: Any = self._maybe_unpack_attachments(raw_content)
-            elif raw_content and entry.role == "assistant":
-                content = self._maybe_unpack_assistant_artifacts(raw_content)
-            else:
-                content = raw_content
-            history.extend(
-                reconstruct_messages_from_entry(
-                    entry.role,
-                    content,
-                    entry.tool_calls,
-                    getattr(entry, "reasoning_content", None),
-                )
-            )
-            last_entry_was_user = entry.role == "user"
+
+        summary_markers: list[str] = []
+        # Structured rows replay their provider messages verbatim; rows written
+        # before the structured record existed go through the legacy
+        # reconstruction plus a one-time deterministic migration.
+        loaded = build_history_from_transcript(
+            transcript,
+            unpack_user=self._maybe_unpack_attachments,
+            unpack_assistant=self._maybe_unpack_assistant_artifacts,
+            summary_marker=_CONTEXT_SUMMARY_MARKER,
+            strip_summary_marker=_strip_context_summary_marker,
+            legacy_migrate=legacy_migration_for(agent),
+            current_input_id=input_message_id,
+        )
+        history = loaded.messages
+        summary_markers.extend(loaded.summary_markers)
+        input_entry: Any = loaded.input_entry
         # Strip the caller-appended user turn only when the transcript really
         # ended on a user entry; an assistant entry that reconstructs into
         # assistant + user(tool_result) must keep its tool_result tail.
-        if trim_last_user and last_entry_was_user and history and history[-1].role == "user":
+        if (
+            input_entry is None
+            and trim_last_user
+            and loaded.last_entry_was_user
+            and history
+            and history[-1].role == "user"
+        ):
             history.pop()
+            input_entry = loaded.last_user_entry
+        remember_input = getattr(agent, "set_transcript_input_entry_id", None)
+        if callable(remember_input):
+            input_entry_id = getattr(input_entry, "message_id", None)
+            input_content = getattr(input_entry, "content", None)
+            remember_input(
+                input_entry_id if isinstance(input_entry_id, str) else None,
+                input_content if isinstance(input_content, str) else None,
+            )
         context_states = await self._load_context_states(session_key)
+        reset_entry_id = loaded.reset_entry_id
+        if reset_entry_id is not None:
+            # The history starts from a compaction record that already carries
+            # its summary; older durable summaries/states are inside it.
+            context_states = [
+                state
+                for state in context_states
+                if int(getattr(state, "covered_through_id", 0) or 0) >= reset_entry_id
+            ]
         provider = getattr(agent, "provider", None)
         provider_context = build_provider_compaction_context(
             context_states=context_states,
@@ -6314,6 +5795,7 @@ class TurnRunner:
             summary_markers,
             context_states=context_states,
             skip_covered_through_ids=provider_context.covered_through_ids,
+            min_covered_through_id=reset_entry_id,
         )
 
     async def _remember_compaction_snapshot(
@@ -6381,6 +5863,7 @@ class TurnRunner:
         *,
         context_states: list[Any] | None = None,
         skip_covered_through_ids: set[int] | None = None,
+        min_covered_through_id: int | None = None,
     ) -> str | None:
         """Return durable compaction summaries as request-scoped context."""
         summaries: list[Any] = []
@@ -6397,6 +5880,12 @@ class TurnRunner:
                     error=str(exc),
                 )
                 summaries = []
+        if min_covered_through_id is not None:
+            summaries = [
+                summary
+                for summary in summaries
+                if int(getattr(summary, "covered_through_id", 0) or 0) >= min_covered_through_id
+            ]
         loaded_context_states = (
             await self._load_context_states(session_key)
             if context_states is None

@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
     from agentos.engine.turn_runner.outcome import StageOutcome
     from agentos.observability.decision_log import PipelineStepRecord
     from agentos.observability.prompt_report import PromptReport
@@ -241,6 +243,9 @@ class PromptAssemblerStageInput:
     fresh_user_session: bool = False
     ingress_pipeline_steps: list[PipelineStepRecord] | None = None
     normalization_metadata: dict[str, Any] | None = None
+    # Router context already being fetched (started right after InputStage,
+    # see ``pre_provider_io``). ``None`` fetches it here, as before.
+    router_context: Awaitable[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -370,10 +375,13 @@ class PromptAssemblerStage:
         )
 
         # 2. Fetch router context (transcript-driven)
-        router_context = await self._router_context.fetch_router_context(
-            inp.session_key,
-            exclude_last_user=(inp.history_has_persisted_user or inp.persist_input),
-        )
+        if inp.router_context is not None:
+            router_context = await inp.router_context
+        else:
+            router_context = await self._router_context.fetch_router_context(
+                inp.session_key,
+                exclude_last_user=(inp.history_has_persisted_user or inp.persist_input),
+            )
 
         # 3. Run pre-turn pipeline (model routing, skills, prompt cache, etc.)
         request = RunPipelineRequest(

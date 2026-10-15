@@ -242,6 +242,13 @@ class ToolsConfig(BaseModel):
     """Top-level runtime tool policy configuration."""
 
     enabled: bool = True
+    # Leave the long tail of tools (``defer_loading`` in their spec) out of
+    # every request; the model loads them on demand through ``tool_search``.
+    # ``false`` sends every tool on every request, the pre-deferral behaviour.
+    defer_loading: bool = True
+    # Ask the model for several independent tool calls in one response (sent
+    # only to providers known to accept the field). ``false`` sends nothing.
+    parallel_calls: bool = True
     profile: Literal["full", "minimal", "memory_only", "coding", "messaging"] | None = None
     allow: list[str] = Field(default_factory=list)
     deny: list[str] = Field(default_factory=list)
@@ -300,6 +307,12 @@ class TaskRuntimeConfig(BaseModel):
     # historical behaviour — used together with
     # ``stream_relay_coalesce_ms`` to enable batching.
     stream_relay_coalesce_chars: int = Field(default=0, ge=0)
+    # Run the independent reads before a turn's first model request (provider
+    # recall, project knowledge, deferred-tool hydrate, router context, the
+    # first-turn memory index warm) concurrently instead of one after another.
+    # The assembled prompt is the same either way; ``false`` restores the
+    # serial order.
+    concurrent_turn_setup: bool = True
 
     @field_validator("pending_overflow_policy")
     @classmethod
@@ -433,6 +446,12 @@ class PromptCacheConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENTOS_CACHE_")
 
     mode: Literal["off", "auto", "on"] = "auto"
+    # Lifetime of the cached stable prefix (system prompt and tools) on
+    # providers with explicit cache breakpoints (Anthropic). "1h" costs 2x the
+    # base input price per cache write instead of 1.25x and pays off when a
+    # session pauses longer than 5 minutes between requests.
+    # Env: AGENTOS_CACHE_TTL.
+    ttl: Literal["5m", "1h"] = "5m"
 
     def __init__(self, **data: Any) -> None:
         # Surface the legacy ``AGENTOS_CACHE_ENABLED`` env var to the
@@ -712,6 +731,11 @@ class MemoryConfig(BaseSettings):
     # External memory provider (Plan B). Disabled by default (name=None) — the
     # provider layer is never imported unless a provider is explicitly selected.
     provider: MemoryProviderSettings = Field(default_factory=MemoryProviderSettings)
+    # Hard deadline for the external provider's per-turn recall. A recall that
+    # misses it does not hold the turn: the turn goes on without it and the
+    # recall finishes in the background, standing in on the next turn if that
+    # one is late too.
+    recall_timeout_seconds: float = Field(default=1.5, gt=0)
 
 
 def _tier(
@@ -1342,6 +1366,9 @@ class AgentOSRouterConfig(BaseSettings):
     enabled: bool = True
     cost_aware: bool = True
     auto_thinking: bool = True
+    # Cap the routed tier's thinking level for cheap tiers (c0 -> low,
+    # c1 -> medium) when the level came from the tier itself.
+    effort_by_tier: bool = True
     rollout_phase: str = "full"  # "observe" | "prompt_only" | "full"
     # "pilot-v1" (default: local ONNX+MiniLM router, English-optimized, no LLM
     # call) | "llm_judge" (routes via a small LLM judge call) | "jev"
@@ -1552,6 +1579,29 @@ class CompactionLlmConfig(BaseSettings):
     model: str | None = None  # None = use session model
     timeout_seconds: float = 90.0
     enabled: bool = True
+    # When a turn ends, its tool results and tool-call argument fields longer
+    # than this are shortened to head/tail + the tool-result-store handle for
+    # every later turn (once; earlier turns are never rewritten again).
+    # 0 = 2% of the model's context window in chars, clamped to 4k-12k.
+    history_tool_result_max_chars: int = Field(default=0, ge=0)
+    # Bound on the in-turn compaction summary call (auxiliary model, task
+    # ``compaction``). On timeout a deterministic digest is used instead.
+    summary_timeout_seconds: float = Field(default=45.0, gt=0.0, le=600.0)
+    # Proactive background compaction: after a turn ends, when the session's
+    # history is at least ``proactive_ratio`` x the compaction trigger, compact
+    # it between turns so the next turn does not wait for the summarizer.
+    # ``false`` leaves compaction to the in-turn preflight only.
+    proactive: bool = True
+    proactive_ratio: float = Field(default=0.70, gt=0.0, le=1.0)
+    # Seconds the session must stay idle after a turn before the proactive job
+    # calls the summarizer; a turn that starts first cancels it for free. A job
+    # cancelled mid-summary doubles the wait for that session (up to 300 s)
+    # until one completes. 0 starts at once.
+    proactive_idle_seconds: float = Field(default=20.0, ge=0.0, le=300.0)
+    # Scale the compaction trigger's request-size estimate by the observed
+    # provider_input_tokens / estimate ratio per (provider, model).
+    # ``false`` uses the raw chars/4 estimate.
+    estimate_calibration: bool = True
 
 
 class AuxiliaryTaskConfig(BaseModel):

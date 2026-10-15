@@ -51,6 +51,14 @@ def _effective_proof_budget(proof_budget: int) -> tuple[int, int]:
     return max(1, proof_budget - headroom), headroom
 
 
+def effective_proof_budget(proof_budget: int) -> int:
+    """The payload size (chars) a provider sends without compacting it.
+
+    Public so the engine can trigger its own compaction under the same line.
+    """
+    return _effective_proof_budget(proof_budget)[0]
+
+
 def _is_data_url(value: str) -> bool:
     return value.startswith("data:") and ";base64," in value[:128]
 

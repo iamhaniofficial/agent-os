@@ -10,6 +10,7 @@ during a long turn survives one -- or several -- inline compactions.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -35,10 +36,16 @@ class _Provider:
 
 
 @pytest.fixture
-async def session_manager() -> AsyncIterator[SessionManager]:
+async def session_manager(tmp_path: Path) -> AsyncIterator[SessionManager]:
     storage = SessionStorage(":memory:")
     await storage.connect()
-    manager = SessionManager(storage, inject_time_prefix=False)
+    # Inline compaction records a durable checkpoint before it rewrites rows;
+    # the gateway always configures the checkpoint workspace.
+    manager = SessionManager(
+        storage,
+        inject_time_prefix=False,
+        checkpoint_workspace_dir=tmp_path,
+    )
     yield manager
     await storage.close()
 

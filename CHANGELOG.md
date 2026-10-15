@@ -9,6 +9,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [2026.10.13] - 2026-10-13
 
 ### Added
+- Turn timing trace. Every turn now records where its wall-clock time goes:
+  per stage, per provider call (time to first event, first text, end of
+  stream, tokens) and per tool batch (duration, calls, approval wait), plus
+  totals (`pre_provider_ms`, `first_text_ms`, `provider_ms`, `tool_ms`,
+  `approval_wait_ms`, `finalize_ms`, `total_ms`, `iterations`). It is logged
+  as one `turn.timing` line per turn, stored under `timing` in the decision
+  log (schema 16), and printed by `agentos replay`.
+- Parallel tool calls by default. Every agent request now asks for several
+  independent tool calls in one response (`parallel_tool_calls: true`), sent
+  only where the API is known to accept it: api.openai.com (not the o-series
+  reasoning models) and OpenRouter. Other OpenAI-compatible endpoints
+  (OpenCAP, Bankr, Surplus, DeepSeek, Zhipu, Gemini-compatible, Ollama, local
+  servers) get nothing, and Anthropic already allows parallel tool use, so no
+  field is sent there. Subagents inherit the setting. `[tools] parallel_calls
+  = false` sends nothing, as before.
+- Effort by router tier. When a turn runs at the thinking level the shipped
+  tier table gives the routed tier, turns routed to `c0` run at most at `low`
+  and turns routed to `c1` at most at `medium`; `c2`, `c3` and the image tier
+  are unchanged. A level is only lowered, never raised, and the model choice
+  never changes. The pilot controller's per-turn level is capped the same
+  way (it is the router's own pick). Left alone: `[llm] thinking`, an
+  explicit model override, a route or model the user pinned with router
+  control, and a tier level the operator set to something other than the
+  shipped value. Lowered turns log `turn_runner.effort_by_tier`.
+  `[agentos_router] effort_by_tier = false` keeps each tier's level (needed to
+  keep a cheap tier at a level equal to the shipped one, since config files
+  store the whole tier table).
+- Proactive compaction. When a turn ends with the session's history at
+  `[compaction] proactive_ratio` (default 0.70) of the compaction trigger and
+  the session then stays idle for `[compaction] proactive_idle_seconds`
+  (default 20), the session is compacted in the background with the same
+  summarizer and persisted like an in-turn compaction (checkpoint, summary,
+  `reset` record, notifications with phase `proactive_background`), so the
+  next turn no longer waits for the summarizer. A turn that starts first
+  makes the job persist nothing (and when it cancels a summary already in
+  progress, the idle wait doubles for that session, up to 300 s, until a job
+  completes); a job that has persisted is never cancelled, and one whose
+  session was reset or truncated meanwhile is skipped without a failure
+  notice; subagent and cron sessions are skipped; the
+  in-turn check stays as the safety net. `[compaction] proactive = false`
+  turns it off.
 - Suggested next prompt. When a turn finishes, the chat input in the web
   console, the desktop app and `agentos chat` shows the message the user is
   most likely to send next as grey placeholder text; `Tab` takes it into the
@@ -18,8 +59,223 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   exchange. Errored or aborted turns get none and cost no call, and answers
   are cached per reply so clients sharing a session share one call. On by
   default; `[sessions] suggest_next = false` turns it off.
+- Prompt caching: `[prompt_cache] ttl = "1h"` (env `AGENTOS_CACHE_TTL`) keeps
+  Anthropic's cached system prompt and tool list for an hour instead of five
+  minutes. Default unchanged (`5m`). (#3648)
+- Ollama: the agent's context window is sent as `options.num_ctx`, capped at
+  32k because Ollama allocates the whole window up front (Ollama's default of
+  a few thousand tokens silently dropped the start of long prompts;
+  `AGENTOS_OLLAMA_NUM_CTX` overrides it, larger or smaller), and `think` is sent when
+  thinking is on for a model that supports it (Qwen 3, DeepSeek R1 / V3.1,
+  gpt-oss with a level, Magistral). (#3648)
+- Tool contract: tools can opt into `strict` (Anthropic `strict`, OpenAI
+  `function.strict`) and set `additionalProperties`; `ToolChoice` is a typed,
+  provider-neutral tool choice translated per provider, and
+  `ChatConfig.parallel_tool_calls = False` maps to OpenAI
+  `parallel_tool_calls` / Anthropic `disable_parallel_tool_use`. Existing tool
+  payloads are unchanged. (#3648)
+- Deferred tool loading. A request no longer carries every tool schema: 24
+  rarely used builtins (audio generation, project and skill administration,
+  `browser`, `x_search`, `http_request`, ...) are marked deferred. The system
+  prompt lists them by name with a one-line summary under "Tools that must be
+  loaded first", the new `tool_search` tool lists them too, and the model loads
+  the ones a task needs; they stay loaded for the rest of the session,
+  including after a restart, and a reset starts lean again. `skill_view` loads
+  the tools a skill lists in `requires_tools` and says so, and calling a
+  deferred tool before loading it returns an error that says how to load it.
+  On a stock gateway a request drops from 63 to 40 tool schemas (about 14k
+  characters less, ~12k net of the longer prompt, ~3k tokens per call). The
+  spreadsheet/document builders and git tools stay loaded: deferred, the model
+  took the shell instead. Policy still applies, and a surface narrowed by an
+  allowlist defers nothing. `[tools] defer_loading = false` sends every tool
+  again; `agentos context` honours it and reports the deferred count, also in
+  `--json`. (#3648)
+
+### Changed
+- Approvals: when several `exec` / `background_process` calls of one batch
+  need approval on the Web UI or the desktop app, all of them are now asked
+  at once instead of each one only after the previous answer. The wait for
+  the operator no longer holds the call's exclusive batch slot (the same
+  applies to sandbox approval prompts). The commands still run one at a time
+  and in the order the model asked for them, whatever order the approvals
+  come back in: a later call gets ahead only as far as its own approval
+  prompt, so a command that needs no approval never runs before an earlier
+  one still waiting for the operator, and other exclusive tools wait for the
+  earlier calls as before. The call's own timeout does not run while it
+  queues to run after its approval, and a call whose batch ran out of time
+  meanwhile times out without running. (The CLI's approve-then-retry flow is
+  unchanged: each retry still runs as soon as its own approval is answered.)
+- Compaction trigger calibration: the request-size estimate (chars / 4)
+  over-counted 1.6-2x against provider-reported input tokens, so compaction
+  fired far too early. Per provider and model, a running ratio of reported
+  input tokens to the estimate now scales the estimate after two calls
+  (clamped 0.7-1.25; logged on `agent.context_estimate_vs_provider` as
+  `calibration_factor`). Usage the provider marks `"estimated": true`
+  (OpenCAP) and requests carrying image or document blocks are not used as
+  samples. `[compaction] estimate_calibration = false` keeps the
+  raw estimate.
+- Turn setup runs its independent reads concurrently: the external memory
+  provider's recall, the session's project knowledge, the deferred-tool
+  hydrate, the router's transcript read and the first-turn memory index warm
+  now overlap instead of running one after another before the first model
+  request. Results are applied in the old order, so the prompt is
+  byte-identical. `[task_runtime] concurrent_turn_setup = false` restores the
+  serial order.
+- Memory-provider recall has a hard deadline, `[memory]
+  recall_timeout_seconds` (default 1.5, was a fixed 3 s). A late recall no
+  longer holds the turn and is no longer cancelled: it finishes in the
+  background and stands in on the session's next turn if that recall is late
+  too. A timeout logs `memory.recall_timeout`.
+- The router's per-turn transcript read takes the newest 128 rows instead of
+  the whole transcript, falling back to the full read only when that window
+  lacks the last four user messages or an assistant reply; the result is the
+  same. On an 1,800-row session this drops the read from ~63 ms to ~8 ms.
+- Blocking file work no longer runs on the event loop: attachment building
+  (PDF text extraction, base64 decoding, media reads) and the memory index's
+  workspace scan and file reads (session-start sync and the 2-second watcher)
+  run on worker threads, so one session's setup no longer stalls another's
+  stream.
+- The system prompt template is compiled once per process instead of on every
+  turn (~8 ms of event-loop time per turn); edits to the template file are
+  still picked up.
+- Anthropic prompt cache now covers the whole conversation, not only the
+  system prompt: breakpoints on the system prompt, the last tool definition
+  and a rolling one on the last block of the last user message (at most four),
+  so every tool-loop iteration reads the previous iteration's prefix from
+  cache instead of paying for the full history again. `cache_mode = "off"`
+  now sends no cache markers at all on this path. (#3648)
+- Providers keep one pooled HTTP connection per provider instead of opening a
+  new client (TCP + TLS handshake) for every request, and use split timeouts
+  (connect 12 s, write 30 s, read = the request timeout; env
+  `AGENTOS_LLM_STREAM_CONNECT_TIMEOUT_SECONDS` /
+  `AGENTOS_LLM_STREAM_WRITE_TIMEOUT_SECONDS`). (#3648)
+- Anthropic cache hints on OpenAI-compatible gateways come from a small
+  table of gateways known to forward them. OpenRouter is the one entry: Claude
+  models (`anthropic/...`) get the request-level `cache_control`, whose
+  breakpoint advances with the conversation, as before. api.openai.com,
+  DeepSeek, Gemini, Zhipu and local servers get none. (#3648)
+- OpenAI (api.openai.com): requests carry a `prompt_cache_key` derived from
+  the model, system prompt and tools, so turns sharing a prefix are routed to
+  the same cache. Not sent to other OpenAI-compatible upstreams. (#3648)
+- Tool calls: each result now reaches the chat as soon as its tool finishes
+  instead of after the whole batch, so a fast `read_file` is shown while a slow
+  `web_fetch` beside it is still running. When several calls in one turn stop
+  for operator approval, every approval is waited on at the same time and each
+  call is retried the moment its own approval is resolved; a denied call
+  returns its denial without holding up the others. What needs approval is
+  unchanged. The model still receives the results in the order it asked for
+  them. Which tools may run side by side is now declared on each tool
+  (`concurrency` = `parallel` / `keyed` / `exclusive`) instead of a hard-coded
+  list of names in the engine; a tool that declares nothing, MCP tools
+  included, still runs alone. Tools also declare `read_only` and
+  `requires_approval` for upcoming use; nothing reads those two yet. Up to 8
+  parallel calls run at once (was 6).
+- Engine: the conversation is now an append-only transcript, so consecutive
+  provider requests share a byte-identical prefix and prompt caches keep
+  hitting. Every assistant row stores the exact provider-facing messages of
+  its turn (new `transcript_entries.provider_messages` column, kind
+  `agentos.provider_messages` v1): the input message, each assistant message
+  with per-block `thinking` / `redacted_thinking` signatures and OpenRouter
+  `reasoning_details`, and every tool call/result pair; the next turn replays
+  it verbatim. Rows written before keep loading through the old
+  reconstruction plus a one-time migration, and the flat display segments are
+  still written for the UI. Nothing rewrites a message after it was sent,
+  with one bounded exception: an oversized tool result is projected once,
+  before its first request (the full output stays in the tool-result store),
+  and when a turn ends its tool results and tool-call argument fields longer
+  than `[compaction] history_tool_result_max_chars` (default `0` = 2% of the
+  context window, clamped to 4k-12k chars) become head/tail plus the store
+  handle for every later turn -- one cache write for that turn's tail, then
+  byte-stable. The per-request aggregate projection, historical
+  re-projection, argument re-sanitizing and three pairing-repair passes are
+  gone (one pass at load, then only the new messages). The timestamp, skills
+  list and request context are trailing text of the current user turn
+  instead of being spliced in on every request; the request context is
+  diffed per `## <title>` section, so only a changed section (memory recall,
+  internal-event mode, plan mode, ...) is sent again, and session-frozen
+  parts (workspace files, project knowledge, router control) moved into the
+  cached system prompt. A follow-up queued while a turn runs is replayed
+  after that turn. Replayed reasoning is no longer stripped on load except
+  for models whose capabilities say they take none.
+- Engine: one `CompactionService` replaces the five compaction paths
+  (in-turn preflight, provider-overflow retry, T3-upgrade, before-turn DB
+  preflight, emergency request-scoped trim). It triggers on the live request
+  estimate against `context window x preflight_compact_ratio` (0.85), or the
+  provider's own no-rewrite request budget when that is lower, before every
+  provider call -- the first call of a turn included -- and never while a
+  tool round is open; a provider that still reports an overflow invokes the
+  same service. When the current turn alone would not fit, preflight does not
+  summarize older history for nothing; the turn ends with
+  `provider_request_too_large` only if the provider then refuses it. The result is always one summary exchange followed by the
+  current turn verbatim (images, per-block thinking and tool pairs kept);
+  only when the current turn alone does not fit are its oldest complete tool
+  rounds folded in. The in-turn summary is an auxiliary side task
+  (`compaction`: `[auxiliary.tasks.compaction]`, else the router's cheapest
+  text tier, else `[auxiliary]` / `[llm]`), with no thinking and bounded by
+  `[compaction] summary_timeout_seconds` (45 s); a timeout or failure falls
+  back to a deterministic digest and logs its error type. A compaction that
+  would take less than 10% off the request is not applied -- no durable
+  rewrite, one `compaction.declined` log line, the request goes out as is,
+  and the turn does not retry it at about the same size; when the system
+  prompt and tools alone exceed the limit the reason is
+  `fixed_context_too_large`, with a hint that the ratio or window is set too
+  low. Manual `/compact`
+  summarizes through the session's `LLMProvider` instead of raw HTTP. A durable checkpoint is
+  recorded before any compaction rewrites stored rows; subagent and cron
+  sessions (canonical `agent:<id>:subagent:<run>` keys included) skip it.
 
 ### Fixed
+- Engine: a tool call still queued when a tool batch ran out of time could be
+  started anyway (and killed a moment later) when the running call's own
+  timeout fired first; the two expire at the same instant. It now times out
+  unstarted like every other queued call. This was also the cause of the
+  `test_batch_deadline_times_out_running_and_queued_calls` flake on Windows
+  CI, which now uses a fake clock.
+- Compaction fallback now always shrinks the history: the deterministic
+  digest used when the summarizer fails is bounded to an eighth of the context
+  window (one shared bound across chunks, a carried-over summary gets at most
+  half), and a summarizer that raises or outlives its timeout falls back to
+  that digest instead of failing the compaction. Before, a history of many
+  short messages produced a digest as large as what it replaced and was
+  declined, so the request was never reduced.
+- Engine: the request right after an in-turn compaction lost most of its
+  system prompt (the Skills and Local Toolchain sections, ~60% of it in a
+  live session) because the compaction rebuilt the prompt without the
+  per-turn pipeline steps; the next turn had the full prompt again, so the
+  prompt cache missed twice. The summary is a message now, so nothing in the
+  system prompt depends on compaction and the rebuild is gone: the system
+  prompt stays byte-identical across a compaction.
+- OpenAI-compatible usage split across chunks: OpenCAP sends the cache detail
+  on the finish chunk and a trailing billing chunk without it (sometimes all
+  zeros, sometimes after an `"estimated": true` chunk); only the last chunk
+  was kept, so turns recorded input or cached tokens as 0 and the cache-break
+  monitor logged false `prompt_cache.break_detected` warnings. Usage chunks
+  are now merged (a zero or estimated value never replaces a real one), and
+  the monitor skips responses whose usage carried no cache figure instead of
+  reading them as a cache break. (#3648)
+- Anthropic extended thinking: every thinking delta of a response was joined
+  into one block with only the last signature, and `redacted_thinking` blocks
+  were dropped, so replaying a multi-block response was a signature mismatch.
+  Each `thinking` / `redacted_thinking` block is now kept with its own
+  signature or data (`DoneEvent.thinking_blocks`) and replayed unmodified, in
+  order. Stored single-block thinking still loads. (#3648)
+- OpenRouter reasoning: `reasoning_details` were parsed for display but never
+  sent back, so Claude, GPT, Gemini and GLM via OpenRouter lost their
+  reasoning (and signatures) across tool calls. They are now merged per block
+  (`DoneEvent.reasoning_details`) and re-sent verbatim on the assistant
+  message, only when the next request goes to the model family that produced
+  them (a router or `/model` switch drops them rather than handing one
+  vendor's signed reasoning to another). (#3648)
+- A model stream that went silent after it had started hung until the
+  per-iteration timeout (30 min by default). It now ends after 120 s without
+  data (`AGENTOS_LLM_STREAM_IDLE_TIMEOUT_SECONDS`, `0` disables) with a
+  retriable `stream_idle_timeout` error; the watchdog starts at the first
+  streamed event, so a slow first token is not affected. (#3648)
+- A stream cut in the middle of a tool call's arguments ended the turn with
+  an incomplete tool call (Anthropic) or ran the call with truncated
+  arguments (OpenAI-compatible). The provider now retries such a stream once,
+  transparently, as long as no text was streamed yet; otherwise it reports
+  the interruption instead of retrying and duplicating output. (#3648)
 - Providers: a 429 that said `Retry-After: 2` failed over to another model at
   once -- losing the prompt cache and changing the cost -- and three of them
   marked the primary provider down for a minute. The providers threw the

@@ -1,1048 +1,406 @@
-"""Tests for pre-flight compaction (Feature D).
+"""Preflight compaction through the TurnRunner (Feature D, one CompactionService).
 
-Covers:
-- Pre-flight triggers when transcript exceeds the configured context-window ratio
-- Pre-flight does NOT trigger when under threshold
-- cron: and subagent: sessions are skipped
-- Missing sessions don't error
+The before-turn DB compaction, the T3-upgrade compaction and the emergency
+request-scoped trim were replaced by the agent's single ``CompactionService``,
+which checks the live request before every provider call -- the first call
+of a turn is the "preflight". These tests drive real turns through the
+runtime with a real ``SessionManager`` and cover what the old preflight tests
+guarded:
+
+- compaction triggers above ``preflight_compact_ratio`` and not below it;
+- a durable checkpoint is recorded before any row is archived, and a failing
+  checkpoint prevents the destructive rewrite;
+- cron/subagent sessions (canonical keys included) compact without one;
+- the compacted transcript is persisted (``reset`` record + durable summary)
+  and the next turn replays it without duplicating the summary;
+- the summarizer runs through the session's ``LLMProvider``.
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agentos.engine import runtime as runtime_module
 from agentos.engine.runtime import TurnRunner
-from agentos.gateway.config import GatewayConfig
+from agentos.engine.types import DoneEvent
+from agentos.gateway.config import AgentOSRouterConfig, AttachmentsConfig, GatewayConfig
 from agentos.provider import DoneEvent as ProviderDone
-from agentos.provider import Message, ModelInfo
+from agentos.provider import Message
 from agentos.provider import TextDeltaEvent as ProviderText
-from agentos.provider.model_catalog import ModelCatalog
-from agentos.session.compaction import CompactionConfig
+from agentos.provider import ToolUseEndEvent as ProviderToolUseEnd
+from agentos.provider import ToolUseStartEvent as ProviderToolUseStart
 from agentos.session.manager import SessionManager
-from agentos.session.models import TranscriptEntry
 from agentos.session.storage import SessionStorage
+from agentos.tools.registry import ToolRegistry
 from agentos.tools.types import CallerKind, ToolContext
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+KEY = "agent:main:webchat:preflight"
+SUMMARY = "SUMMARY: the user asked about deployments on host-17"
 
 
-def _make_entry(content: str, role: str = "user") -> TranscriptEntry:
-    return TranscriptEntry(
-        session_id="test-session-id",
-        session_key="test:key",
-        role=role,
-        content=content,
-    )
+class _Provider:
+    """Answers turns; answers summarizer calls with a fixed summary."""
 
+    provider_name = "test"
 
-def _make_assistant_tool_entry(content: str, tool_calls: list[dict[str, Any]]) -> TranscriptEntry:
-    return TranscriptEntry(
-        session_id="test-session-id",
-        session_key="test:key",
-        role="assistant",
-        content=content,
-        tool_calls=tool_calls,
-        token_count=1,
-    )
+    def __init__(self) -> None:
+        self.model = "test/model"
+        self.turn_requests: list[list[Message]] = []
+        self.summarizer_requests: list[list[Message]] = []
 
+    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
+        system = str(getattr(config, "system", "") or "")
+        if system.startswith("You are a conversation compactor"):
+            self.summarizer_requests.append(list(messages))
+            return self._stream(SUMMARY)
+        self.turn_requests.append(list(messages))
+        return self._stream(f"answer {len(self.turn_requests)}")
 
-def _make_assistant_reasoning_entry(content: str, reasoning_content: str) -> TranscriptEntry:
-    return TranscriptEntry(
-        session_id="test-session-id",
-        session_key="test:key",
-        role="assistant",
-        content=content,
-        reasoning_content=reasoning_content,
-        token_count=1,
-    )
+    async def _stream(self, text: str) -> AsyncIterator[Any]:
+        yield ProviderText(text=text)
+        yield ProviderDone(stop_reason="end_turn", input_tokens=10, output_tokens=1)
 
-
-def _checkpoint_receipt() -> SimpleNamespace:
-    return SimpleNamespace(
-        scope="checkpoint",
-        status="checkpoint_saved",
-        source_path="memory/.checkpoints/s/turn.jsonl",
-        content_hash="h1",
-    )
-
-
-class _FakeCompactionProvider:
-    provider_name = "openai"
-
-    def __init__(self, model: str = "provider/model") -> None:
-        self._api_key = "preflight-provider-key"
-        self._model = model
-        self._base_url = "https://openrouter.ai/api/v1"
-
-    @property
-    def model(self) -> str:
-        return self._model
-
-    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator:
-        return self._stream()
-
-    async def _stream(self) -> AsyncIterator:
-        yield ProviderText(text="ok")
-        yield ProviderDone(stop_reason="end_turn", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[ModelInfo]:
+    async def list_models(self) -> list[Any]:
         return []
 
 
-class _FakeSelectorClone:
-    current_config = SimpleNamespace(model="provider/model")
+class _SelectorClone:
+    current_config = SimpleNamespace(model="test/model")
 
-    def __init__(self, provider: _FakeCompactionProvider) -> None:
+    def __init__(self, provider: _Provider) -> None:
         self.provider = provider
-        self.override_calls: list[str] = []
 
     def override_model(self, model: str) -> None:
-        self.override_calls.append(model)
-        self.provider._model = model
         self.current_config = SimpleNamespace(model=model)
 
-    def resolve(self) -> _FakeCompactionProvider:
+    def resolve(self) -> _Provider:
         return self.provider
 
 
-class _FakeProviderSelector:
-    current_config = SimpleNamespace(model="provider/model")
+class _Selector:
+    def __init__(self, provider: _Provider) -> None:
+        self.provider = provider
 
-    def __init__(self, provider: _FakeCompactionProvider | None = None) -> None:
-        self.provider = provider or _FakeCompactionProvider()
-        self.clone_instance = _FakeSelectorClone(self.provider)
-        self.override_calls: list[str] = []
-
-    def clone(self) -> _FakeSelectorClone:
-        return self.clone_instance
-
-    def override_model(self, model: str) -> None:
-        self.override_calls.append(model)
-
-    def resolve(self) -> _FakeCompactionProvider:
-        return self.provider
+    def clone(self) -> _SelectorClone:
+        return _SelectorClone(self.provider)
 
 
-class _ResultCompactionSessionManager:
-    def __init__(self, transcript: list[TranscriptEntry]) -> None:
-        self._transcript = transcript
-        self.compact_with_result_calls: list[tuple[str, int, object | None]] = []
-        self.compact_with_result_kwargs: list[dict[str, object | None]] = []
+class _Catalog:
+    def __init__(self, context_window: int) -> None:
+        self.context_window = context_window
 
-    async def get_transcript(self, session_key: str) -> list[TranscriptEntry]:
-        return list(self._transcript)
+    def resolve_max_tokens(self, model_id, user_override=0, provider_name=""):  # noqa: ARG002
+        return 1024
 
-    async def compact_with_result(
-        self,
-        session_key: str,
-        context_window_tokens: int,
-        config: object | None = None,
-        **kwargs,
-    ) -> SimpleNamespace:
-        self.compact_with_result_calls.append((session_key, context_window_tokens, config))
-        self.compact_with_result_kwargs.append(dict(kwargs))
-        return SimpleNamespace(
-            summary="summary text",
-            kept_entries=[{"role": "assistant", "content": "tail"}],
-            removed_count=4,
-            chunks_processed=3,
-            summary_source="llm",
-            tokens_before=1000,
-            tokens_after=200,
-            remaining_budget_tokens=800,
-        )
+    def resolve_context_window(self, model_id, provider_name=""):  # noqa: ARG002
+        return self.context_window
+
+    def get_capabilities(self, model_id, provider_name="", base_url=""):  # noqa: ARG002
+        return None
 
 
-class _FailingResultCompactionSessionManager(_ResultCompactionSessionManager):
-    async def compact_with_result(
-        self,
-        session_key: str,
-        context_window_tokens: int,
-        config: object | None = None,
-        **kwargs,
-    ) -> SimpleNamespace:
-        self.compact_with_result_calls.append((session_key, context_window_tokens, config))
-        self.compact_with_result_kwargs.append(dict(kwargs))
-        raise RuntimeError("preimage write failed")
+@pytest.fixture(autouse=True)
+def _auxiliary_client(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Route the summarizer's auxiliary client to the test provider.
+
+    The in-turn summarizer runs as the auxiliary side task ``compaction``
+    (cheap model, no thinking), not on the turn's own model.
+    """
+    from agentos.provider import auxiliary
+
+    built: list[dict[str, Any]] = []
+
+    def _factory(**kwargs: Any) -> Any:
+        built.append(kwargs)
+        return _AUX_PROVIDER["provider"]
+
+    monkeypatch.setattr(
+        auxiliary,
+        "_client",
+        auxiliary.AuxiliaryClient(
+            config={"provider": "opencap", "model": "cheap-model"},
+            provider_factory=_factory,
+        ),
+    )
+    return built
 
 
-class _StaleResultCompactionSessionManager(_ResultCompactionSessionManager):
-    async def compact_with_result(
-        self,
-        session_key: str,
-        context_window_tokens: int,
-        config: object | None = None,
-        **kwargs,
-    ) -> SimpleNamespace:
-        self.compact_with_result_calls.append((session_key, context_window_tokens, config))
-        self.compact_with_result_kwargs.append(dict(kwargs))
-        return SimpleNamespace(
-            summary="",
-            kept_entries=list(self._transcript),
-            removed_count=0,
-            chunks_processed=0,
-            summary_source="skipped",
-            skip_reason="stale_preimage",
-            tokens_before=2400,
-            tokens_after=2400,
-            remaining_budget_tokens=0,
-        )
+_AUX_PROVIDER: dict[str, Any] = {}
 
 
 @pytest.fixture
-async def session_mgr(tmp_path):
+async def storages() -> AsyncIterator[list[SessionStorage]]:
+    opened: list[SessionStorage] = []
+    yield opened
+    for storage in opened:
+        await storage.close()
+
+
+async def _manager(
+    tmp_path: Path,
+    storages: list[SessionStorage],
+    *,
+    checkpoint: bool = True,
+) -> SessionManager:
     storage = SessionStorage(":memory:")
     await storage.connect()
-    mgr = SessionManager(storage, checkpoint_workspace_dir=tmp_path)
-    yield mgr
-    await storage.close()
-
-
-# ---------------------------------------------------------------------------
-# Tests: _maybe_preflight_compact
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_preflight_no_session_manager_is_noop() -> None:
-    """When session_manager is None, pre-flight silently returns."""
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=None)
-    # Should not raise
-    await runner._maybe_preflight_compact("some:session", 200_000)
-
-
-@pytest.mark.asyncio
-async def test_preflight_skips_cron_sessions() -> None:
-    """cron: prefixed sessions are skipped regardless of token count."""
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock()
-    mock_sm.get_transcript = AsyncMock()
-
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-    await runner._maybe_preflight_compact("cron:daily-job", 200_000)
-
-    mock_sm.get_transcript.assert_not_called()
-    mock_sm.compact.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_preflight_skips_subagent_sessions() -> None:
-    """subagent: prefixed sessions are skipped regardless of token count."""
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock()
-    mock_sm.get_transcript = AsyncMock()
-
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-    await runner._maybe_preflight_compact("subagent:worker-1", 200_000)
-
-    mock_sm.get_transcript.assert_not_called()
-    mock_sm.compact.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_preflight_missing_session_does_not_error() -> None:
-    """KeyError from get_transcript (session doesn't exist) is swallowed."""
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock()
-    mock_sm.get_transcript = AsyncMock(side_effect=KeyError("Session not found"))
-
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-    # Should not raise
-    await runner._maybe_preflight_compact("missing:session", 200_000)
-
-    mock_sm.compact.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_preflight_empty_transcript_is_noop() -> None:
-    """Empty transcript skips compaction."""
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock()
-    mock_sm.get_transcript = AsyncMock(return_value=[])
-
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-    await runner._maybe_preflight_compact("user:session", 200_000)
-
-    mock_sm.compact.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_preflight_under_threshold_does_not_compact() -> None:
-    """Transcript under the configured context-window ratio → no compaction."""
-    # 100 tokens worth of content (estimate_tokens("x" * 400) ≈ 100 with len//4 fallback)
-    entries = [_make_entry("x" * 400)]  # ~100 tokens
-
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock()
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-    # Threshold = 200_000 * 0.85 = 170_000 — 100 tokens is well under
-    await runner._maybe_preflight_compact("user:session", 200_000)
-
-    mock_sm.compact.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_preflight_uses_configured_compaction_ratio() -> None:
-    """Operators can tune the preflight threshold without code changes."""
-    context_window = 1000
-    entries = [_make_entry("a")]
-
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock(return_value="summary text")
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-
-    runner = TurnRunner(
-        provider_selector=MagicMock(),
-        session_manager=mock_sm,
-        config=SimpleNamespace(preflight_compact_ratio=0.5),
+    storages.append(storage)
+    return SessionManager(
+        storage,
+        inject_time_prefix=False,
+        checkpoint_workspace_dir=tmp_path if checkpoint else None,
     )
 
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=600):
-        await runner._maybe_preflight_compact("user:session", context_window)
 
-    mock_sm.compact.assert_called_once_with("user:session", context_window)
-
-
-@pytest.mark.asyncio
-async def test_preflight_above_threshold_triggers_compact() -> None:
-    """Transcript exceeding the default 85% context-window ratio triggers compaction."""
-    # Use patch to control estimate_tokens so threshold math is deterministic
-    context_window = 1000
-
-    # Create entries whose total estimated tokens exceed threshold
-    entries = [_make_entry("a" * 4000)]  # len//4 = 1000 tokens > 850
-
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock(return_value="summary text")
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=1000):
-        await runner._maybe_preflight_compact("user:session", context_window)
-
-    mock_sm.compact.assert_called_once_with("user:session", context_window)
-
-
-@pytest.mark.asyncio
-async def test_preflight_checkpoint_runs_before_compact() -> None:
-    context_window = 1000
-    entries = [_make_entry("early durable fact " + ("a" * 4000))]
-    calls: list[str] = []
-    mock_sm = MagicMock()
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-    mock_sm.compact = AsyncMock(
-        side_effect=lambda *args, **kwargs: calls.append("compact") or "summary"
-    )
-    mock_sm.record_memory_checkpoint = AsyncMock(
-        side_effect=lambda *args, **kwargs: calls.append("checkpoint") or _checkpoint_receipt()
-    )
-
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=1000):
-        await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
-
-    assert calls[0] == "checkpoint"
-    assert "compact" in calls
-
-
-@pytest.mark.asyncio
-async def test_preflight_records_checkpoint_before_compacting() -> None:
-    context_window = 1000
-    entries = [_make_entry("early durable fact " + ("a" * 4000))]
-    calls: list[str] = []
-    mock_sm = MagicMock()
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-    mock_sm.record_memory_checkpoint = AsyncMock(
-        side_effect=lambda *args, **kwargs: calls.append("checkpoint") or _checkpoint_receipt()
-    )
-    mock_sm.compact = AsyncMock(
-        side_effect=lambda *args, **kwargs: calls.append("compact") or "summary text"
-    )
-
-    runner = TurnRunner(
-        provider_selector=MagicMock(),
-        session_manager=mock_sm,
-        config=SimpleNamespace(memory=SimpleNamespace()),
-    )
-
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=1000):
-        await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
-
-    assert calls[:2] == ["checkpoint", "compact"]
-    await asyncio.sleep(0)
-    mock_sm.compact.assert_awaited_once_with("agent:ops:long-session", context_window)
-
-
-@pytest.mark.asyncio
-async def test_preflight_checkpoint_failure_prevents_destructive_compaction() -> None:
-    context_window = 1000
-    entries = [_make_entry("early durable fact " + ("a" * 4000))]
-    mock_sm = MagicMock()
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-    mock_sm.record_memory_checkpoint = AsyncMock(
-        side_effect=RuntimeError("checkpoint write failed")
-    )
-    mock_sm.compact = AsyncMock(return_value="summary text")
-    runner = TurnRunner(
-        provider_selector=MagicMock(),
-        session_manager=mock_sm,
-        config=SimpleNamespace(memory=SimpleNamespace()),
-    )
-
-    with (
-        patch("agentos.session.tokenizer.estimate_tokens", return_value=1000),
-        pytest.raises(RuntimeError, match="checkpoint write failed"),
-    ):
-        await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
-
-    mock_sm.compact.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_preflight_completed_event_reports_compaction_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    context_window = 1000
-    entries = [_make_entry("a" * 4000)]
-    sm = _ResultCompactionSessionManager(entries)
-    events: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        runtime_module,
-        "notify_compaction",
-        lambda session_key, **payload: events.append((session_key, payload)),
-    )
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
-
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=1000):
-        await runner._maybe_preflight_compact("user:session", context_window)
-
-    assert sm.compact_with_result_calls == [("user:session", context_window, None)]
-    assert [(key, payload["status"]) for key, payload in events] == [
-        ("user:session", "started"),
-        ("user:session", "observed"),
-        ("user:session", "observed"),
-        ("user:session", "completed"),
-    ]
-    compaction_ids = {payload.get("compaction_id") for _, payload in events}
-    assert len(compaction_ids) == 1
-    assert None not in compaction_ids
-    assert events[0][1]["event"] == "compaction.triggered"
-    assert events[1][1]["event"] == "compaction.chunk_summarized"
-    assert events[2][1]["event"] == "compaction.summary_verified"
-    completed = events[-1][1]
-    assert completed["applied"] is True
-    assert completed["durability"] == "durable"
-    assert completed["user_visible"] is True
-    assert completed["event"] == "compaction.persisted"
-    assert completed["event_chain"] == [
-        "compaction.triggered",
-        "compaction.chunk_summarized",
-        "compaction.summary_verified",
-        "compaction.persisted",
-    ]
-    assert completed["coverage_status"] == "unknown"
-    assert completed["chunk_count"] == 3
-    assert completed["summary_source"] == "llm"
-    assert completed["removed_count"] == 4
-    assert completed["kept_count"] == 1
-    assert completed["tokens_after"] == 200
-    assert completed["remaining_budget_tokens"] == 800
-
-
-@pytest.mark.asyncio
-async def test_preflight_counts_tool_call_arguments_when_deciding_to_compact() -> None:
-    context_window = 1000
-    entries = [
-        _make_assistant_tool_entry(
-            "small visible answer",
-            [
-                {
-                    "type": "tool_use",
-                    "tool_use_id": "write-stale",
-                    "name": "write_file",
-                    "input": {
-                        "path": "index.html",
-                        "content": "x" * 5000,
-                    },
-                }
-            ],
-        )
-    ]
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock(return_value="summary text")
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-
-    with patch(
-        "agentos.session.tokenizer.estimate_tokens",
-        side_effect=lambda text: max(1, len(str(text)) // 4),
-    ):
-        await runner._maybe_preflight_compact("user:session", context_window)
-
-    mock_sm.compact.assert_called_once_with("user:session", context_window)
-
-
-@pytest.mark.asyncio
-async def test_preflight_counts_reasoning_content_when_deciding_to_compact() -> None:
-    context_window = 1000
-    entries = [
-        _make_assistant_reasoning_entry(
-            "small visible answer",
-            "reasoning " + ("r" * 5000),
-        )
-    ]
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock(return_value="summary text")
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-
-    with patch(
-        "agentos.session.tokenizer.estimate_tokens",
-        side_effect=lambda text: max(1, len(str(text)) // 4),
-    ):
-        await runner._maybe_preflight_compact("user:session", context_window)
-
-    mock_sm.compact.assert_called_once_with("user:session", context_window)
-
-
-@pytest.mark.asyncio
-async def test_preflight_compact_failure_uses_emergency_ephemeral_history_trim() -> None:
-    session_key = "agent:ops:preflight-emergency"
-    context_window = 1000
-    entries = [
-        TranscriptEntry(
-            session_id="test-session-id",
-            session_key=session_key,
-            role="user" if index % 2 == 0 else "assistant",
-            content=f"historic message {index} " + ("x" * 500),
-            token_count=300,
-        )
-        for index in range(8)
-    ]
-    sm = _FailingResultCompactionSessionManager(entries)
-    runner = TurnRunner(
-        provider_selector=MagicMock(),
-        session_manager=sm,
-        config=SimpleNamespace(memory=SimpleNamespace()),
-    )
-
-    await runner._maybe_preflight_compact(session_key, context_window)
-
-    class _HistoryCapture:
-        provider = SimpleNamespace(provider_name="test")
-
-        def __init__(self) -> None:
-            self.history: list[Any] = []
-
-        def set_history(self, history: list[Any]) -> None:
-            self.history = history
-
-    agent = _HistoryCapture()
-    summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
-
-    assert sm.compact_with_result_calls == [(session_key, context_window, None)]
-    assert len(await sm.get_transcript(session_key)) == len(entries)
-    assert 0 < len(agent.history) < len(entries)
-    assert summary_context is not None
-    assert "emergency request-scoped compaction" in summary_context.lower()
-
-
-@pytest.mark.asyncio
-async def test_preflight_compact_failure_reports_emergency_without_failed_event(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    session_key = "agent:ops:preflight-emergency-event"
-    context_window = 1000
-    entries = [
-        TranscriptEntry(
-            session_id="test-session-id",
-            session_key=session_key,
-            role="user" if index % 2 == 0 else "assistant",
-            content=f"historic message {index} " + ("x" * 500),
-            token_count=300,
-        )
-        for index in range(8)
-    ]
-    sm = _FailingResultCompactionSessionManager(entries)
-    events: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        runtime_module,
-        "notify_compaction",
-        lambda session_key, **payload: events.append((session_key, payload)),
-    )
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
-    runner._compaction_failures[session_key] = runtime_module._CompactionFailureState(count=1)
-
-    await runner._maybe_preflight_compact(session_key, context_window)
-
-    statuses = [payload["status"] for _, payload in events]
-    assert statuses == ["started", "emergency_ephemeral"]
-    emergency = events[-1][1]
-    assert emergency["applied"] is True
-    assert emergency["durability"] == "request_scoped"
-    assert emergency["user_visible"] is True
-    assert emergency["reason"] == "compact_failed"
-    assert emergency["flush_receipt_status"] == "emergency_ephemeral"
-    assert runner._compaction_failures[session_key].count == 2
-
-
-@pytest.mark.asyncio
-async def test_preflight_open_circuit_still_uses_request_scoped_emergency_trim(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    session_key = "agent:ops:preflight-open-circuit"
-    context_window = 1000
-    entries = [
-        TranscriptEntry(
-            session_id="test-session-id",
-            session_key=session_key,
-            role="user" if index % 2 == 0 else "assistant",
-            content=f"historic message {index} " + ("x" * 500),
-            token_count=300,
-        )
-        for index in range(8)
-    ]
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock()
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-    events: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        runtime_module,
-        "notify_compaction",
-        lambda session_key, **payload: events.append((session_key, payload)),
-    )
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-    runner._compaction_failures[session_key] = runtime_module._CompactionFailureState(
-        count=3,
-        opened_at=runtime_module.time.monotonic(),
-    )
-
-    await runner._maybe_preflight_compact(session_key, context_window)
-
-    mock_sm.compact.assert_not_awaited()
-    assert [payload["status"] for _, payload in events] == ["emergency_ephemeral"]
-    emergency = events[-1][1]
-    assert emergency["reason"] == "durable_compaction_circuit_open"
-    assert emergency["applied"] is True
-    assert emergency["durability"] == "request_scoped"
-    assert runner._compaction_failures[session_key].count == 3
-
-
-@pytest.mark.asyncio
-async def test_preflight_empty_summary_uses_emergency_ephemeral_history_trim() -> None:
-    session_key = "agent:ops:preflight-empty-summary"
-    context_window = 1000
-    entries = [
-        TranscriptEntry(
-            session_id="test-session-id",
-            session_key=session_key,
-            role="user" if index % 2 == 0 else "assistant",
-            content=f"historic message {index} " + ("x" * 500),
-            token_count=300,
-        )
-        for index in range(8)
-    ]
-
-    class _EmptySummarySessionManager(_ResultCompactionSessionManager):
-        async def compact_with_result(
-            self,
-            session_key: str,
-            context_window_tokens: int,
-            config: object | None = None,
-            **kwargs,
-        ) -> SimpleNamespace:
-            self.compact_with_result_calls.append((session_key, context_window_tokens, config))
-            self.compact_with_result_kwargs.append(dict(kwargs))
-            return SimpleNamespace(
-                summary="",
-                kept_entries=entries,
-                removed_count=0,
-                chunks_processed=0,
-                summary_source="skipped",
-                tokens_before=2400,
-                tokens_after=2400,
-                remaining_budget_tokens=0,
-            )
-
-    sm = _EmptySummarySessionManager(entries)
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
-
-    await runner._maybe_preflight_compact(session_key, context_window)
-
-    class _HistoryCapture:
-        provider = SimpleNamespace(provider_name="test")
-
-        def __init__(self) -> None:
-            self.history: list[Any] = []
-
-        def set_history(self, history: list[Any]) -> None:
-            self.history = history
-
-    agent = _HistoryCapture()
-    summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
-
-    assert sm.compact_with_result_calls == [(session_key, context_window, None)]
-    assert len(await sm.get_transcript(session_key)) == len(entries)
-    assert 0 < len(agent.history) < len(entries)
-    assert summary_context is not None
-    assert "emergency request-scoped compaction" in summary_context.lower()
-
-
-@pytest.mark.asyncio
-async def test_preflight_stale_preimage_skip_does_not_use_emergency_trim(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    session_key = "agent:ops:preflight-stale-summary"
-    context_window = 1000
-    entries = [
-        TranscriptEntry(
-            session_id="test-session-id",
-            session_key=session_key,
-            role="user" if index % 2 == 0 else "assistant",
-            content=f"historic message {index} " + ("x" * 500),
-            token_count=300,
-        )
-        for index in range(8)
-    ]
-    sm = _StaleResultCompactionSessionManager(entries)
-    events: list[tuple[str, dict[str, Any]]] = []
-    monkeypatch.setattr(
-        runtime_module,
-        "notify_compaction",
-        lambda session_key, **payload: events.append((session_key, payload)),
-    )
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
-    runner._compaction_failures[session_key] = runtime_module._CompactionFailureState(count=1)
-
-    await runner._maybe_preflight_compact(session_key, context_window)
-
-    assert sm.compact_with_result_calls == [(session_key, context_window, None)]
-    assert runner.has_compacted_this_turn(session_key) is False
-    assert runner._compaction_failures[session_key].count == 1
-    skipped = [payload for _, payload in events if payload.get("status") == "skipped"]
-    assert skipped[-1]["reason"] == "stale_preimage"
-    assert skipped[-1]["applied"] is False
-    assert skipped[-1]["durability"] == "none"
-    assert skipped[-1]["user_visible"] is False
-
-    class _HistoryCapture:
-        provider = SimpleNamespace(provider_name="test")
-
-        def __init__(self) -> None:
-            self.history: list[Any] = []
-
-        def set_history(self, history: list[Any]) -> None:
-            self.history = history
-
-    agent = _HistoryCapture()
-    summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
-    assert summary_context is None
-    assert len(agent.history) == len(entries)
-
-
-@pytest.mark.asyncio
-async def test_preflight_compacts_without_a_flush_service() -> None:
-    context_window = 1000
-    entries = [_make_entry("early durable fact " + ("a" * 4000))]
-    mock_sm = MagicMock()
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-    mock_sm.compact = AsyncMock(return_value="summary text")
-
-    runner = TurnRunner(
-        provider_selector=MagicMock(),
-        session_manager=mock_sm,
-        config=SimpleNamespace(memory=SimpleNamespace()),
-    )
-
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=1000):
-        await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
-
-    mock_sm.compact.assert_awaited_once_with("agent:ops:long-session", context_window)
-
-
-@pytest.mark.asyncio
-async def test_preflight_passes_provider_backed_compaction_config() -> None:
-    context_window = 1000
-    entries = [_make_entry("early durable fact " + ("a" * 4000))]
-    captured_configs: list[CompactionConfig | None] = []
-
-    mock_sm = MagicMock()
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-
-    async def compact(session_key, context_window_tokens, config=None):
-        captured_configs.append(config)
-        return "summary text"
-
-    mock_sm.compact = AsyncMock(side_effect=compact)
-
-    runner = TurnRunner(
-        provider_selector=MagicMock(),
-        session_manager=mock_sm,
-        config=SimpleNamespace(
-            compaction=SimpleNamespace(enabled=True, model=None, timeout_seconds=17.5)
-        ),
-    )
-    provider = _FakeCompactionProvider(model="provider/model")
-
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=1000):
-        await runner._maybe_preflight_compact(
-            "agent:ops:long-session",
-            context_window,
-            compaction_provider=provider,
-            compaction_model="routed/model",
-        )
-
-    assert len(captured_configs) == 1
-    config = captured_configs[0]
-    assert isinstance(config, CompactionConfig)
-    assert config.api_key == "preflight-provider-key"
-    assert config.model == "routed/model"
-    assert config.base_url == "https://openrouter.ai/api/v1"
-    assert config.timeout_seconds == 17.5
-
-
-@pytest.mark.asyncio
-async def test_preflight_keeps_legacy_compact_manager_compatible() -> None:
-    context_window = 1000
-    entries = [_make_entry("early durable fact " + ("a" * 4000))]
-    calls: list[tuple[str, int]] = []
-
-    mock_sm = MagicMock()
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-
-    async def compact(session_key, context_window_tokens):
-        calls.append((session_key, context_window_tokens))
-        return "summary text"
-
-    mock_sm.compact = AsyncMock(side_effect=compact)
-
-    runner = TurnRunner(
-        provider_selector=MagicMock(),
-        session_manager=mock_sm,
-        config=SimpleNamespace(
-            compaction=SimpleNamespace(enabled=True, model=None, timeout_seconds=17.5)
+def _runner(
+    provider: _Provider,
+    manager: SessionManager,
+    tmp_path: Path,
+    *,
+    ratio: float = 0.5,
+    context_window: int = 20_000,
+) -> TurnRunner:
+    return TurnRunner(
+        provider_selector=_Selector(provider),
+        tool_registry=ToolRegistry(),
+        session_manager=manager,
+        model_catalog=_Catalog(context_window),
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            agentos_router=AgentOSRouterConfig(enabled=False),
+            preflight_compact_ratio=ratio,
         ),
     )
 
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=1000):
-        await runner._maybe_preflight_compact(
-            "agent:ops:long-session",
-            context_window,
-            compaction_provider=_FakeCompactionProvider(model="provider/model"),
-            compaction_model="routed/model",
+
+async def _seed(manager: SessionManager, key: str, *, rounds: int = 6) -> None:
+    await manager.create(key)
+    for index in range(rounds):
+        await manager.append_message(key, "user", f"old question {index} " + "q" * 6000)
+        await manager.append_message(key, "assistant", f"old answer {index} " + "a" * 6000)
+
+
+async def _turn(runner: TurnRunner, manager: SessionManager, key: str, text: str, tmp_path: Path):
+    await manager.append_message(key, "user", text)
+    return [
+        event
+        async for event in runner.run(
+            text,
+            key,
+            tool_context=ToolContext(caller_kind=CallerKind.WEB, workspace_dir=str(tmp_path)),
+            history_has_persisted_user=True,
+            no_memory_capture=True,
         )
+    ]
 
-    assert calls == [("agent:ops:long-session", context_window)]
 
-
-@pytest.mark.asyncio
-async def test_run_falls_back_to_generic_preflight_after_t3_flush_failed() -> None:
-    selector = _FakeProviderSelector()
-    runner = TurnRunner(provider_selector=selector, config=GatewayConfig())
-    seen: dict[str, object] = {}
-
-    async def fake_t3(session_key, turn, context_window_tokens, **kwargs):
-        seen["t3_session_key"] = session_key
-        return "flush_failed"
-
-    async def spy_preflight(session_key, context_window_tokens, **kwargs):
-        seen["preflight_session_key"] = session_key
-        seen.update(kwargs)
-
-    runner._maybe_compact_on_t3_upgrade = fake_t3  # type: ignore[method-assign]
-    runner._maybe_preflight_compact = spy_preflight  # type: ignore[method-assign]
-    tool_ctx = ToolContext(caller_kind=CallerKind.CLI)
-
-    async for _ in runner.run(
-        "hello",
-        "agent:main:abc123",
-        tool_context=tool_ctx,
-        model="routed/model",
-    ):
-        pass
-
-    assert seen["t3_session_key"] == "agent:main:abc123"
-    assert seen["preflight_session_key"] == "agent:main:abc123"
-    assert seen["compaction_model"] == "routed/model"
+def _dump(messages: list[Message]) -> list[str]:
+    return [json.dumps(message.model_dump(mode="json"), sort_keys=True) for message in messages]
 
 
 @pytest.mark.asyncio
-async def test_run_forwards_routed_provider_and_model_to_preflight() -> None:
-    selector = _FakeProviderSelector()
-    runner = TurnRunner(
-        provider_selector=selector,
-        config=GatewayConfig(),
-        model_catalog=ModelCatalog(),
+async def test_preflight_under_threshold_does_not_compact(
+    tmp_path: Path, storages: list[SessionStorage]
+) -> None:
+    manager = await _manager(tmp_path, storages)
+    provider = _Provider()
+    _AUX_PROVIDER["provider"] = provider
+    runner = _runner(provider, manager, tmp_path, ratio=0.9, context_window=1_000_000)
+    await _seed(manager, KEY, rounds=1)
+
+    events = await _turn(runner, manager, KEY, "what now?", tmp_path)
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert provider.summarizer_requests == []
+    assert str(provider.turn_requests[0][0].content).startswith("old question 0")
+    assert await manager.get_summaries(KEY) == []
+
+
+@pytest.mark.asyncio
+async def test_preflight_compacts_before_the_first_call_and_persists_it(
+    tmp_path: Path,
+    storages: list[SessionStorage],
+    _auxiliary_client: list[dict[str, Any]],
+) -> None:
+    manager = await _manager(tmp_path, storages)
+    provider = _Provider()
+    _AUX_PROVIDER["provider"] = provider
+    runner = _runner(provider, manager, tmp_path)
+    await _seed(manager, KEY)
+    rows_before = len(await manager.get_transcript(KEY))
+
+    first = await _turn(runner, manager, KEY, "deploy status?", tmp_path)
+
+    assert any(isinstance(event, DoneEvent) for event in first)
+    # The summarizer ran as the auxiliary side task on the cheap model, over
+    # the old rows (in chunks that fit the model window).
+    assert provider.summarizer_requests
+    from agentos.gateway.session_titler import fast_model_hint
+
+    cheapest_tier = fast_model_hint(runner._config, task="compaction")
+    assert cheapest_tier[1]
+    assert {kwargs["model"] for kwargs in _auxiliary_client} == {cheapest_tier[1]}
+    assert "old question 0" in str(provider.summarizer_requests[0][0].content)
+    summarizer_calls = len(provider.summarizer_requests)
+    # The very first turn request already carries the single-summary shape.
+    sent = provider.turn_requests[0]
+    assert str(sent[0].content).startswith("[Context summary]\n")
+    assert SUMMARY in str(sent[0].content)
+    assert sent[1].content == "Understood. Continuing from summary."
+    assert str(sent[2].content).startswith("deploy status?")
+    assert len(sent) == 3
+
+    # Durable side: checkpoint receipt, summary row, archived transcript rows.
+    receipts = await manager.storage.list_memory_durable_receipts(
+        session_key=KEY, status="checkpoint_saved", limit=5
     )
-    seen: dict[str, object] = {}
-
-    async def spy_preflight(session_key, context_window_tokens, **kwargs):
-        seen["session_key"] = session_key
-        seen["context_window_tokens"] = context_window_tokens
-        seen.update(kwargs)
-
-    runner._maybe_preflight_compact = spy_preflight  # type: ignore[method-assign]
-    tool_ctx = ToolContext(caller_kind=CallerKind.CLI)
-
-    async for _ in runner.run(
-        "hello",
-        "agent:main:abc123",
-        tool_context=tool_ctx,
-        model="z-ai/glm-5.1",
-    ):
-        pass
-
-    assert seen["session_key"] == "agent:main:abc123"
-    assert seen["context_window_tokens"] == 202_752
-    assert seen["compaction_model"] == "z-ai/glm-5.1"
-    assert getattr(seen["compaction_provider"], "model") == "z-ai/glm-5.1"
-    assert selector.override_calls == []
-    assert selector.clone_instance.override_calls[-1] == "z-ai/glm-5.1"
-
-
-@pytest.mark.asyncio
-async def test_preflight_compact_called_with_correct_args() -> None:
-    """compact() is called with (session_key, context_window_tokens)."""
-    entries = [_make_entry("content")]
-
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock(return_value="")
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=90_000):
-        await runner._maybe_preflight_compact("user:long-session", 100_000)
-
-    mock_sm.compact.assert_called_once_with("user:long-session", 100_000)
-
-
-@pytest.mark.asyncio
-async def test_preflight_exactly_at_threshold_does_not_compact() -> None:
-    """Transcript at exactly the threshold (not exceeding) → no compaction."""
-    context_window = 1000
-    threshold = int(context_window * 0.85)  # default threshold: 850
-
-    entries = [_make_entry("a")]
-
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock()
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
-
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
-
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=threshold):
-        await runner._maybe_preflight_compact("user:session", context_window)
-
-    mock_sm.compact.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_preflight_integration_with_real_session_manager(session_mgr, tmp_path) -> None:
-    """Integration: pre-flight with real SessionManager compacts when over threshold."""
-    mgr = session_mgr
-    key = "user:preflight-test"
-    await mgr.create(key)
-
-    # Seed transcript entries
-    await mgr.append_message(key, role="user", content="message one")
-    await mgr.append_message(key, role="assistant", content="reply one")
-    await mgr.append_message(key, role="user", content="message two")
-
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mgr)
-
-    # Patch compact_with_result() to verify the metadata-preserving path is used.
-    original_compact_with_result = mgr.compact_with_result
-    compact_calls: list[dict[str, object]] = []
-
-    async def _spy_compact_with_result(
-        session_key,
-        context_window_tokens,
-        config=None,
-        *,
-        compaction_id=None,
-        trigger_reason=None,
-        flush_receipt_status=None,
-    ):
-        compact_calls.append(
-            {
-                "session_key": session_key,
-                "context_window_tokens": context_window_tokens,
-                "compaction_id": compaction_id,
-                "trigger_reason": trigger_reason,
-                "flush_receipt_status": flush_receipt_status,
-            }
-        )
-        return await original_compact_with_result(
-            session_key,
-            context_window_tokens,
-            config,
-            compaction_id=compaction_id,
-            trigger_reason=trigger_reason,
-            flush_receipt_status=flush_receipt_status,
-        )
-
-    mgr.compact_with_result = _spy_compact_with_result  # type: ignore[method-assign]
-
-    # Force all tokens to exceed the default threshold (100 * 0.85 = 85)
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=1000):
-        await runner._maybe_preflight_compact(key, 100)
-
-    # compact_with_result() was invoked with the correct args.
-    assert len(compact_calls) == 1
-    assert compact_calls[0]["session_key"] == key
-    assert compact_calls[0]["context_window_tokens"] == 100
-    assert compact_calls[0]["compaction_id"]
-    assert compact_calls[0]["trigger_reason"] == "preflight"
-    assert compact_calls[0]["flush_receipt_status"] == "not_required"
-    receipts = await mgr.storage.list_memory_durable_receipts(
-        session_key=key,
-        status="checkpoint_saved",
-        limit=1,
-    )
-    assert receipts
-    assert receipts[0].scope == "checkpoint"
-    assert receipts[0].status == "checkpoint_saved"
-    assert receipts[0].source_path
+    assert receipts and receipts[0].scope == "checkpoint"
     assert (tmp_path / receipts[0].source_path).exists()
+    summaries = await manager.get_summaries(KEY)
+    assert len(summaries) == 1
+    assert SUMMARY in summaries[0].summary_text
+    rows = await manager.get_transcript(KEY)
+    assert len(rows) < rows_before
+    record = rows[-1].provider_messages
+    assert isinstance(record, dict)
+    assert record["mode"] == "reset"
+    assert record["messages"][0]["content"] == sent[0].content
+
+    second = await _turn(runner, manager, KEY, "and the logs?", tmp_path)
+
+    assert any(isinstance(event, DoneEvent) for event in second)
+    # No second compaction; the reload replays the compacted transcript and
+    # the durable summary is not repeated as request context.
+    assert len(provider.summarizer_requests) == summarizer_calls
+    resent = provider.turn_requests[1]
+    assert _dump(resent)[: len(sent)] == _dump(sent)
+    assert resent[len(sent)].role == "assistant"
+    payload = json.dumps([message.model_dump(mode="json") for message in resent])
+    assert payload.count("[Context summary]") == 1
+    assert "[Compacted Session Summaries]" not in payload
 
 
 @pytest.mark.asyncio
-async def test_preflight_compaction_circuit_breaker_retries_after_cooldown() -> None:
-    context_window = 1000
-    entries = [_make_entry("a" * 4000)]
+async def test_canonical_subagent_session_compacts_without_a_checkpoint(
+    tmp_path: Path, storages: list[SessionStorage]
+) -> None:
+    key = "agent:main:subagent:run-7"
+    manager = await _manager(tmp_path, storages)
+    provider = _Provider()
+    _AUX_PROVIDER["provider"] = provider
+    runner = _runner(provider, manager, tmp_path)
+    await _seed(manager, key)
 
-    mock_sm = MagicMock()
-    mock_sm.compact = AsyncMock(side_effect=RuntimeError("compact failed"))
-    mock_sm.get_transcript = AsyncMock(return_value=entries)
+    events = await _turn(runner, manager, key, "subtask", tmp_path)
 
-    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert str(provider.turn_requests[0][0].content).startswith("[Context summary]\n")
+    receipts = await manager.storage.list_memory_durable_receipts(session_key=key, limit=5)
+    assert receipts == []
 
-    with patch("agentos.session.tokenizer.estimate_tokens", return_value=1000):
-        for _ in range(4):
-            await runner._maybe_preflight_compact("user:session", context_window)
-            runner.clear_compaction_turn_state("user:session")
 
-    assert mock_sm.compact.await_count == 3
+@pytest.mark.asyncio
+async def test_checkpoint_failure_prevents_the_destructive_rewrite(
+    tmp_path: Path, storages: list[SessionStorage]
+) -> None:
+    # No checkpoint workspace: record_memory_checkpoint raises.
+    manager = await _manager(tmp_path, storages, checkpoint=False)
+    provider = _Provider()
+    _AUX_PROVIDER["provider"] = provider
+    runner = _runner(provider, manager, tmp_path)
+    await _seed(manager, KEY)
+    rows_before = len(await manager.get_transcript(KEY))
 
-    runner._compaction_failures["user:session"].opened_at = 0.0
-    with (
-        patch("agentos.session.tokenizer.estimate_tokens", return_value=1000),
-        patch("agentos.engine.runtime.time.monotonic", return_value=999.0),
-    ):
-        await runner._maybe_preflight_compact("user:session", context_window)
+    events = await _turn(runner, manager, KEY, "deploy status?", tmp_path)
 
-    assert mock_sm.compact.await_count == 4
+    # The turn still answers from the compacted request ...
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert str(provider.turn_requests[0][0].content).startswith("[Context summary]\n")
+    # ... but no row was archived and no durable summary was written.
+    rows = await manager.get_transcript(KEY)
+    assert len(rows) == rows_before + 2  # only this turn's user + assistant rows were added
+    assert await manager.get_summaries(KEY) == []
+    failed = await manager.storage.list_memory_durable_receipts(
+        session_key=KEY, status="checkpoint_failed", limit=5
+    )
+    assert failed
+
+
+class _ToolThenAnswerProvider(_Provider):
+    """Turn requests: a tool call first, then the answer. Records the system
+    prompt each turn request carried."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.systems: list[str] = []
+
+    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
+        system = str(getattr(config, "system", "") or "")
+        if system.startswith("You are a conversation compactor"):
+            self.summarizer_requests.append(list(messages))
+            return self._stream(SUMMARY)
+        self.turn_requests.append(list(messages))
+        self.systems.append(system)
+        return self._turn_stream(len(self.turn_requests))
+
+    async def _turn_stream(self, call: int) -> AsyncIterator[Any]:
+        if call == 1:
+            yield ProviderToolUseStart(tool_use_id="look-1", tool_name="lookup")
+            yield ProviderToolUseEnd(
+                tool_use_id="look-1", tool_name="lookup", arguments={"q": "logs"}
+            )
+            yield ProviderDone(stop_reason="tool_use", input_tokens=10, output_tokens=1)
+            return
+        yield ProviderText(text="answer")
+        yield ProviderDone(stop_reason="end_turn", input_tokens=10, output_tokens=1)
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_is_identical_across_a_mid_turn_compaction(
+    tmp_path: Path,
+    storages: list[SessionStorage],
+) -> None:
+    """The compaction summary is a message: the request after a compaction
+    carries exactly the system prompt the one before did (the old prompt
+    rebuild dropped the pipeline-added sections such as Skills)."""
+    from agentos.tools.registry import ToolSpec
+
+    manager = await _manager(tmp_path, storages)
+    provider = _ToolThenAnswerProvider()
+    _AUX_PROVIDER["provider"] = provider
+    # 200k window, ratio 0.1: the first request is under the 20k-token limit,
+    # the second one (with a 40k-char tool result) is over it.
+    runner = _runner(provider, manager, tmp_path, ratio=0.1, context_window=200_000)
+    registry = ToolRegistry()
+
+    async def lookup(q: str) -> str:
+        return "L" * 40_000
+
+    registry.register(
+        ToolSpec(
+            name="lookup",
+            description="Look something up",
+            parameters={
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": ["q"],
+            },
+        ),
+        lookup,
+    )
+    runner._tool_registry = registry
+    await _seed(manager, KEY, rounds=3)
+
+    events = await _turn(runner, manager, KEY, "check the logs", tmp_path)
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert len(provider.summarizer_requests) >= 1  # compacted between the two calls
+    assert str(provider.turn_requests[1][0].content).startswith("[Context summary]")
+    assert not str(provider.turn_requests[0][0].content).startswith("[Context summary]")
+    before, after = provider.systems
+    assert after == before

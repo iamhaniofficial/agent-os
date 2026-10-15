@@ -1,5 +1,7 @@
 """Jinja2-based system prompt assembly for agent identity."""
 
+from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
@@ -9,7 +11,12 @@ from .types import AgentProfile
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
+@lru_cache(maxsize=1)
 def _make_env() -> Environment:
+    # One environment per process: Jinja caches compiled templates per
+    # environment, and compiling system_prompt.j2 cost ~10 ms of event-loop
+    # time on every turn. ``auto_reload`` (the default) still picks up an
+    # edited template file.
     return Environment(
         loader=FileSystemLoader(str(_TEMPLATES_DIR)),
         undefined=StrictUndefined,
@@ -23,6 +30,7 @@ def assemble_system_prompt(
     profile: AgentProfile,
     *,
     tools: list[str] | None = None,
+    deferred_tools: Mapping[str, str] | Sequence[str] | None = None,
     skills: list[str] | None = None,
     memory: str | None = None,
     runtime_info: dict[str, str] | None = None,
@@ -44,7 +52,12 @@ def assemble_system_prompt(
 
     Args:
         profile: The agent profile containing identity and workspace context.
-        tools: List of available tool names.
+        tools: List of available tool names, deferred ones included, so the
+            sections that depend on a tool stay on when it is one load away.
+        deferred_tools: The subset of ``tools`` the request leaves out until
+            ``tool_search`` loads them, as name -> one-line summary (a plain
+            list of names renders without summaries). Listed under their own
+            "load first" heading rather than with the loaded tools.
         skills: List of available skill names.
         memory: Memory section content (omitted in minimal mode).
         runtime_info: OS/shell/workspace metadata for Runtime section.
@@ -76,6 +89,11 @@ def assemble_system_prompt(
         "soul_body": soul_body,
         "agents_doc": profile.agents_doc,
         "tools": tools or [],
+        "deferred_tools": (
+            dict(deferred_tools)
+            if isinstance(deferred_tools, Mapping)
+            else dict.fromkeys(deferred_tools or (), "")
+        ),
         "skills": skills or [],
         "memory": memory,
         "prompt_mode": profile.prompt_mode,

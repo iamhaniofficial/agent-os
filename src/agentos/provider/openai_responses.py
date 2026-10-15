@@ -20,6 +20,7 @@ from agentos.secrets import clean_header_secret
 from .openai import _http_error_body_text, _resolve_llm_proxy
 from .protocol import ProviderConnectionConfig, ProviderMetadata
 from .retry_after import retry_after_from_response
+from .transport import PooledHttpClient, stream_timeouts
 from .types import (
     ChatConfig,
     ContentBlockText,
@@ -205,6 +206,11 @@ class OpenAIResponsesProvider:
         self._base_url = base_url.rstrip("/")
         self._org_id = org_id
         self._proxy = _resolve_llm_proxy(proxy)
+        self._http = PooledHttpClient(proxy=self._proxy)
+
+    async def aclose(self) -> None:
+        """Close the pooled HTTP client (a later request opens a new one)."""
+        await self._http.aclose()
 
     @property
     def model(self) -> str:
@@ -285,16 +291,12 @@ class OpenAIResponsesProvider:
             payload["tool_choice"] = _build_tool_choice_payload(config.tool_choice)
 
         try:
-            async with httpx.AsyncClient(
-                timeout=config.timeout,
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-            ) as client:
-                response = await client.post(
-                    self._api_url("/v1/responses"),
-                    headers=headers,
-                    json=payload,
-                )
+            response = await self._http.get().post(
+                self._api_url("/v1/responses"),
+                headers=headers,
+                json=payload,
+                timeout=stream_timeouts(config.timeout),
+            )
         except httpx.TimeoutException as exc:
             yield ErrorEvent(message=f"Request timed out: {exc}", code="timeout")
             return

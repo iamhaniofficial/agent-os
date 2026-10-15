@@ -7,7 +7,9 @@ and the stream-consumer stage boundary: the
 per turn, AFTER ``CompactionAndHistoryStage`` and BEFORE the
 ``async for event in agent.run_turn(...)`` loop.
 Side-effect contract: the stage is a pure transformation. The single
-port executes synchronously and has no observable side effects on the
+port is synchronous; with attachments present it runs on a worker thread
+(``asyncio.to_thread``) because PDF extraction and media reads block. It
+has no observable side effects on the
 agent / runner / session. Validation failures (count cap, disallowed
 media type, ref-without-media-root, invalid base64, oversize) raise
 ``ValueError`` from the port and propagate as-is to the outer terminal
@@ -27,6 +29,7 @@ future ``ErrorEvent`` early-yield branch.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -117,10 +120,17 @@ class AttachmentStage:
     ) -> StageOutcome[AttachmentStageOutput]:
         from agentos.engine.turn_runner.outcome import StageOutcome
 
-        extra_messages = self._builder.build(
-            inp.effective_runtime_message,
-            inp.attachments or [],
-        )
+        attachments = inp.attachments or []
+        if attachments:
+            # PDF text extraction, base64 decoding and media-ref reads block;
+            # run them off the event loop so other sessions keep streaming.
+            extra_messages = await asyncio.to_thread(
+                self._builder.build,
+                inp.effective_runtime_message,
+                attachments,
+            )
+        else:
+            extra_messages = self._builder.build(inp.effective_runtime_message, attachments)
         turn_input = (
             inp.effective_runtime_message if extra_messages is None else ""
         )

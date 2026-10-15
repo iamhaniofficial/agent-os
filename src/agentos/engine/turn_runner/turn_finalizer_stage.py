@@ -126,6 +126,7 @@ class TranscriptAppendPort(Protocol):
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
+        provider_messages: dict[str, Any] | None = None,
     ) -> bool: ...
 
 
@@ -172,6 +173,17 @@ class MemoryNudgePort(Protocol):
         no_memory_capture: bool,
         turn_segments: Any,
     ) -> None: ...
+
+
+@runtime_checkable
+class ProactiveCompactionPort(Protocol):
+    """Schedule a between-turns compaction when the history is near the trigger.
+
+    Synchronous and cheap; the job runs after the turn has ended
+    (:class:`agentos.engine.proactive_compaction.ProactiveCompactionScheduler`).
+    """
+
+    def after_turn(self, *, session_key: str, agent_id: str, succeeded: bool) -> None: ...
 
 
 class _NoopMemoryNudge:
@@ -330,6 +342,10 @@ class TurnFinalizerStageInput:
     heartbeat_ack_max_chars: int
     no_memory_capture: bool
 
+    # From the Agent: the structured provider-message record of the turn
+    # (``agentos.engine.transcript``), persisted next to the flat segments.
+    provider_messages: dict[str, Any] | None = None
+
 
 @dataclass(frozen=True)
 class TurnFinalizerStageOutput:
@@ -408,7 +424,9 @@ class TurnFinalizerStage:
         session_totals: SessionTotalsPort,
         turn_error_persist: TurnErrorPersistPort,
         memory_nudge: MemoryNudgePort | None = None,
+        proactive_compaction: ProactiveCompactionPort | None = None,
     ) -> None:
+        self._proactive_compaction = proactive_compaction
         self._transcript_append = transcript_append
         self._turn_memory_capture = turn_memory_capture
         self._session_totals = session_totals
@@ -480,6 +498,9 @@ class TurnFinalizerStage:
             if inp.done_event is not None and inp.done_event.reasoning_content:
                 reasoning_content = inp.done_event.reasoning_content
             token_count = inp.done_event.output_tokens if inp.done_event is not None else None
+            append_kwargs: dict[str, Any] = {}
+            if inp.provider_messages is not None:
+                append_kwargs["provider_messages"] = inp.provider_messages
             transcript_appended = await self._transcript_append.append_message(
                 inp.session_key,
                 role="assistant",
@@ -491,6 +512,7 @@ class TurnFinalizerStage:
                     resolved_model=inp.resolved_model,
                 ),
                 token_count=token_count,
+                **append_kwargs,
             )
             if transcript_appended:
                 try:
@@ -566,6 +588,24 @@ class TurnFinalizerStage:
                     session_key=inp.session_key,
                     error=str(exc),
                 )
+
+        # --- proactive compaction (stream C) --------------------------------
+        # Last step of the success path: the turn is persisted, so a
+        # between-turns compaction may be scheduled; it starts after the turn.
+        if self._proactive_compaction is not None:
+            try:
+                self._proactive_compaction.after_turn(
+                    session_key=inp.session_key,
+                    agent_id=inp.agent_id,
+                    succeeded=transcript_appended and not inp.error_message,
+                )
+            except Exception as exc:  # noqa: BLE001 - log-and-continue intentional
+                log.warning(
+                    "compaction.proactive_schedule_failed",
+                    session_key=inp.session_key,
+                    error=str(exc),
+                )
+        # --- end proactive compaction ----------------------------------------
 
         return StageOutcome.success(
             TurnFinalizerStageOutput(

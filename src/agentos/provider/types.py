@@ -149,6 +149,26 @@ class DoneEvent:
     # Structured detail the provider attached to the stop, e.g. Anthropic's
     # refusal ``{"type": "refusal", "category": ..., "explanation": ...}``.
     stop_details: dict[str, Any] | None = None
+    # Every ``thinking`` / ``redacted_thinking`` block of the response, in
+    # stream order, each with its own ``signature`` / ``data``. This is the
+    # replay-safe form: put these blocks, unmodified and in this order, at the
+    # start of the assistant message's content. ``reasoning_content`` and
+    # ``thinking_signature`` above stay as the joined text and the last
+    # signature for older callers; they cannot round-trip more than one block.
+    thinking_blocks: list[ContentBlockThinking | ContentBlockRedactedThinking] = field(
+        default_factory=list
+    )
+    # OpenRouter ``reasoning_details`` of the response, fragments merged per
+    # ``index``. Store them on :attr:`Message.reasoning_details`; the
+    # OpenAI-compatible provider re-sends them verbatim to OpenRouter.
+    reasoning_details: list[dict[str, Any]] | None = None
+    # False when the provider's usage carried no cache-read figure at all
+    # (unknown, not zero hits); the cache-break monitor skips such responses.
+    cache_usage_reported: bool = True
+    # True when ``input_tokens`` came only from a usage object the provider
+    # marked ``"estimated": true`` (OpenCAP), not from a billed count. The
+    # request-size calibration ignores such samples.
+    usage_estimated: bool = False
 
     def __post_init__(self) -> None:
         given = self.stop_reason
@@ -246,6 +266,9 @@ class ToolInputSchema(BaseModel):
     type: Literal["object"] = "object"
     properties: dict[str, Any] = {}
     required: list[str] = []
+    # JSON Schema ``additionalProperties``. ``None`` leaves it out of the wire
+    # schema (unchanged payloads); strict tools must set it to ``False``.
+    additionalProperties: bool | dict[str, Any] | None = None  # noqa: N815
 
 
 class ToolDefinition(BaseModel):
@@ -254,6 +277,9 @@ class ToolDefinition(BaseModel):
     name: str
     description: str
     input_schema: ToolInputSchema
+    # Opt-in constrained decoding of the tool input (Anthropic ``strict``,
+    # OpenAI ``function.strict``). ``None`` sends nothing.
+    strict: bool | None = None
     execution_timeout_seconds: float | None = None
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
@@ -285,6 +311,19 @@ class ModelInfo(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class ToolChoice(BaseModel):
+    """Provider-neutral tool choice; each provider translates it.
+
+    ``auto``: the model decides. ``any``: it must call some tool (OpenAI
+    ``required``). ``none``: no tool calls. ``tool``: it must call ``name``.
+    ``disable_parallel_tool_use`` asks for at most one tool call per response.
+    """
+
+    type: Literal["auto", "any", "none", "tool"] = "auto"
+    name: str | None = None
+    disable_parallel_tool_use: bool | None = None
+
+
 class ChatConfig(BaseModel):
     """Runtime options for a single chat call."""
 
@@ -301,7 +340,32 @@ class ChatConfig(BaseModel):
     model_capabilities: ModelCapabilities | None = None
     thinking_level: Any | None = None
     provider_request_max_chars: int = 0
+    # A :class:`ToolChoice`, an Anthropic-native dict, an OpenAI-style dict or a
+    # bare string (``"auto"`` / ``"any"`` / ``"required"`` / ``"none"``).
     tool_choice: Any | None = None
+    # Prompt-cache TTL for the stable prefix (system prompt and tools).
+    # ``None`` / ``"5m"`` is the provider default; ``"1h"`` asks Anthropic for
+    # the one-hour cache. The rolling conversation breakpoint stays at 5 min.
+    cache_ttl: Literal["5m", "1h"] | None = None
+    # Seconds without a streamed data event, once streaming has started,
+    # before the provider abandons the stream with a retriable
+    # ``stream_idle_timeout`` error. ``None`` reads
+    # ``AGENTOS_LLM_STREAM_IDLE_TIMEOUT_SECONDS`` (default 120); ``0`` disables.
+    stream_idle_timeout: float | None = None
+    # ``False`` asks for at most one tool call per response (OpenAI
+    # ``parallel_tool_calls``, Anthropic ``disable_parallel_tool_use``).
+    # ``None`` sends nothing.
+    parallel_tool_calls: bool | None = None
+    # OpenAI ``prompt_cache_key``: requests sharing it are routed to the same
+    # cache. Only sent to api.openai.com; when unset there, a key derived from
+    # the model, system prompt and tools is used.
+    prompt_cache_key: str | None = None
+    # Extra ``anthropic-beta`` values for this request (merged, de-duplicated).
+    anthropic_betas: list[str] = []
+    # Context window the caller budgets for. Ollama sends it as
+    # ``options.num_ctx`` (its own default is a few thousand tokens and
+    # silently truncates a long prompt); other providers ignore it.
+    context_window_tokens: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +415,13 @@ class ContentBlockThinking(BaseModel):
     signature: str | None = None
 
 
+class ContentBlockRedactedThinking(BaseModel):
+    """An encrypted Anthropic thinking block; replayed byte-for-byte."""
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str
+
+
 class ContentBlockCompaction(BaseModel):
     type: Literal["compaction"] = "compaction"
     content: str | None = None
@@ -366,6 +437,7 @@ MessageContent = (
         | ContentBlockImage
         | ContentBlockDocument
         | ContentBlockThinking
+        | ContentBlockRedactedThinking
         | ContentBlockCompaction
     ]
 )
@@ -377,3 +449,6 @@ class Message(BaseModel):
     role: Literal["user", "assistant"]
     content: MessageContent
     reasoning_content: str | None = None
+    # OpenRouter ``reasoning_details`` from the response that produced this
+    # assistant message, kept verbatim for replay (see DoneEvent).
+    reasoning_details: list[dict[str, Any]] | None = None

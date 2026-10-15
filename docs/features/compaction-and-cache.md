@@ -57,14 +57,18 @@ Avoid compact loops when the runtime says the session is already within budget.
 
 ## Passive Compaction
 
-Passive compaction can happen when AgentOS detects context pressure before
-or during agent work. The exact trigger depends on model context limits,
-configured budgets, current history, and tool output size.
+Passive compaction happens when the next model request would take more than
+85% of the model's context window (`preflight_compact_ratio` in
+`agentos.toml`, default `0.85`). The check runs before every model call -- the
+first one of a turn included -- and never after a reply has streamed, so
+compacting does not make the model answer the same step twice. It also never
+runs while a tool call is waiting for its result.
 
-Inside a turn, the check runs before each model call, never after a reply has
-streamed, so compacting does not make the model answer the same step twice.
-Only context the model has already seen is summarized: a new request and fresh
-tool results always reach the model in full at least once.
+A compaction replaces everything before the current turn with one summary,
+written by the session's own model. The current turn -- your message, its
+attachments and every tool step so far -- stays word for word. Only when the
+current turn alone is too large are its oldest finished tool steps folded into
+the summary as well; your message and the latest step are always kept.
 
 If passive compaction fails, the safest user response is usually:
 
@@ -75,14 +79,27 @@ If passive compaction fails, the safest user response is usually:
 
 ## Prompt Cache Continuity
 
-Prompt caching works best when stable prompt parts stay stable. AgentOS
-tries to keep:
+Prompt caching works best when stable prompt parts stay stable. AgentOS keeps
+the conversation append-only: once a message has been sent to the model it is
+replayed byte for byte on every later request, in the same turn and in later
+turns. In practice:
 
-- stable system prompt and tool definitions early;
-- current request, volatile runtime context, retrieved history, and tool results
-  near the tail;
-- model/provider switches visible through diagnostics when they may affect
-  cache continuity.
+- the system prompt and tool definitions come first and stay the same between
+  requests (workspace files and project knowledge are part of that cached
+  system prompt); loading a deferred tool with `tool_search` appends its
+  definition, which costs one cache write for the tool list;
+- the current time, the skills list and other per-turn context (memory
+  recall, plan mode, ...) are added at the end of your message for that turn
+  and stay there; each part is only repeated when it changes;
+- a tool result too large for the request is shortened once, before the model
+  first sees it; when the turn ends, results and tool-call arguments longer
+  than `[compaction] history_tool_result_max_chars` (default: 2% of the
+  context window, 4k-12k characters) are kept as head/tail plus a handle to
+  the full output for later turns. That happens once per turn, so the next
+  request re-caches only the end of the previous turn;
+- compaction is the only thing that rewrites earlier context;
+- model/provider switches stay visible through diagnostics when they may
+  affect cache continuity.
 
 Cache continuity is best-effort. Routing, tools, attachments, provider changes,
 or a large new context can reduce cache reuse.

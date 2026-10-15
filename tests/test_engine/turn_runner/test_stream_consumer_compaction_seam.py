@@ -12,9 +12,8 @@ Five focused tests cover:
 2. ``notify_compaction`` fires after persist.
 3. Memory snapshot refresh fires AFTER persist and respects
    ``private_memory_allowed``.
-4. System prompt refresh fires AFTER snapshot refresh; the cacheable
-   base is extracted from the ``(base, dynamic_suffix)`` tuple when
-   ``_assemble_prompt`` returns one.
+4. The system prompt is NOT rebuilt: the compaction summary is a message,
+   so the prompt stays byte-identical across a compaction.
 5. Failed persistence reports a failed lifecycle event and does NOT refresh
    snapshot or prompt state into a false post-compaction view.
 """
@@ -287,44 +286,33 @@ async def test_memory_snapshot_refresh_respects_private_memory(
 
 
 # ---------------------------------------------------------------------------
-# In-turn compaction test 4: system prompt refresh fires + tuple/str extract
+# In-turn compaction test 4: no system prompt rebuild
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("returns_tuple", [True, False])
 @pytest.mark.asyncio
-async def test_system_prompt_refresh_extracts_cacheable_base(
-    returns_tuple: bool,
+async def test_compaction_does_not_rebuild_the_system_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``agent.refresh_system_prompt`` is invoked exactly once per
-    CompactionEvent with the cacheable base (NOT a tuple). The
-    tuple-vs-str pattern is exercised for both return shapes.
-    """
+    """No ``_assemble_prompt`` / ``refresh_system_prompt`` on compaction: the
+    rebuild ran without the per-turn pipeline steps and dropped sections
+    (Skills, Local Toolchain) from the next request."""
 
     case = _baseline_case()
     runner = _setup_runner(monkeypatch, case)
-
-    # Override _assemble_prompt to return a tuple vs str depending on case.
-    refresh_payload = (
-        ("CACHEABLE_BASE", "VOLATILE_SUFFIX")
-        if returns_tuple
-        else "CACHEABLE_BASE"
-    )
+    assembled: list[Any] = []
 
     def _assemble_prompt_override(self, *args, **kwargs):  # noqa: ARG001, ARG002
-        return refresh_payload
+        assembled.append(args)
+        return "REBUILT"
 
     runner._assemble_prompt = _assemble_prompt_override.__get__(runner, TurnRunner)
 
     await _drive(runner)
 
-    assert len(_MAILBOX.refresh_prompt_calls) == 1
-    refreshed = _MAILBOX.refresh_prompt_calls[0]
-    assert refreshed == "CACHEABLE_BASE", (
-        f"returns_tuple={returns_tuple}: "
-        f"tuple-vs-str extract diverged ({refreshed!r})"
-    )
+    # Assembled once, for the turn itself; never again for the compaction.
+    assert len(assembled) == 1
+    assert _MAILBOX.refresh_prompt_calls == []
 
 
 # ---------------------------------------------------------------------------

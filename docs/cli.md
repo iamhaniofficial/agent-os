@@ -485,6 +485,41 @@ failover circuit-breaker state (`closed`, `half_open`, or `open (42s)`); see
 Provider-specific setup examples, including OpenCAP and Surplus Intelligence,
 live in [`providers-and-models.md`](providers-and-models.md).
 
+Context history: when a turn ends, its tool results and tool-call arguments
+longer than `compaction.history_tool_result_max_chars` are kept for later
+turns as head/tail plus a tool-result-store handle (during the turn the model
+sees them in full). `0`, the default, means 2% of the model's context window,
+clamped to 4,000-12,000 characters:
+
+```sh
+agentos config set compaction.history_tool_result_max_chars 20000
+```
+
+The in-turn compaction summary is an auxiliary side task (`compaction`, the
+router's cheapest text tier unless `[auxiliary.tasks.compaction]` names a
+model) bounded by `compaction.summary_timeout_seconds` (default 45):
+
+```sh
+agentos config set compaction.summary_timeout_seconds 30
+```
+
+Once a turn ends with the history at `compaction.proactive_ratio` (default
+0.70) of the compaction trigger, the session is compacted in the background
+before the next turn, once the session has been idle for
+`compaction.proactive_idle_seconds` (default 20; doubled per session, up to
+300, after a turn cancels a running summary); `compaction.proactive false`
+turns that off. The
+trigger's size estimate is calibrated per provider/model against the input
+tokens providers report; `compaction.estimate_calibration false` uses the raw
+estimate:
+
+```sh
+agentos config set compaction.proactive false
+agentos config set compaction.proactive_ratio 0.6
+agentos config set compaction.proactive_idle_seconds 60
+agentos config set compaction.estimate_calibration false
+```
+
 Search:
 
 ```sh
@@ -635,7 +670,29 @@ simultaneous sessions.
 For Ollama models that do not reliably support native tool calls, set
 `tools.enabled = false` in the config file to run in plain-text mode. Keep it
 enabled for tool-capable cloud models such as `glm-5.2:cloud`; the Ollama
-provider preserves native tool-call history between turns.
+provider preserves native tool-call history between turns. Ollama is sent the
+agent's context window as `num_ctx`, capped at 32768 because Ollama reserves
+memory for the whole window up front (its own default is a few thousand tokens
+and silently drops the start of a long prompt); set `AGENTOS_OLLAMA_NUM_CTX`
+to override it, larger for a big GPU or smaller to fit a small one.
+
+Prompt caching is controlled by `[prompt_cache]`: `mode` (`auto`, `on`,
+`off`) and `ttl`. With `ttl = "1h"` Anthropic keeps the cached system prompt
+and tool list for an hour instead of five minutes; a cache write then costs
+2x the input price instead of 1.25x, which pays off when a session pauses
+longer than five minutes between requests:
+
+```sh
+agentos config set prompt_cache.ttl 1h
+```
+
+Model streams have their own timeouts, read from the environment:
+`AGENTOS_LLM_STREAM_CONNECT_TIMEOUT_SECONDS` (default 12),
+`AGENTOS_LLM_STREAM_WRITE_TIMEOUT_SECONDS` (default 30) and
+`AGENTOS_LLM_STREAM_IDLE_TIMEOUT_SECONDS` (default 120; `0` turns it off). The
+idle timeout starts once the model has begun streaming and ends a stream that
+then goes silent with a retriable error, instead of waiting for the much
+longer per-iteration timeout.
 
 More detail:
 
@@ -1526,7 +1583,21 @@ Tool schemas dominate it — around 7,300 tokens on a stock install, charged on
 every call in every turn — and the command prices each `[tools] profile` against
 the current one so the trade is visible before you make it. A profile is fixed
 for the session, so narrowing it does not disturb the prompt cache. `--top <n>`
-(default 10) sets how many of the largest tools it lists.
+(default 10) sets how many of the largest tools it lists. The figure already
+leaves out deferred tools (`tools.defer_loading`, on by default): the long tail
+the model loads on demand through `tool_search`, which the command counts on
+its own line. `agentos config set tools.defer_loading false` sends every tool
+on every request again.
+
+Two turn-speed switches, both on by default. The first stops asking
+api.openai.com and OpenRouter for parallel tool calls; the second keeps each
+router tier's own thinking level instead of lowering it on cheap tiers (c0 at
+most `low`, c1 at most `medium`):
+
+```sh
+agentos config set tools.parallel_calls false
+agentos config set agentos_router.effort_by_tier false
+```
 
 Every CLI command logs to stderr at `INFO` and above, so its output is only
 the command's own. Set `AGENTOS_LOG_LEVEL=debug` to see the debug-level events

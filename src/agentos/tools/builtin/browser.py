@@ -715,6 +715,7 @@ async def _do_close(session_key: str) -> str:
     required=["action"],
     execution_timeout_seconds=_ENGINE_TIMEOUT_CEILING_SECONDS,
     result_budget_class="external",
+    defer_loading=True,
 )
 async def browser(
     action: str,

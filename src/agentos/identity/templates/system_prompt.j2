@@ -25,9 +25,20 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 {% if tools -%}
 ## Available Tools
 
-{% for tool in tools -%}
+{% for tool in tools if tool not in deferred_tools -%}
 - {{ tool }}
 {% endfor %}
+{% if deferred_tools %}
+
+### Tools that must be loaded first
+
+These are installed but their schemas are not sent until loaded. When a task matches one, call `tool_search(names=["<name>"])` once, then call the tool; it stays loaded for the rest of the session. Prefer a matching tool here over the shell or a skill script.
+
+{% for name, summary in deferred_tools.items() -%}
+- {{ name }}{% if summary %}: {{ summary }}{% endif %}
+
+{% endfor %}
+{% endif %}
 
 {% endif -%}
 

@@ -40,7 +40,6 @@ from agentos.provider.request_proof import (
     ProviderRequestBudgetExceeded,
     prove_provider_payload,
 )
-from agentos.session.compaction import CompactionResult
 
 RAW_CURRENT_TURN_OVERFLOW_MESSAGE = (
     "Context overflow is in the current turn's recent tool calls or "
@@ -908,19 +907,46 @@ async def test_provider_timeout_error_is_not_reclassified_as_iteration_timeout()
     )
 
 
+def _patch_summarizer(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    summary: str = "short summary",
+    calls: list[dict[str, Any]] | None = None,
+    error: Exception | None = None,
+) -> None:
+    """Stub the compaction service's provider-backed summarizer."""
+
+    async def _summarize(
+        provider: Any,
+        messages: list[Message],
+        previous_summary: str | None,
+        *,
+        window_tokens: int,
+        timeout: float,
+    ) -> tuple[str, str]:
+        del provider, timeout
+        if calls is not None:
+            calls.append(
+                {
+                    "messages": list(messages),
+                    "previous_summary": previous_summary,
+                    "window_tokens": window_tokens,
+                }
+            )
+        if error is not None:
+            raise error
+        return summary, "llm"
+
+    monkeypatch.setattr("agentos.engine.compaction_service.summarize_messages", _summarize)
+
+
 @pytest.mark.asyncio
 async def test_context_overflow_noop_compaction_does_not_resend_unchanged_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _noop_compact(request: Any) -> CompactionResult:
-        return CompactionResult(
-            summary="",
-            kept_entries=request.entries,
-            removed_count=0,
-            chunks_processed=0,
-        )
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _noop_compact)
+    """Nothing before the current turn: compaction cannot shrink the request."""
+    calls: list[dict[str, Any]] = []
+    _patch_summarizer(monkeypatch, calls=calls)
     provider = _ContextOverflowProvider()
     agent = Agent(
         provider=provider,
@@ -933,6 +959,7 @@ async def test_context_overflow_noop_compaction_does_not_resend_unchanged_contex
     events = [event async for event in agent.run_turn("hello")]
 
     assert len(provider.calls) == 1
+    assert calls == []
     assert any(
         isinstance(event, ErrorEvent) and event.code == "compaction_not_smaller" for event in events
     )
@@ -943,15 +970,7 @@ async def test_context_overflow_noop_compaction_does_not_resend_unchanged_contex
 async def test_context_overflow_summary_only_larger_payload_does_not_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _summary_only_compact(request: Any) -> CompactionResult:
-        return CompactionResult(
-            summary="summary without reducing request payload",
-            kept_entries=request.entries,
-            removed_count=0,
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _summary_only_compact)
+    _patch_summarizer(monkeypatch, summary="summary that is longer than the history " * 200)
     provider = _ContextOverflowProvider()
     agent = Agent(
         provider=provider,
@@ -960,6 +979,7 @@ async def test_context_overflow_summary_only_larger_payload_does_not_retry(
             max_overflow_retries=2,
         ),
     )
+    agent.set_history([Message(role="user", content="q"), Message(role="assistant", content="a")])
 
     events = [event async for event in agent.run_turn("hello")]
 
@@ -974,15 +994,7 @@ async def test_context_overflow_summary_only_larger_payload_does_not_retry(
 async def test_context_overflow_effective_compaction_allows_single_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _effective_compact(request: Any) -> CompactionResult:
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=[],
-            removed_count=len(request.entries),
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _effective_compact)
+    _patch_summarizer(monkeypatch)
     provider = _ContextOverflowProvider(success_after=1)
     agent = Agent(
         provider=provider,
@@ -991,11 +1003,17 @@ async def test_context_overflow_effective_compaction_allows_single_retry(
             max_overflow_retries=2,
         ),
     )
+    agent.set_history(list(_LARGE_HISTORY))
 
     events = [event async for event in agent.run_turn("x" * 4000)]
 
     assert len(provider.calls) == 2
     assert _provider_payload_is_smaller(provider.calls[0], provider.calls[1])
+    # One summary exchange, then the current turn verbatim.
+    retried = provider.calls[1]
+    assert retried[0].content == "[Context summary]\nshort summary"
+    assert retried[1].content == "Understood. Continuing from summary."
+    assert str(retried[2].content).startswith("x" * 4000)
     assert any(event.kind == "done" and getattr(event, "text", "") == "ok" for event in events)
 
 
@@ -1003,39 +1021,14 @@ async def test_context_overflow_effective_compaction_allows_single_retry(
 async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import agentos.engine.agent as agent_module
-
     provider = _HighUsageToolLoopProvider(tool_rounds=3, input_tokens_per_call=4000)
-    flush_calls: list[int] = []
-    compact_requests: list[Any] = []
+    summarize_calls: list[dict[str, Any]] = []
 
     async def _tool(call: Any) -> ToolResult:
         return ToolResult(
             tool_use_id=call.tool_use_id,
             tool_name=call.tool_name,
             content="ok",
-        )
-
-    async def _flush(_plan: Any, flush_messages: list[Message]) -> Any:
-        flush_calls.append(len(flush_messages))
-        return SimpleNamespace(
-            mode="llm",
-            indexed_chunk_count=1,
-            integrity_status="ok",
-            output_coverage_status="ok",
-            invalid_candidate_count=0,
-            candidate_missing_ids=[],
-            obligation_status="ok",
-            obligation_missing_ids=[],
-        )
-
-    async def _compact(request: Any) -> CompactionResult:
-        compact_requests.append(request)
-        return CompactionResult(
-            summary="",
-            kept_entries=request.entries,
-            removed_count=0,
-            chunks_processed=0,
         )
 
     agent = Agent(
@@ -1047,7 +1040,7 @@ async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
         ),
         tool_handler=_tool,
     )
-    monkeypatch.setattr(agent_module, "compact_context", _compact)
+    _patch_summarizer(monkeypatch, calls=summarize_calls)
 
     events = [event async for event in agent.run_turn("read the files one by one")]
 
@@ -1055,61 +1048,49 @@ async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
     assert done.text == "done"
     assert done.input_tokens == 16_000
     assert len(provider.calls) == 4
-    assert flush_calls == []
-    assert compact_requests == []
+    assert summarize_calls == []
 
 
 @pytest.mark.asyncio
 async def test_inline_overflow_still_triggers_for_large_live_provider_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import agentos.engine.agent as agent_module
-
     provider = _HighUsageToolLoopProvider(tool_rounds=0, input_tokens_per_call=1)
     large_tool = ToolDefinition(
         name="large_context_tool",
-        description="large live request surface " + ("z" * 6000),
+        description="large live request surface " + ("z" * 2000),
         input_schema=ToolInputSchema(),
     )
-    compact_requests: list[Any] = []
-
-    async def _compact(request: Any) -> CompactionResult:
-        compact_requests.append(request)
-        return CompactionResult(
-            summary="",
-            kept_entries=request.entries,
-            removed_count=0,
-            chunks_processed=0,
-        )
+    summarize_calls: list[dict[str, Any]] = []
 
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            context_window_tokens=3000,
+            context_window_tokens=12_000,
             context_overflow_threshold=0.5,
-            system_prompt="live request system context " + ("s" * 2000),
+            system_prompt="live request system context " + ("s" * 1000),
         ),
         tool_definitions=[large_tool],
     )
-    agent.set_history(
-        [
-            Message(role="user", content="earlier question"),
-            Message(role="assistant", content="earlier answer"),
-        ]
-    )
-    monkeypatch.setattr(agent_module, "compact_context", _compact)
+    earlier = [
+        Message(role="user", content="earlier question " + "q" * 3000),
+        Message(role="assistant", content="earlier answer " + "a" * 3000),
+    ]
+    agent.set_history(list(earlier))
+    _patch_summarizer(monkeypatch, calls=summarize_calls)
 
     events = [event async for event in agent.run_turn("hello")]
 
     assert any(isinstance(event, DoneEvent) for event in events)
     assert len(provider.calls) == 1
-    # The check runs before the call, over the history the request carries;
-    # this turn's input is not folded into the compaction.
-    assert len(compact_requests) == 1
-    assert [entry["content"] for entry in compact_requests[0].entries] == [
-        "earlier question",
-        "earlier answer",
-    ]
+    # The check runs before the call over the whole live request: the history
+    # alone is under the limit, the system prompt and tools push it over.
+    # This turn's input is not folded in.
+    assert len(summarize_calls) == 1
+    assert summarize_calls[0]["messages"] == earlier
+    sent = provider.calls[0]
+    assert sent[0].content == "[Context summary]\nshort summary"
+    assert str(sent[-1].content).startswith("hello")
 
 
 class _TextThenToolProvider:
@@ -1185,13 +1166,10 @@ async def test_failed_overflow_compaction_never_replays_a_streamed_response(
     A failed compaction then re-called the provider for the same iteration, so
     the consumer saw the first reply's text and tool_use twice.
     """
-    compact_calls: list[int] = []
-
-    async def _failing_compact(request: Any) -> CompactionResult:
-        compact_calls.append(len(request.entries))
-        raise RuntimeError("summarizer unavailable")
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _failing_compact)
+    compact_calls: list[dict[str, Any]] = []
+    # A raising summarizer now falls back to the digest; an empty summary is
+    # what still fails a compaction.
+    _patch_summarizer(monkeypatch, calls=compact_calls, summary="")
     provider = _TextThenToolProvider(tool_rounds=1)
     agent = _overflowing_agent(provider, max_overflow_retries=2)
 
@@ -1214,23 +1192,17 @@ async def test_overflow_compaction_runs_before_the_provider_call(
 ) -> None:
     from agentos.engine.types import CompactionEvent
 
-    async def _effective_compact(request: Any) -> CompactionResult:
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=[],
-            removed_count=len(request.entries),
-            chunks_processed=1,
-        )
-
+    _patch_summarizer(monkeypatch)
     prompt_states: list[list[Message]] = []
 
     def _record_prompt_state(*, messages: list[Message], **_kwargs: Any) -> None:
         prompt_states.append(list(messages))
         return None
 
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _effective_compact)
     monkeypatch.setattr("agentos.engine.agent.record_prompt_state", _record_prompt_state)
-    monkeypatch.setattr("agentos.engine.agent.notify_compaction", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "agentos.engine.compaction_service.notify_compaction", lambda *_a, **_k: None
+    )
     provider = _TextThenToolProvider(tool_rounds=0)
     agent = _overflowing_agent(provider, max_overflow_retries=2)
     agent._session_key = "agent:main:preflight"
@@ -1250,24 +1222,20 @@ async def test_overflow_compaction_runs_before_the_provider_call(
     compaction = events[compaction_index]
     assert compaction.removed_count == 2
     assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == ["done"]
+    # The turn's structured record replaces the transcript (reset mode).
+    record = agent.transcript_record()
+    assert record is not None
+    assert record["mode"] == "reset"
+    assert record["compaction_id"] == compaction.compaction_id
+    assert record["messages"][0]["content"] == "[Context summary]\nshort summary"
 
 
 @pytest.mark.asyncio
 async def test_overflow_compaction_keeps_unseen_tool_results_verbatim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    compact_requests: list[Any] = []
-
-    async def _effective_compact(request: Any) -> CompactionResult:
-        compact_requests.append(request)
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=[],
-            removed_count=len(request.entries),
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _effective_compact)
+    summarize_calls: list[dict[str, Any]] = []
+    _patch_summarizer(monkeypatch, calls=summarize_calls)
     provider = _TextThenToolProvider(tool_rounds=1)
     # Only the second call overflows: the first sees the small history alone.
     agent = Agent(
@@ -1280,19 +1248,21 @@ async def test_overflow_compaction_keeps_unseen_tool_results_verbatim(
         ),
         tool_handler=_big_tool,
     )
-    agent.set_history([Message(role="user", content="q"), Message(role="assistant", content="a")])
+    history = [
+        Message(role="user", content="q" * 1200),
+        Message(role="assistant", content="a" * 1200),
+    ]
+    agent.set_history(list(history))
 
     events = [event async for event in agent.run_turn("read the file")]
 
     assert len(provider.calls) == 2
-    assert len(compact_requests) == 1
-    # Compaction covered what the first request carried, not the new tool turn.
-    assert [entry["content"] for entry in compact_requests[0].entries] == [
-        "q",
-        "a",
-        "read the file",
-    ]
+    assert len(summarize_calls) == 1
+    # Compaction summarizes everything before the current turn; the current
+    # turn (its input and the new tool round) is kept verbatim.
+    assert summarize_calls[0]["messages"] == history
     second = provider.calls[1]
+    assert str(second[2].content).startswith("read the file")
     tool_results = [
         block
         for message in second
@@ -1306,8 +1276,28 @@ async def test_overflow_compaction_keeps_unseen_tool_results_verbatim(
     assert any(isinstance(event, DoneEvent) for event in events)
 
 
+@pytest.mark.asyncio
+async def test_preflight_never_summarizes_history_for_a_turn_too_large_on_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentos.engine.types import CompactionEvent
+
+    summarize_calls: list[dict[str, Any]] = []
+    _patch_summarizer(monkeypatch, calls=summarize_calls)
+    provider = _TextThenToolProvider(tool_rounds=0)
+    agent = _overflowing_agent(provider, max_overflow_retries=2)
+
+    events = [event async for event in agent.run_turn("p" * 20_000)]
+
+    assert summarize_calls == []
+    assert not any(isinstance(event, CompactionEvent) for event in events)
+    # The request goes out untouched; the provider has the final word.
+    assert provider.calls[0][: len(_LARGE_HISTORY)] == _LARGE_HISTORY
+    assert agent.transcript_record()["mode"] == "append"
+
+
 async def _big_tool(call: Any) -> ToolResult:
-    return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="r" * 6000)
+    return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="r" * 1500)
 
 
 @pytest.mark.asyncio
@@ -1317,10 +1307,7 @@ async def test_exhausted_overflow_retries_stop_before_the_provider_call(
     max_overflow_retries: int,
     expected_calls: int,
 ) -> None:
-    async def _failing_compact(request: Any) -> CompactionResult:
-        raise RuntimeError("summarizer unavailable")
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _failing_compact)
+    _patch_summarizer(monkeypatch, summary="")
     provider = _TextThenToolProvider(tool_rounds=3)
     agent = _overflowing_agent(provider, max_overflow_retries=max_overflow_retries)
 
@@ -1328,7 +1315,7 @@ async def test_exhausted_overflow_retries_stop_before_the_provider_call(
 
     assert len(provider.calls) == expected_calls
     error_index = _event_index(events, lambda event: isinstance(event, ErrorEvent))
-    assert events[error_index].code == "compaction_failed"
+    assert events[error_index].code == "compaction_refused_empty_summary"
     # Nothing streams after the terminal error, and nothing streamed twice.
     assert not any(isinstance(event, TextDeltaEvent) for event in events[error_index:])
     texts = [event.text for event in events if isinstance(event, TextDeltaEvent)]
@@ -1340,18 +1327,9 @@ async def test_provider_request_budget_exhausted_compacts_warns_and_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     compaction_events: list[tuple[str, dict[str, Any]]] = []
-
-    async def _effective_compact(request: Any) -> CompactionResult:
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=[],
-            removed_count=len(request.entries),
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _effective_compact)
+    _patch_summarizer(monkeypatch)
     monkeypatch.setattr(
-        "agentos.engine.agent.notify_compaction",
+        "agentos.engine.compaction_service.notify_compaction",
         lambda session_key, **payload: compaction_events.append((session_key, payload)),
     )
     provider = _ProviderRequestBudgetExceededProvider(success_after=1)
@@ -1363,6 +1341,7 @@ async def test_provider_request_budget_exhausted_compacts_warns_and_retries(
         ),
         session_key="agent:main:budget",
     )
+    agent.set_history(list(_LARGE_HISTORY))
 
     events = [event async for event in agent.run_turn("x" * 4000)]
     warning_codes = [event.code for event in events if isinstance(event, WarningEvent)]
@@ -1397,18 +1376,8 @@ async def test_provider_request_budget_exhausted_compacts_warns_and_retries(
 async def test_provider_request_budget_uses_provider_window_for_compaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    compaction_windows: list[int] = []
-
-    async def _effective_compact(request: Any) -> CompactionResult:
-        compaction_windows.append(request.context_window_tokens)
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=[],
-            removed_count=len(request.entries),
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _effective_compact)
+    summarize_calls: list[dict[str, Any]] = []
+    _patch_summarizer(monkeypatch, calls=summarize_calls)
     provider = _ProviderRequestBudgetExceededProvider(
         success_after=1,
         proof={
@@ -1427,11 +1396,12 @@ async def test_provider_request_budget_uses_provider_window_for_compaction(
             max_overflow_retries=2,
         ),
     )
+    agent.set_history(list(_LARGE_HISTORY))
 
     events = [event async for event in agent.run_turn("x" * 4000)]
 
-    assert compaction_windows
-    assert compaction_windows[0] < 100_000
+    assert summarize_calls
+    assert summarize_calls[0]["window_tokens"] < 100_000
     assert len(provider.calls) == 2
     assert any(event.kind == "done" and getattr(event, "text", "") == "ok" for event in events)
 
@@ -1440,18 +1410,8 @@ async def test_provider_request_budget_uses_provider_window_for_compaction(
 async def test_provider_request_budget_retry_payload_is_rechecked_against_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    compaction_windows: list[int] = []
-
-    async def _effective_compact(request: Any) -> CompactionResult:
-        compaction_windows.append(request.context_window_tokens)
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=[],
-            removed_count=len(request.entries),
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _effective_compact)
+    summarize_calls: list[dict[str, Any]] = []
+    _patch_summarizer(monkeypatch, calls=summarize_calls)
     provider = _BudgetCheckingProvider(proof_budget=2_500)
     agent = Agent(
         provider=provider,
@@ -1461,12 +1421,13 @@ async def test_provider_request_budget_retry_payload_is_rechecked_against_budget
             max_overflow_retries=2,
         ),
     )
+    agent.set_history(list(_LARGE_HISTORY))
 
-    events = [event async for event in agent.run_turn("x" * 4000)]
+    events = [event async for event in agent.run_turn("x" * 1000)]
 
     assert [proof["fits"] for proof in provider.proofs] == [False, True]
-    assert compaction_windows
-    assert compaction_windows[0] < agent.config.context_window_tokens
+    assert summarize_calls
+    assert summarize_calls[0]["window_tokens"] < agent.config.context_window_tokens
     assert len(provider.calls) == 2
     assert provider.proofs[1]["estimated_chars"] <= provider.proof_budget
     assert session_payload_chars(provider.calls[1]) < provider.proof_budget
@@ -1477,18 +1438,8 @@ async def test_provider_request_budget_retry_payload_is_rechecked_against_budget
 async def test_provider_budget_retry_uses_effective_proof_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    compaction_windows: list[int] = []
-
-    async def _record_compaction_window(request: Any) -> CompactionResult:
-        compaction_windows.append(request.context_window_tokens)
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=[],
-            removed_count=len(request.entries),
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _record_compaction_window)
+    summarize_calls: list[dict[str, Any]] = []
+    _patch_summarizer(monkeypatch, calls=summarize_calls)
     provider = _ProviderRequestBudgetExceededProvider(
         success_after=1,
         proof={
@@ -1510,10 +1461,11 @@ async def test_provider_budget_retry_uses_effective_proof_budget(
             max_overflow_retries=2,
         ),
     )
+    agent.set_history(list(_LARGE_HISTORY))
 
     events = [event async for event in agent.run_turn("x" * 4000)]
 
-    assert compaction_windows == [21_600]
+    assert [call["window_tokens"] for call in summarize_calls] == [21_600]
     assert any(event.kind == "done" and getattr(event, "text", "") == "ok" for event in events)
 
 
@@ -1521,15 +1473,9 @@ async def test_provider_budget_retry_uses_effective_proof_budget(
 async def test_provider_request_budget_recent_tail_reason_survives_noop_compaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _noop_compact(request: Any) -> CompactionResult:
-        return CompactionResult(
-            summary="",
-            kept_entries=request.entries,
-            removed_count=0,
-            chunks_processed=0,
-        )
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _noop_compact)
+    """With no history the current turn alone is the tail: nothing to compact."""
+    summarize_calls: list[dict[str, Any]] = []
+    _patch_summarizer(monkeypatch, calls=summarize_calls)
     provider = _ProviderRequestBudgetExceededProvider(
         proof={
             "fallback_reason": "provider_request_budget_exhausted",
@@ -1552,6 +1498,7 @@ async def test_provider_request_budget_recent_tail_reason_survives_noop_compacti
     errors = [event for event in events if isinstance(event, ErrorEvent)]
 
     assert len(provider.calls) == 1
+    assert summarize_calls == []
     assert errors[-1].code == "provider_request_too_large"
     assert RAW_CURRENT_TURN_OVERFLOW_MESSAGE not in errors[-1].message
     assert not any(
@@ -1563,15 +1510,7 @@ async def test_provider_request_budget_recent_tail_reason_survives_noop_compacti
 async def test_provider_request_budget_recent_tail_exhaustion_is_reported_as_controlled_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _effective_compact(request: Any) -> CompactionResult:
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=[],
-            removed_count=len(request.entries),
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr("agentos.engine.agent.compact_context", _effective_compact)
+    _patch_summarizer(monkeypatch)
     provider = _ProviderRequestBudgetExceededProvider(
         proof={
             "fallback_reason": "provider_request_budget_exhausted",
@@ -1587,6 +1526,7 @@ async def test_provider_request_budget_recent_tail_exhaustion_is_reported_as_con
             max_overflow_retries=1,
         ),
     )
+    agent.set_history(list(_LARGE_HISTORY))
 
     events = [event async for event in agent.run_turn("x" * 4000)]
     errors = [event for event in events if isinstance(event, ErrorEvent)]
@@ -1601,31 +1541,18 @@ async def test_provider_request_budget_recent_tail_exhaustion_is_reported_as_con
 async def test_context_overflow_degraded_flush_still_runs_live_compaction_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    compact_called = False
-
-    async def _compact_runs_after_degraded_flush(request: Any) -> CompactionResult:
-        nonlocal compact_called
-        compact_called = True
-        return CompactionResult(
-            summary="short summary",
-            kept_entries=[],
-            removed_count=len(request.entries),
-            chunks_processed=1,
-        )
-
-    monkeypatch.setattr(
-        "agentos.engine.agent.compact_context",
-        _compact_runs_after_degraded_flush,
-    )
+    summarize_calls: list[dict[str, Any]] = []
+    _patch_summarizer(monkeypatch, calls=summarize_calls)
     provider = _ContextOverflowProvider(success_after=1)
     agent = Agent(
         provider=provider,
         config=AgentConfig(max_provider_retries=0, max_overflow_retries=2),
     )
+    agent.set_history(list(_LARGE_HISTORY))
 
     events = [event async for event in agent.run_turn("x" * 4000)]
 
-    assert compact_called is True
+    assert summarize_calls
     assert len(provider.calls) == 2
     assert any(event.kind == "done" and getattr(event, "text", "") == "ok" for event in events)
     assert not any(

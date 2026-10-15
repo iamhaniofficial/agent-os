@@ -130,30 +130,6 @@ class _RecordingMemorySnapshotRefresh:
 
 
 @dataclass
-class _RecordingSystemPromptRefresh:
-    calls: list[dict[str, Any]] = field(default_factory=list)
-
-    def refresh_system_prompt(
-        self,
-        *,
-        agent: Any,
-        agent_id: str,
-        tool_defs: list[Any],
-        session_key: str,
-        bootstrap_context_mode: str | None,
-    ) -> None:
-        self.calls.append(
-            {
-                "agent": agent,
-                "agent_id": agent_id,
-                "tool_defs": tool_defs,
-                "session_key": session_key,
-                "bootstrap_context_mode": bootstrap_context_mode,
-            }
-        )
-
-
-@dataclass
 class _RecordingMemorySyncNotify:
     calls: list[dict[str, Any]] = field(default_factory=list)
 
@@ -229,7 +205,6 @@ def _make_stage(
     agent_run: _RecordingAgentRun | None = None,
     compaction_persist: _RecordingCompactionPersist | None = None,
     memory_snapshot_refresh: _RecordingMemorySnapshotRefresh | None = None,
-    system_prompt_refresh: _RecordingSystemPromptRefresh | None = None,
     memory_sync_notify: _RecordingMemorySyncNotify | None = None,
     warning_transformer=None,
 ) -> tuple[StreamConsumerStage, dict[str, Any]]:
@@ -237,9 +212,6 @@ def _make_stage(
     compaction_persist = compaction_persist or _RecordingCompactionPersist()
     memory_snapshot_refresh = (
         memory_snapshot_refresh or _RecordingMemorySnapshotRefresh()
-    )
-    system_prompt_refresh = (
-        system_prompt_refresh or _RecordingSystemPromptRefresh()
     )
     memory_sync_notify = memory_sync_notify or _RecordingMemorySyncNotify()
     if warning_transformer is None:
@@ -249,7 +221,6 @@ def _make_stage(
         agent_run=agent_run,
         compaction_persist=compaction_persist,
         memory_snapshot_refresh=memory_snapshot_refresh,
-        system_prompt_refresh=system_prompt_refresh,
         memory_sync_notify=memory_sync_notify,
         warning_transformer=warning_transformer,
     )
@@ -257,7 +228,6 @@ def _make_stage(
         "agent_run": agent_run,
         "compaction_persist": compaction_persist,
         "memory_snapshot_refresh": memory_snapshot_refresh,
-        "system_prompt_refresh": system_prompt_refresh,
         "memory_sync_notify": memory_sync_notify,
     }
     return stage, recordings
@@ -698,14 +668,12 @@ def test_done_handler_prices_the_model_that_actually_ran(
 
 
 @pytest.mark.asyncio
-async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> None:
+async def test_compaction_handler_runs_persist_then_snapshot() -> None:
     persist = _RecordingCompactionPersist()
     snapshot = _RecordingMemorySnapshotRefresh()
-    prompt = _RecordingSystemPromptRefresh()
     handler = _CompactionHandler(
         persist=persist,
         memory_snapshot=snapshot,
-        system_prompt=prompt,
     )
     inp = _make_input()
     await handler.handle(
@@ -717,36 +685,30 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     assert persist.calls[0]["kept_entries"] == [1, 2]
     assert persist.calls[0]["compaction_id"] == "cmp_inline_1"
     assert len(snapshot.calls) == 1
-    assert len(prompt.calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_compaction_handler_skips_persist_when_session_manager_absent() -> None:
     persist = _RecordingCompactionPersist()
     snapshot = _RecordingMemorySnapshotRefresh()
-    prompt = _RecordingSystemPromptRefresh()
     handler = _CompactionHandler(
         persist=persist,
         memory_snapshot=snapshot,
-        system_prompt=prompt,
     )
     inp = _make_input(session_manager_present=False)
     await handler.handle(CompactionEvent(summary="s", kept_entries=[]), inp)
     assert persist.calls == []
-    # Snapshot + prompt still fire; the persist guard is the only conditional.
+    # The snapshot refresh still fires; the persist guard is the only conditional.
     assert len(snapshot.calls) == 1
-    assert len(prompt.calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_compaction_handler_preserves_recoverable_state_on_persist_failure() -> None:
     persist = _RecordingCompactionPersist(raises=RuntimeError)
     snapshot = _RecordingMemorySnapshotRefresh()
-    prompt = _RecordingSystemPromptRefresh()
     handler = _CompactionHandler(
         persist=persist,
         memory_snapshot=snapshot,
-        system_prompt=prompt,
     )
     inp = _make_input()
     # Must NOT raise, but failed durable persistence must not refresh runtime state
@@ -754,7 +716,6 @@ async def test_compaction_handler_preserves_recoverable_state_on_persist_failure
     await handler.handle(CompactionEvent(summary="s", kept_entries=[]), inp)
     assert len(persist.calls) == 1
     assert snapshot.calls == []
-    assert prompt.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -953,7 +914,6 @@ async def test_outer_stage_suppresses_compaction_event_and_refreshes_runtime_sta
     assert len(recs["compaction_persist"].calls) == 1
     assert recs["compaction_persist"].calls[0]["kept_entries"] == [1, 2, 3]
     assert len(recs["memory_snapshot_refresh"].calls) == 1
-    assert len(recs["system_prompt_refresh"].calls) == 1
 
 
 @pytest.mark.asyncio

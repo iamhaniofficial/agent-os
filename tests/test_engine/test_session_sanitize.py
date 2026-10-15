@@ -14,10 +14,13 @@ from agentos.engine.session_sanitize import (
     project_historical_tool_payloads,
     sanitize_session_messages,
 )
+from agentos.engine.transcript import legacy_migration_for, scrub_projected_tool_arguments
 from agentos.engine.types import ThinkingLevel
 from agentos.provider import (
     ChatConfig,
+    ContentBlockRedactedThinking,
     ContentBlockText,
+    ContentBlockThinking,
     ContentBlockToolResult,
     ContentBlockToolUse,
     Message,
@@ -354,151 +357,103 @@ def test_historical_replay_projection_compacts_list_tool_results() -> None:
     assert messages[0].content[0].content == large_result
 
 
-def test_agent_aggregate_tool_result_budget_compacts_old_bulky_results() -> None:
-    raw_old_output = "old bulky output\n" + ("x" * 4000)
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200,
-        ),
-    )
-    messages = [
+def _seal(agent: Agent, messages: list[Message], start: int = 0) -> list[Message]:
+    """Seal *messages* the way the agent does before their first request."""
+    sealed = list(messages)
+    agent._seal_transcript(sealed, start)
+    return sealed
+
+
+def _tool_pair(
+    tool_id: str,
+    body: str,
+    *,
+    name: str = "execute_code",
+    is_error: bool = False,
+    tool_input: dict[str, Any] | None = None,
+) -> list[Message]:
+    return [
         Message(
             role="assistant",
-            content=[
-                ContentBlockToolUse(id="old-1", name="execute_code", input={}),
-            ],
+            content=[ContentBlockToolUse(id=tool_id, name=name, input=tool_input or {})],
         ),
         Message(
             role="user",
-            content=[
-                ContentBlockToolResult(
-                    tool_use_id="old-1",
-                    content=raw_old_output,
-                    is_error=False,
-                )
-            ],
-        ),
-        Message(
-            role="assistant",
-            content=[
-                ContentBlockToolUse(id="err-1", name="execute_code", input={}),
-            ],
-        ),
-        Message(
-            role="user",
-            content=[
-                ContentBlockToolResult(
-                    tool_use_id="err-1",
-                    content="Traceback\n" + ("e" * 4000),
-                    is_error=True,
-                )
-            ],
-        ),
-        Message(
-            role="assistant",
-            content=[
-                ContentBlockToolUse(id="new-1", name="execute_code", input={}),
-            ],
-        ),
-        Message(
-            role="user",
-            content=[
-                ContentBlockToolResult(
-                    tool_use_id="new-1",
-                    content="recent output\n" + ("r" * 4000),
-                    is_error=False,
-                )
-            ],
+            content=[ContentBlockToolResult(tool_use_id=tool_id, content=body, is_error=is_error)],
         ),
     ]
 
-    compacted = agent._compact_aggregate_tool_results_for_provider(messages)
 
-    old_result = compacted[1].content[0]
-    err_result = compacted[3].content[0]
-    new_result = compacted[5].content[0]
+def test_seal_projects_an_oversized_result_once_and_keeps_errors() -> None:
+    """A tool result over its budget is shrunk when appended; errors are kept."""
+    agent = Agent(
+        provider=CapturingProvider(),
+        config=AgentConfig(context_window_tokens=200),
+    )
+    messages = [
+        *_tool_pair("old-1", "old bulky output\n" + ("x" * 9000)),
+        *_tool_pair("err-1", "Traceback\n" + ("e" * 9000), is_error=True),
+    ]
+
+    sealed = _seal(agent, messages)
+
+    old_result = sealed[1].content[0]
+    err_result = sealed[3].content[0]
     assert isinstance(old_result, ContentBlockToolResult)
     assert isinstance(err_result, ContentBlockToolResult)
-    assert isinstance(new_result, ContentBlockToolResult)
-    assert "aggregate_tool_result_compacted" in old_result.content
-    assert "tool_result_handle:" not in old_result.content
-    assert len(old_result.content) < 1000
-    assert "Traceback" in err_result.content
-    assert len(err_result.content) > 4000
-    assert "recent output" in new_result.content
-    assert len(new_result.content) > 4000
-    assert agent.config.metadata["tool_aggregate_projection_applied"] is True
-    assert agent.config.metadata["tool_projection_applied"] is True
-    assert agent.config.metadata["tool_projection_tokens_saved"] > 0
-
-
-def test_agent_large_context_compacts_old_local_tool_results_for_provider() -> None:
-    def _tool_pair(tool_id: str, body: str, *, is_error: bool = False) -> list[Message]:
-        return [
-            Message(
-                role="assistant",
-                content=[ContentBlockToolUse(id=tool_id, name="local_tool", input={})],
-            ),
-            Message(
-                role="user",
-                content=[
-                    ContentBlockToolResult(
-                        tool_use_id=tool_id,
-                        content=body,
-                        is_error=is_error,
-                    )
-                ],
-            ),
-        ]
-
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200_000,
-        ),
-    )
-    messages = [
-        block
-        for pair in (
-            _tool_pair("old-1", "old local output\n" + ("x" * 70_000)),
-            _tool_pair(
-                "err-1",
-                "Traceback preserved\n" + ("e" * 20_000),
-                is_error=True,
-            ),
-            _tool_pair("mid-1", "middle local output\n" + ("m" * 50_000)),
-            _tool_pair("new-1", "recent local output\n" + ("r" * 50_000)),
-        )
-        for block in pair
-    ]
-
-    compacted = agent._compact_aggregate_tool_results_for_provider(messages)
-
-    old_result = compacted[1].content[0]
-    error_result = compacted[3].content[0]
-    middle_result = compacted[5].content[0]
-    recent_result = compacted[7].content[0]
-    assert isinstance(old_result, ContentBlockToolResult)
-    assert isinstance(error_result, ContentBlockToolResult)
-    assert isinstance(middle_result, ContentBlockToolResult)
-    assert isinstance(recent_result, ContentBlockToolResult)
     assert "[tool_result_projection]" in old_result.content
     assert "tool_result_handle:" not in old_result.content
-    assert len(old_result.content) < 5_000
-    assert "Traceback preserved" in error_result.content
-    assert len(error_result.content) > 20_000
-    assert "middle local output" in middle_result.content
-    assert "recent local output" in recent_result.content
-    total_result_chars = sum(
-        len(block.content)
-        for message in compacted
-        if isinstance(message.content, list)
-        for block in message.content
-        if isinstance(block, ContentBlockToolResult)
-    )
-    assert total_result_chars <= agent._tool_result_provider_request_max_chars()
+    assert len(old_result.content) < len(messages[1].content[0].content)
+    assert "Traceback" in err_result.content
+    assert len(err_result.content) > 9000
     assert agent.config.metadata["tool_provider_guard_projection_applied"] is True
+    assert agent.config.metadata["tool_projection_applied"] is True
+
+
+def test_seal_never_rewrites_an_already_sealed_message() -> None:
+    """Shrinking happens at append time only; sealed messages are immutable."""
+    agent = Agent(
+        provider=CapturingProvider(),
+        config=AgentConfig(context_window_tokens=200),
+    )
+    first = _tool_pair("old-1", "old bulky output\n" + ("x" * 9000))
+    transcript = list(first)
+    agent._seal_transcript(transcript, 0)
+    sealed_first = list(transcript)
+
+    transcript.extend(_tool_pair("new-1", "new bulky output\n" + ("y" * 9000)))
+    agent._seal_transcript(transcript, len(sealed_first))
+
+    # The earlier pair is byte-identical (same objects) after the second seal.
+    assert all(a is b for a, b in zip(transcript[:2], sealed_first, strict=True))
+    second_result = transcript[3].content[0]
+    assert isinstance(second_result, ContentBlockToolResult)
+    assert "[tool_result_projection]" in second_result.content
+
+
+def test_seal_keeps_under_cap_results_verbatim_on_a_large_context() -> None:
+    """No aggregate rewrite: results under their budget stay as appended.
+
+    Accumulated size is the compaction service's job (one summary + the
+    current turn), not a per-request projection of older results.
+    """
+    agent = Agent(
+        provider=CapturingProvider(),
+        config=AgentConfig(context_window_tokens=200_000),
+    )
+    messages = [
+        *_tool_pair("old-1", "old local output\n" + ("x" * 70_000), name="local_tool"),
+        *_tool_pair(
+            "err-1", "Traceback preserved\n" + ("e" * 20_000), name="local_tool", is_error=True
+        ),
+        *_tool_pair("mid-1", "middle local output\n" + ("m" * 50_000), name="local_tool"),
+        *_tool_pair("new-1", "recent local output\n" + ("r" * 50_000), name="local_tool"),
+    ]
+
+    sealed = _seal(agent, messages)
+
+    assert [message.content for message in sealed] == [message.content for message in messages]
+    assert "tool_provider_guard_projection_applied" not in agent.config.metadata
 
 
 @pytest.mark.asyncio
@@ -511,18 +466,7 @@ async def test_agent_single_tool_result_projection_does_not_store_raw_content(tm
     )
     raw_output = "single bulky output\n" + ("x" * 8000)
 
-    messages = [
-        Message(
-            role="assistant",
-            content=[ContentBlockToolUse(id="tool-1", name="execute_code", input={})],
-        ),
-        Message(
-            role="user",
-            content=[ContentBlockToolResult(tool_use_id="tool-1", content=raw_output)],
-        ),
-    ]
-
-    projected = agent._compact_aggregate_tool_results_for_provider(messages)
+    projected = _seal(agent, _tool_pair("tool-1", raw_output))
     result = projected[1].content[0]
     assert isinstance(result, ContentBlockToolResult)
 
@@ -543,23 +487,7 @@ async def test_agent_tool_result_projection_never_writes_raw_store(
         ),
     )
 
-    messages = [
-        Message(
-            role="assistant",
-            content=[ContentBlockToolUse(id="tool-1", name="execute_code", input={})],
-        ),
-        Message(
-            role="user",
-            content=[
-                ContentBlockToolResult(
-                    tool_use_id="tool-1",
-                    content="single bulky output\n" + ("x" * 8000),
-                )
-            ],
-        ),
-    ]
-
-    projected = agent._compact_aggregate_tool_results_for_provider(messages)
+    projected = _seal(agent, _tool_pair("tool-1", "single bulky output\n" + ("x" * 8000)))
     result = projected[1].content[0]
     assert isinstance(result, ContentBlockToolResult)
 
@@ -568,7 +496,8 @@ async def test_agent_tool_result_projection_never_writes_raw_store(
     assert not list((tmp_path / "tool-results").rglob("content.txt"))
 
 
-def test_agent_aggregate_tool_result_budget_uses_total_not_single_result_size() -> None:
+def test_seal_budgets_each_result_on_its_own_not_the_total() -> None:
+    """Five results that are each under the cap are not rewritten."""
     agent = Agent(
         provider=CapturingProvider(),
         config=AgentConfig(
@@ -577,98 +506,57 @@ def test_agent_aggregate_tool_result_budget_uses_total_not_single_result_size() 
     )
     messages: list[Message] = []
     for index in range(5):
-        tool_id = f"tool-{index}"
-        messages.extend(
-            [
-                Message(
-                    role="assistant",
-                    content=[
-                        ContentBlockToolUse(id=tool_id, name="execute_code", input={}),
-                    ],
-                ),
-                Message(
-                    role="user",
-                    content=[
-                        ContentBlockToolResult(
-                            tool_use_id=tool_id,
-                            content=f"chunk {index}\n" + ("x" * 800),
-                            is_error=False,
-                        )
-                    ],
-                ),
-            ]
-        )
+        messages.extend(_tool_pair(f"tool-{index}", f"chunk {index}\n" + ("x" * 800)))
 
-    compacted = agent._compact_aggregate_tool_results_for_provider(messages)
+    sealed = _seal(agent, messages)
 
-    compacted_contents = [
+    contents = [
         message.content[0].content
-        for message in compacted
+        for message in sealed
         if isinstance(message.content, list)
         and message.content
         and isinstance(message.content[0], ContentBlockToolResult)
     ]
-    assert any("aggregate_tool_result_compacted" in content for content in compacted_contents)
-    assert "recent output" not in "\n".join(compacted_contents)
+    assert contents == [f"chunk {index}\n" + ("x" * 800) for index in range(5)]
 
 
-def test_agent_provider_backstop_classifies_external_results_from_tool_use_names() -> None:
+def test_seal_classifies_external_results_from_tool_use_names() -> None:
     agent = Agent(
         provider=CapturingProvider(),
         config=AgentConfig(
             context_window_tokens=1_000_000,
             tool_result_provider_request_max_chars=1300,
-            tool_result_external_keep_recent=2,
         ),
     )
     messages: list[Message] = []
-    for index in range(4):
-        tool_id = f"fetch-{index}"
+    for index in range(2):
         messages.extend(
-            [
-                Message(
-                    role="assistant",
-                    content=[
-                        ContentBlockToolUse(
-                            id=tool_id,
-                            name="web_fetch",
-                            input={"url": f"https://example.com/{index}"},
-                        ),
-                    ],
-                ),
-                Message(
-                    role="user",
-                    content=[
-                        ContentBlockToolResult(
-                            tool_use_id=tool_id,
-                            content=f"fetch {index}\n" + ("x" * 5000),
-                            is_error=False,
-                        )
-                    ],
-                ),
-            ]
+            _tool_pair(
+                f"fetch-{index}",
+                f"fetch {index}\n" + ("x" * 5000),
+                name="web_fetch",
+                tool_input={"url": f"https://example.com/{index}"},
+            )
         )
 
-    compacted = agent._compact_aggregate_tool_results_for_provider(messages)
+    sealed = _seal(agent, messages)
 
     external_contents = [
         message.content[0].content
-        for message in compacted
+        for message in sealed
         if isinstance(message.content, list)
         and message.content
         and isinstance(message.content[0], ContentBlockToolResult)
     ]
-    assert "fetch 3" in external_contents[-1]
-    assert "fetch 2" in external_contents[-2]
-    assert any("[tool_result_projection]" in content for content in external_contents[:2])
-    assert any(
+    assert all("[tool_result_projection]" in content for content in external_contents)
+    assert all(
         "external tool result compacted for provider request context" in content
-        for content in external_contents[:2]
+        for content in external_contents
     )
-    assert sum(len(content) for content in external_contents) < 4 * (len("fetch 0\n") + 5000)
+    assert sum(len(content) for content in external_contents) < 2 * (len("fetch 0\n") + 5000)
 
 
-def test_agent_provider_backstop_preserves_sessions_yield_control_json() -> None:
+def test_seal_preserves_sessions_yield_control_json() -> None:
     agent = Agent(
         provider=CapturingProvider(),
         config=AgentConfig(
@@ -685,42 +573,17 @@ def test_agent_provider_backstop_preserves_sessions_yield_control_json() -> None
         }
     )
     messages = [
-        Message(
-            role="assistant",
-            content=[ContentBlockToolUse(id="yield-1", name="sessions_yield", input={})],
-        ),
-        Message(
-            role="user",
-            content=[
-                ContentBlockToolResult(
-                    tool_use_id="yield-1",
-                    content=control_payload,
-                    is_error=False,
-                )
-            ],
-        ),
-        Message(
-            role="assistant",
-            content=[
-                ContentBlockToolUse(
-                    id="fetch-1", name="web_fetch", input={"url": "https://example.com"}
-                )
-            ],
-        ),
-        Message(
-            role="user",
-            content=[
-                ContentBlockToolResult(
-                    tool_use_id="fetch-1",
-                    content="fetch\n" + ("x" * 1000),
-                    is_error=False,
-                )
-            ],
+        *_tool_pair("yield-1", control_payload, name="sessions_yield"),
+        *_tool_pair(
+            "fetch-1",
+            "fetch\n" + ("x" * 1000),
+            name="web_fetch",
+            tool_input={"url": "https://example.com"},
         ),
     ]
 
-    compacted = agent._compact_aggregate_tool_results_for_provider(messages)
-    control_result = compacted[1].content[0]
+    sealed = _seal(agent, messages)
+    control_result = sealed[1].content[0]
 
     assert isinstance(control_result, ContentBlockToolResult)
     payload = json.loads(control_result.content)
@@ -728,7 +591,7 @@ def test_agent_provider_backstop_preserves_sessions_yield_control_json() -> None
     assert payload["waited"] is False
 
 
-def test_agent_provider_view_keeps_large_tool_use_arguments_by_default(tmp_path) -> None:
+def test_seal_keeps_large_tool_use_arguments() -> None:
     agent = Agent(
         provider=CapturingProvider(),
         config=AgentConfig(
@@ -736,64 +599,24 @@ def test_agent_provider_view_keeps_large_tool_use_arguments_by_default(tmp_path)
         ),
     )
     large_code = "print('start')\n" + ("x = 1\n" * 500) + "print('end')\n"
-    messages = [
-        Message(
-            role="assistant",
-            content=[
-                ContentBlockToolUse(
-                    id="code-1",
-                    name="execute_code",
-                    input={"code": large_code, "timeout": 10},
-                )
-            ],
-        )
-    ]
+    messages = _tool_pair(
+        "code-1",
+        "ok",
+        tool_input={"code": large_code, "timeout": 10},
+    )
 
-    projected = agent._sanitize_projected_tool_use_arguments_for_provider(messages)
+    sealed = _seal(agent, messages)
+    scrubbed, count = scrub_projected_tool_arguments(messages)
 
-    original_block = messages[0].content[0]
-    projected_block = projected[0].content[0]
-    assert isinstance(original_block, ContentBlockToolUse)
-    assert isinstance(projected_block, ContentBlockToolUse)
-    assert original_block.input["code"] == large_code
-    assert projected_block.input["code"] == large_code
-    assert "tool_use_argument_projection" not in projected_block.input["code"]
+    for view in (sealed, scrubbed):
+        block = view[0].content[0]
+        assert isinstance(block, ContentBlockToolUse)
+        assert block.input["code"] == large_code
+    assert count == 0
     assert "tool_argument_projection_applied" not in agent.config.metadata
 
 
-def test_agent_provider_view_derives_tool_argument_budget_above_legacy_default(
-    tmp_path,
-) -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            context_window_tokens=200_000,
-            max_tokens=8192,
-        ),
-    )
-    large_code = "print('start')\n" + ("x = 1\n" * 2500) + "print('end')\n"
-    messages = [
-        Message(
-            role="assistant",
-            content=[
-                ContentBlockToolUse(
-                    id="code-derived-1",
-                    name="execute_code",
-                    input={"code": large_code, "timeout": 10},
-                )
-            ],
-        )
-    ]
-
-    projected = agent._sanitize_projected_tool_use_arguments_for_provider(messages)
-
-    projected_block = projected[0].content[0]
-    assert isinstance(projected_block, ContentBlockToolUse)
-    assert projected_block.input["code"] == large_code
-    assert "tool_use_argument_projection" not in projected_block.input["code"]
-
-
-def test_agent_provider_view_scrubs_legacy_projected_tool_argument(tmp_path) -> None:
+def test_legacy_scrub_replaces_projected_tool_argument() -> None:
     projection = (
         "[tool_use_argument_projection]\n"
         "tool: execute_code\n"
@@ -802,12 +625,6 @@ def test_agent_provider_view_scrubs_legacy_projected_tool_argument(tmp_path) -> 
         "sha256: missing\n"
         "tool_argument_handle: tr-missing\n"
         "head:\nprint('legacy')"
-    )
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            tool_use_argument_provider_request_max_chars=1200,
-        ),
     )
     messages = [
         Message(
@@ -819,23 +636,21 @@ def test_agent_provider_view_scrubs_legacy_projected_tool_argument(tmp_path) -> 
                     input={"code": projection, "timeout": 99},
                 )
             ],
+            reasoning_details=[{"type": "reasoning.text", "text": "kept"}],
         )
     ]
 
-    projected = agent._sanitize_projected_tool_use_arguments_for_provider(messages)
+    scrubbed, count = scrub_projected_tool_arguments(messages)
 
-    block = projected[0].content[0]
+    block = scrubbed[0].content[0]
+    assert count == 1
     assert isinstance(block, ContentBlockToolUse)
     assert "tool_use_argument_projection" not in block.input["code"]
     assert "invalid_provider_context_projection:execute_code.code" in block.input["code"]
-    stored_contents = [
-        path.read_text(encoding="utf-8")
-        for path in (tmp_path / "tool-results").rglob("content.txt")
-    ]
-    assert all("tool_use_argument_projection" not in content for content in stored_contents)
+    assert scrubbed[0].reasoning_details == [{"type": "reasoning.text", "text": "kept"}]
 
 
-def test_agent_provider_view_does_not_project_aggregate_tool_use_arguments(tmp_path) -> None:
+def test_seal_does_not_project_many_tool_use_arguments() -> None:
     agent = Agent(
         provider=CapturingProvider(),
         config=AgentConfig(
@@ -843,41 +658,41 @@ def test_agent_provider_view_does_not_project_aggregate_tool_use_arguments(tmp_p
             tool_use_argument_projection_enabled=True,
         ),
     )
-    messages = [
-        Message(
-            role="assistant",
-            content=[
-                ContentBlockToolUse(
-                    id=f"write-{index}",
-                    name="write_file",
-                    input={
-                        "path": f"generated/file-{index}.html",
-                        "content": "x" * 700,
-                    },
-                )
-                for index in range(5)
-            ],
-        )
-    ]
+    for size, count in ((700, 5), (200, 6)):
+        messages = [
+            Message(
+                role="assistant",
+                content=[
+                    ContentBlockToolUse(
+                        id=f"write-{index}",
+                        name="write_file",
+                        input={
+                            "path": f"generated/file-{index}.html",
+                            "content": "x" * size,
+                        },
+                    )
+                    for index in range(count)
+                ],
+            ),
+            Message(
+                role="user",
+                content=[
+                    ContentBlockToolResult(tool_use_id=f"write-{index}", content="ok")
+                    for index in range(count)
+                ],
+            ),
+        ]
 
-    projected = agent._sanitize_projected_tool_use_arguments_for_provider(messages)
+        sealed = _seal(agent, messages)
 
-    projected_blocks = [
-        block for block in projected[0].content if isinstance(block, ContentBlockToolUse)
-    ]
-    assert all(block.input["content"] == "x" * 700 for block in projected_blocks)
-    assert all(
-        original.input["content"] == "x" * 700
-        for original in messages[0].content
-        if isinstance(original, ContentBlockToolUse)
-    )
+        blocks = [block for block in sealed[0].content if isinstance(block, ContentBlockToolUse)]
+        assert all(block.input["content"] == "x" * size for block in blocks)
+        assert all(block.input["path"].startswith("generated/") for block in blocks)
     assert "tool_argument_projection_applied" not in agent.config.metadata
     assert "tool_argument_projection_calls" not in agent.config.metadata
 
 
-def test_agent_provider_view_derives_tool_result_budget_above_legacy_default(
-    tmp_path,
-) -> None:
+def test_seal_derives_tool_result_budget_above_legacy_default() -> None:
     agent = Agent(
         provider=CapturingProvider(),
         config=AgentConfig(
@@ -887,180 +702,54 @@ def test_agent_provider_view_derives_tool_result_budget_above_legacy_default(
     )
     messages: list[Message] = []
     for index in range(3):
-        tool_id = f"fetch-derived-{index}"
-        payload = f"FETCH_DERIVED_{index}\n" + ("x" * 40_000)
         messages.extend(
-            [
-                Message(
-                    role="assistant",
-                    content=[
-                        ContentBlockToolUse(
-                            id=tool_id,
-                            name="web_fetch",
-                            input={"url": f"https://example.com/{index}"},
-                        )
-                    ],
-                ),
-                Message(
-                    role="user",
-                    content=[
-                        ContentBlockToolResult(
-                            tool_use_id=tool_id,
-                            content=payload,
-                            is_error=False,
-                        )
-                    ],
-                ),
-            ]
+            _tool_pair(
+                f"fetch-derived-{index}",
+                f"FETCH_DERIVED_{index}\n" + ("x" * 40_000),
+                name="web_fetch",
+                tool_input={"url": f"https://example.com/{index}"},
+            )
         )
 
-    compacted = agent._compact_aggregate_tool_results_for_provider(messages)
+    sealed = _seal(agent, messages)
 
-    first_result = compacted[1].content[0]
+    first_result = sealed[1].content[0]
     assert isinstance(first_result, ContentBlockToolResult)
     assert first_result.content.startswith("FETCH_DERIVED_0")
     assert "external_tool_result_compacted" not in first_result.content
 
 
-def test_agent_provider_view_does_not_project_small_aggregate_tool_use_arguments(tmp_path) -> None:
+def test_seal_keeps_successful_file_write_argument_executable(tmp_path) -> None:
     agent = Agent(
         provider=CapturingProvider(),
         config=AgentConfig(
-            tool_use_argument_provider_request_max_chars=1200,
-            tool_use_argument_projection_enabled=True,
+            tool_use_argument_provider_request_max_chars=8000,
         ),
     )
-    messages = [
-        Message(
-            role="assistant",
-            content=[
-                ContentBlockToolUse(
-                    id=f"write-{index}",
-                    name="write_file",
-                    input={
-                        "path": f"generated/file-{index}.html",
-                        "content": "x" * 200,
-                    },
-                )
-                for index in range(6)
-            ],
+    large_html = "<html>\n" + ("<p>word</p>\n" * 900) + "</html>\n"
+    messages = _tool_pair(
+        "write-1",
+        '{"status":"ok","path":"index.html"}',
+        name="write_file",
+        tool_input={"path": "index.html", "content": large_html},
+    )
+
+    first = _seal(agent, messages)
+    second = _seal(agent, messages)
+
+    for view in (first, second):
+        tool_use = next(
+            block for block in view[0].content if isinstance(block, ContentBlockToolUse)
         )
-    ]
-
-    projected = agent._sanitize_projected_tool_use_arguments_for_provider(messages)
-
-    projected_blocks = [
-        block for block in projected[0].content if isinstance(block, ContentBlockToolUse)
-    ]
-    assert all(block.input["content"] == "x" * 200 for block in projected_blocks)
-    assert all(block.input["path"].startswith("generated/") for block in projected_blocks)
-    assert "tool_argument_projection_applied" not in agent.config.metadata
-    assert "tool_argument_projection_calls" not in agent.config.metadata
-
-
-def test_agent_provider_view_keeps_successful_file_write_argument_executable(tmp_path) -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            tool_use_argument_provider_request_max_chars=8000,
-        ),
-    )
-    large_html = "<html>\n" + ("<p>word</p>\n" * 900) + "</html>\n"
-    messages = [
-        Message(
-            role="assistant",
-            content=[
-                ContentBlockToolUse(
-                    id="write-1",
-                    name="write_file",
-                    input={"path": "index.html", "content": large_html},
-                )
-            ],
-        ),
-        Message(
-            role="user",
-            content=[
-                ContentBlockToolResult(
-                    tool_use_id="write-1",
-                    content='{"status":"ok","path":"index.html"}',
-                    is_error=False,
-                )
-            ],
-        ),
-    ]
-
-    projected = agent._sanitize_projected_tool_use_arguments_for_provider(messages)
-
-    projected_tool_use = next(
-        block for block in projected[0].content if isinstance(block, ContentBlockToolUse)
-    )
-    projected_content = projected_tool_use.input["content"]
-    assert projected_tool_use.id == "write-1"
-    assert projected_tool_use.name == "write_file"
-    assert projected_tool_use.input["path"] == "index.html"
-    assert projected_content == large_html
-    assert "[tool_use_argument_projection]" not in projected_content
-    assert "successful_file_write_projection" not in projected_content
-    assert "<p>word</p>" in projected_content
-    projected_result = next(
-        block for block in projected[1].content if isinstance(block, ContentBlockToolResult)
-    )
-    assert projected_result.tool_use_id == "write-1"
-    assert projected[-1].role == "user"
-    history_block = next(
-        block for block in messages[0].content if isinstance(block, ContentBlockToolUse)
-    )
-    assert history_block.input["content"] == large_html
-    assert "tool_argument_projection_applied" not in agent.config.metadata
-    assert "tool_argument_projection_calls" not in agent.config.metadata
-
-
-def test_agent_provider_view_does_not_store_successful_file_write_snapshot(
-    tmp_path,
-) -> None:
-    agent = Agent(
-        provider=CapturingProvider(),
-        config=AgentConfig(
-            tool_use_argument_provider_request_max_chars=8000,
-        ),
-    )
-    large_html = "<html>\n" + ("<p>word</p>\n" * 900) + "</html>\n"
-    messages = [
-        Message(
-            role="assistant",
-            content=[
-                ContentBlockToolUse(
-                    id="write-1",
-                    name="write_file",
-                    input={"path": "index.html", "content": large_html},
-                )
-            ],
-        ),
-        Message(
-            role="user",
-            content=[
-                ContentBlockToolResult(
-                    tool_use_id="write-1",
-                    content='{"status":"ok","path":"index.html"}',
-                    is_error=False,
-                )
-            ],
-        ),
-    ]
-
-    first = agent._sanitize_projected_tool_use_arguments_for_provider(messages)
-    second = agent._sanitize_projected_tool_use_arguments_for_provider(messages)
-
-    first_block = next(
-        block for block in first[0].content if isinstance(block, ContentBlockToolUse)
-    )
-    second_block = next(
-        block for block in second[0].content if isinstance(block, ContentBlockToolUse)
-    )
-
-    assert first_block.input["content"] == large_html
-    assert second_block.input["content"] == large_html
-    assert not list((tmp_path / "tool-results" / "s" / "session-1").glob("**/meta.json"))
+        assert tool_use.id == "write-1"
+        assert tool_use.input["path"] == "index.html"
+        assert tool_use.input["content"] == large_html
+        result = next(
+            block for block in view[1].content if isinstance(block, ContentBlockToolResult)
+        )
+        assert result.tool_use_id == "write-1"
+        assert view[-1].role == "user"
+    assert not list((tmp_path / "tool-results").glob("**/meta.json"))
     assert "tool_argument_projection_applied" not in agent.config.metadata
     assert "tool_argument_projection_calls" not in agent.config.metadata
 
@@ -1136,30 +825,33 @@ async def test_agent_provider_view_omits_loaded_history_tool_arguments() -> None
         provider=provider,
         config=AgentConfig(max_iterations=1),
     )
+    # Rows without a structured record are migrated once, on load.
     agent.set_history(
-        [
-            Message(
-                role="assistant",
-                content=[
-                    ContentBlockToolUse(
-                        id="write-stale",
-                        name="write_file",
-                        input={"path": "index.html", "content": large_argument},
-                    )
-                ],
-                reasoning_content="old reasoning\n" + ("r" * 10_000),
-            ),
-            Message(
-                role="user",
-                content=[
-                    ContentBlockToolResult(
-                        tool_use_id="write-stale",
-                        content='{"status":"ok"}',
-                        is_error=False,
-                    )
-                ],
-            ),
-        ]
+        legacy_migration_for(agent)(
+            [
+                Message(
+                    role="assistant",
+                    content=[
+                        ContentBlockToolUse(
+                            id="write-stale",
+                            name="write_file",
+                            input={"path": "index.html", "content": large_argument},
+                        )
+                    ],
+                    reasoning_content="old reasoning\n" + ("r" * 10_000),
+                ),
+                Message(
+                    role="user",
+                    content=[
+                        ContentBlockToolResult(
+                            tool_use_id="write-stale",
+                            content='{"status":"ok"}',
+                            is_error=False,
+                        )
+                    ],
+                ),
+            ]
+        )
     )
 
     events = [event async for event in agent.run_turn("new task")]
@@ -1196,29 +888,31 @@ async def test_agent_preserves_deepseek_reasoning_while_projecting_history_paylo
         ),
     )
     agent.set_history(
-        [
-            Message(
-                role="assistant",
-                content=[
-                    ContentBlockToolUse(
-                        id="deepseek-stale",
-                        name="write_file",
-                        input={"path": "index.html", "content": large_argument},
-                    )
-                ],
-                reasoning_content=reasoning,
-            ),
-            Message(
-                role="user",
-                content=[
-                    ContentBlockToolResult(
-                        tool_use_id="deepseek-stale",
-                        content='{"status":"ok"}',
-                        is_error=False,
-                    )
-                ],
-            ),
-        ]
+        legacy_migration_for(agent)(
+            [
+                Message(
+                    role="assistant",
+                    content=[
+                        ContentBlockToolUse(
+                            id="deepseek-stale",
+                            name="write_file",
+                            input={"path": "index.html", "content": large_argument},
+                        )
+                    ],
+                    reasoning_content=reasoning,
+                ),
+                Message(
+                    role="user",
+                    content=[
+                        ContentBlockToolResult(
+                            tool_use_id="deepseek-stale",
+                            content='{"status":"ok"}',
+                            is_error=False,
+                        )
+                    ],
+                ),
+            ]
+        )
     )
 
     events = [event async for event in agent.run_turn("continue")]
@@ -1259,11 +953,9 @@ async def test_agent_runtime_context_is_request_only_and_not_system_prefix() -> 
     assert call["messages"][0].content.startswith("hello")
     assert "[Runtime context for this turn]" in call["messages"][0].content
     assert len(call["messages"]) == 1
-    assert all(
-        "[Runtime context for this turn]" not in message.content
-        for message in agent._history
-        if isinstance(message.content, str)
-    )
+    # The timestamp is a trailing block of the CURRENT user turn and is kept
+    # with it: the next request replays the exact same bytes.
+    assert agent._history[0] == call["messages"][0]
 
 
 @pytest.mark.asyncio
@@ -1294,10 +986,12 @@ async def test_agent_runtime_context_does_not_precede_current_user_text() -> Non
         and message.content.startswith("[Runtime context for this turn]")
         for message in first_call[:-1]
     )
-    assert agent._history[0] == Message(role="user", content=first_prompt)
+    assert agent._history[0] == first_call[-1]
 
     second_call = provider.calls[1]["messages"]
-    assert second_call[0] == Message(role="user", content=first_prompt)
+    # The first turn is replayed byte for byte, its timestamp included; the
+    # second turn carries its own timestamp. Nothing older is rewritten.
+    assert second_call[0] == first_call[-1]
     assert second_call[1] == Message(
         role="assistant",
         content=[ContentBlockText(text="ok")],
@@ -1352,55 +1046,48 @@ def test_turn_runner_preserves_joined_system_prompt_when_cache_disabled() -> Non
     assert request_context_prompt is None
 
 
-def test_agent_adjusts_request_context_indexes_after_compaction() -> None:
-    entries = [
-        {"role": "user", "content": "old question"},
-        {"role": "assistant", "content": "old answer"},
-        {"role": "user", "content": "[Available skills for this turn]\nskill"},
-        {"role": "user", "content": "current question"},
-    ]
-    kept_entries = [
-        {"role": "assistant", "content": "old answer"},
-        {"role": "user", "content": "current question"},
-    ]
+@pytest.mark.asyncio
+async def test_compaction_keeps_the_current_turn_with_its_context_blocks() -> None:
+    """The single-summary shape keeps the current turn's input message --
+    volatile context blocks included -- verbatim after the summary exchange."""
 
-    request_idx = Agent._adjust_compacted_insert_index(
-        entries,
-        kept_entries,
-        2,
-        summary_present=True,
-    )
-    runtime_idx = Agent._adjust_compacted_insert_index(
-        entries,
-        kept_entries,
-        3,
-        summary_present=True,
-    )
+    async def _summarizer(_messages: list[Message], _previous: str | None) -> tuple[str, str]:
+        return "summary", "llm"
 
-    compacted_messages = [
-        Message(role="user", content="[Context summary]\nsummary"),
-        Message(role="assistant", content="Understood. Continuing from summary."),
+    from agentos.engine.compaction_service import CompactionService
+
+    current = Message(
+        role="user",
+        content=(
+            "current question\n\n[Request context for this turn]\nvolatile"
+            "\n\n[Runtime context for this turn]\nnow"
+        ),
+    )
+    messages = [
+        Message(role="user", content="old question"),
         Message(role="assistant", content="old answer"),
-        Message(role="user", content="current question"),
+        current,
     ]
-    request_context = Message(role="user", content="[Request context for this turn]\nvolatile")
-    runtime_context = Message(role="user", content="[Runtime context for this turn]\nnow")
+    service = CompactionService(provider=None, summarizer=_summarizer)
 
-    request_messages = Agent._with_request_context_messages(
-        compacted_messages,
-        request_context,
-        request_idx,
-        runtime_context,
-        runtime_idx,
+    result = await service.compact(
+        messages,
+        turn_input_index=2,
+        estimated_tokens=10_000,
+        window_tokens=1_000,
+        message_tokens=lambda items: sum(
+            4_950 if str(m.content).startswith("old") else 10 for m in items
+        ),
     )
 
-    assert [message.content for message in request_messages] == [
+    assert result.compacted
+    assert [message.content for message in result.messages] == [
         "[Context summary]\nsummary",
         "Understood. Continuing from summary.",
-        "old answer",
-        "[Request context for this turn]\nvolatile",
-        "current question\n\n[Runtime context for this turn]\nnow",
+        current.content,
     ]
+    assert result.messages[2] is current
+    assert result.turn_input_index == 2
 
 
 @pytest.mark.asyncio
@@ -1431,25 +1118,22 @@ async def test_agent_request_context_is_request_only_after_history() -> None:
     assert call["config"].system == "stable system"
     assert call["config"].cache_breakpoints == [{"text": "stable system", "cache": "true"}]
     assert "<memory_context>volatile recall</memory_context>" not in call["config"].system
-    assert [message.role for message in call["messages"]] == [
-        "user",
-        "assistant",
-        "user",
-        "user",
-        "user",
-    ]
+    # History is untouched; skills, request context and the timestamp are
+    # trailing blocks of the CURRENT user message, in that order.
+    assert [message.role for message in call["messages"]] == ["user", "assistant", "user"]
     assert call["messages"][0] == Message(role="user", content="old question")
     assert call["messages"][1] == Message(role="assistant", content="old answer")
-    assert "[Available skills for this turn]" in call["messages"][2].content
-    assert "[Request context for this turn]" in call["messages"][3].content
-    assert "<memory_context>volatile recall</memory_context>" in call["messages"][3].content
-    assert call["messages"][4].content.startswith("hello")
-    assert "[Runtime context for this turn]" in call["messages"][4].content
-    assert all(
-        "<memory_context>volatile recall</memory_context>" not in message.content
-        for message in agent._history
-        if isinstance(message.content, str)
+    current = call["messages"][2].content
+    assert current.startswith("hello\n\n[Available skills for this turn]")
+    assert current.index("[Available skills for this turn]") < current.index(
+        "[Request context for this turn]"
     )
+    assert current.index("[Request context for this turn]") < current.index(
+        "[Runtime context for this turn]"
+    )
+    assert "<memory_context>volatile recall</memory_context>" in current
+    # ... and persisted with that message, so the next turn replays it as is.
+    assert agent._history[2] == call["messages"][2]
 
 
 @pytest.mark.asyncio
@@ -1586,11 +1270,39 @@ async def test_agent_request_context_repeats_across_tool_loop_without_persisting
         ]
         assert len(request_context_messages) == 1
         assert "[Request context for this turn]" in request_context_messages[0].content
-    assert all(
-        "<memory_context>volatile recall</memory_context>" not in message.content
-        for message in agent._history
-        if isinstance(message.content, str)
+    # The second request repeats the first byte for byte as its prefix.
+    first, second = (call["messages"] for call in provider.calls)
+    assert second[: len(first)] == first
+
+
+@pytest.mark.asyncio
+async def test_unchanged_skills_and_request_context_are_not_repeated_next_turn() -> None:
+    provider = CapturingProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            system_prompt="stable system",
+            request_context_prompt="<memory_context>stable recall</memory_context>",
+            skills_context_prompt="<skill id='memory'>Memory helper</skill>",
+            max_iterations=1,
+        ),
     )
+
+    _ = [event async for event in agent.run_turn("first")]
+    _ = [event async for event in agent.run_turn("second")]
+    agent.config.skills_context_prompt = "<skill id='memory'>Memory helper v2</skill>"
+    _ = [event async for event in agent.run_turn("third")]
+
+    second_input = provider.calls[1]["messages"][-1].content
+    third_input = provider.calls[2]["messages"][-1].content
+    assert "[Available skills for this turn]" not in second_input
+    assert "[Request context for this turn]" not in second_input
+    assert "[Runtime context for this turn]" in second_input
+    assert "Memory helper v2" in third_input
+    assert "[Request context for this turn]" not in third_input
+    # Every request starts with the previous request's messages, unchanged.
+    for earlier, later in zip(provider.calls, provider.calls[1:], strict=False):
+        assert later["messages"][: len(earlier["messages"])] == earlier["messages"]
 
 
 @pytest.mark.asyncio
@@ -1649,7 +1361,9 @@ async def test_agent_canonicalizes_large_tool_result_for_event_history_and_provi
     assert len(replay_result.content) < len(raw_output)
 
 
-def test_agent_provider_request_messages_project_overflow_retry_tool_results() -> None:
+def test_agent_provider_request_messages_are_the_sealed_transcript() -> None:
+    """The request view does no per-call rewriting: a sealed transcript is sent
+    as is, and an unsealed oversized result is shrunk by the seal, not here."""
     agent = Agent(
         provider=CapturingProvider(),
         config=AgentConfig(
@@ -1668,13 +1382,12 @@ def test_agent_provider_request_messages_project_overflow_retry_tool_results() -
         ),
     ]
 
-    request_messages = agent._provider_request_messages(
-        messages,
-        request_context_message=None,
-        request_context_insert_index=0,
-        runtime_context_message=Message(role="user", content="[Runtime context]"),
-        runtime_context_insert_index=len(messages),
-    )
+    unsealed_view = agent._provider_request_messages(messages)
+    assert unsealed_view == messages
+
+    sealed = list(messages)
+    agent._seal_transcript(sealed, 0)
+    request_messages = agent._provider_request_messages(sealed)
 
     original_result = messages[1].content[0]
     assert isinstance(original_result, ContentBlockToolResult)
@@ -1690,7 +1403,7 @@ def test_agent_provider_request_messages_project_overflow_retry_tool_results() -
     assert "[tool_result_projection]" in request_result.content
     assert "tool_result_handle:" not in request_result.content
     assert len(request_result.content) < len(raw_output)
-
+    assert agent._provider_request_messages(sealed) == request_messages
 
 
 @pytest.mark.asyncio
@@ -1792,17 +1505,14 @@ async def test_agent_refuses_copied_tool_argument_projection_without_dispatch(
     assert not result_event.arguments["code"].startswith("[tool_use_argument_projection]\n")
     assert "tool_use_argument_projection" not in result_event.arguments["code"]
     assert result_event.arguments["timeout"] == 99
-    history_block = next(
-        block
-        for message in agent._history
-        if message.role == "assistant" and isinstance(message.content, list)
-        for block in message.content
-        if isinstance(block, ContentBlockToolUse) and block.id == "tool-2"
+    # The refused call is stripped from the transcript before any request
+    # carries it (append time), so it is neither sent nor persisted.
+    assert not _history_has_tool_use(agent, "tool-2")
+    assert not any(
+        "tool-2" in json.dumps(message.model_dump(mode="json"))
+        for call in provider.calls
+        for message in call["messages"]
     )
-    assert history_block.input["code"] == result_event.arguments["code"]
-    assert not history_block.input["code"].startswith("[tool_use_argument_projection]\n")
-    assert "tool_use_argument_projection" not in history_block.input["code"]
-    assert history_block.input["timeout"] == 99
 
     follow_up_events = [event async for event in agent.run_turn("continue")]
     assert any(event.kind == "done" for event in follow_up_events)
@@ -1864,17 +1574,7 @@ async def test_agent_refuses_unrestorable_tool_argument_projection(tmp_path) -> 
     assert "Projected tool argument" not in result_event.result
     assert not result_event.arguments["code"].startswith("[tool_use_argument_projection]\n")
     assert "tool_use_argument_projection" not in result_event.arguments["code"]
-
-    history_block = next(
-        block
-        for message in agent._history
-        if message.role == "assistant" and isinstance(message.content, list)
-        for block in message.content
-        if isinstance(block, ContentBlockToolUse) and block.id == "tool-2"
-    )
-    assert history_block.input["code"] == result_event.arguments["code"]
-    assert not history_block.input["code"].startswith("[tool_use_argument_projection]\n")
-    assert "tool_use_argument_projection" not in history_block.input["code"]
+    assert not _history_has_tool_use(agent, "tool-2")
 
     second_events = [event async for event in agent.run_turn("hi")]
 
@@ -1929,16 +1629,7 @@ async def test_agent_refuses_copied_provider_compacted_tool_arguments(tmp_path) 
     assert "provider-only compacted tool arguments" not in result_event.result
     assert "ProjectedToolArgumentsError" not in result_event.result
     assert "_agentos_compacted_tool_arguments" not in result_event.arguments
-
-    history_block = next(
-        block
-        for message in agent._history
-        if message.role == "assistant" and isinstance(message.content, list)
-        for block in message.content
-        if isinstance(block, ContentBlockToolUse) and block.id == "tool-compact"
-    )
-    assert history_block.input == result_event.arguments
-    assert "_agentos_compacted_tool_arguments" not in history_block.input
+    assert not _history_has_tool_use(agent, "tool-compact")
 
     follow_up_events = [event async for event in agent.run_turn("continue")]
     assert any(event.kind == "done" for event in follow_up_events)
@@ -1990,6 +1681,15 @@ async def test_agent_repair_prompt_keeps_provider_request_from_ending_on_assista
     assert "provider_context_omitted" not in replay_payload
 
 
+def _history_has_tool_use(agent: Agent, tool_use_id: str) -> bool:
+    return any(
+        isinstance(block, ContentBlockToolUse) and block.id == tool_use_id
+        for message in agent._history
+        if isinstance(message.content, list)
+        for block in message.content
+    )
+
+
 def test_agent_repair_prompt_handles_tool_use_without_tool_result() -> None:
     agent = Agent(provider=CapturingProvider(), config=AgentConfig())
     messages = [
@@ -2010,7 +1710,8 @@ def test_agent_repair_prompt_handles_tool_use_without_tool_result() -> None:
         ),
     ]
 
-    stripped = agent._strip_provider_context_marker_replay_for_provider(messages)
+    stripped = list(messages)
+    agent._seal_transcript(stripped, 1)
 
     assert stripped[-1].role == "user"
     assert isinstance(stripped[-1].content, str)
@@ -2131,7 +1832,11 @@ async def test_agent_preserves_direct_deepseek_v4_reasoning_without_capabilities
 
 
 @pytest.mark.asyncio
-async def test_agent_drops_reasoning_content_when_model_is_not_deepseek() -> None:
+async def test_agent_keeps_reasoning_in_the_transcript_for_reasoning_models() -> None:
+    """Replayed reasoning is no longer dropped on load by default: it stays in
+    the append-only transcript and each provider decides what to send (the
+    OpenAI-compatible provider still omits ``reasoning_content`` for models
+    that do not take it)."""
     provider = CapturingProvider()
     agent = Agent(
         provider=provider,
@@ -2151,7 +1856,58 @@ async def test_agent_drops_reasoning_content_when_model_is_not_deepseek() -> Non
             Message(role="user", content="old question"),
             Message(
                 role="assistant",
-                content=[ContentBlockText(text="old answer")],
+                content=[
+                    ContentBlockThinking(thinking="block one", signature="sig-1"),
+                    ContentBlockRedactedThinking(data="opaque"),
+                    ContentBlockText(text="old answer"),
+                ],
+                reasoning_content="I reasoned before answering.",
+                reasoning_details=[{"type": "reasoning.text", "text": "r", "index": 0}],
+            ),
+        ]
+    )
+
+    events = [event async for event in agent.run_turn("continue")]
+
+    assert any(event.kind == "done" for event in events)
+    sent_assistant = provider.calls[0]["messages"][1]
+    assert sent_assistant == agent._history[1]
+    assert sent_assistant.reasoning_content == "I reasoned before answering."
+    assert sent_assistant.reasoning_details == [
+        {"type": "reasoning.text", "text": "r", "index": 0}
+    ]
+    assert [getattr(block, "type", None) for block in sent_assistant.content] == [
+        "thinking",
+        "redacted_thinking",
+        "text",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_drops_replayed_reasoning_only_for_models_without_reasoning() -> None:
+    """Dropping reasoning on load is opt-in, decided by model capabilities."""
+    provider = CapturingProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            model_id="plain-chat-model",
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=False,
+                supports_tools=True,
+                reasoning_format="none",
+            ),
+        ),
+    )
+    agent.set_history(
+        [
+            Message(role="user", content="old question"),
+            Message(
+                role="assistant",
+                content=[
+                    ContentBlockThinking(thinking="block one", signature="sig-1"),
+                    ContentBlockText(text="old answer"),
+                ],
                 reasoning_content="I reasoned before answering.",
             ),
         ]
@@ -2160,6 +1916,6 @@ async def test_agent_drops_reasoning_content_when_model_is_not_deepseek() -> Non
     events = [event async for event in agent.run_turn("continue")]
 
     assert any(event.kind == "done" for event in events)
-    assert provider.calls
     sent_assistant = provider.calls[0]["messages"][1]
     assert sent_assistant.reasoning_content is None
+    assert [getattr(block, "type", None) for block in sent_assistant.content] == ["text"]

@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
-
-from agentos.env import trust_env as _trust_env
+import structlog
 
 from .reasoning import ThinkTagStreamSplitter
 from .retry_after import retry_after_from_response
+from .transport import (
+    PooledHttpClient,
+    StreamIdleTimeoutError,
+    guard_tool_stream,
+    is_nonempty_line,
+    iter_lines_with_idle_timeout,
+    resolve_stream_idle_timeout,
+    stream_idle_error_event,
+    stream_timeouts,
+)
 from .types import (
     ChatConfig,
     DoneEvent,
@@ -29,7 +39,14 @@ from .types import (
     normalize_stop_reason,
 )
 
+log = structlog.get_logger(__name__)
+
 _OLLAMA_DEFAULT_BASE = "http://localhost:11434"
+#: Operator override for ``options.num_ctx`` (wins over the caller's window).
+_OLLAMA_NUM_CTX_ENV = "AGENTOS_OLLAMA_NUM_CTX"
+#: Largest ``num_ctx`` derived from the caller's window. 32k holds the agent's
+#: system prompt, tool schemas and a working history; more needs the env var.
+_OLLAMA_NUM_CTX_CEILING = 32_768
 _OLLAMA_ERROR_BODY_LIMIT = 2000
 # Connect budget for a daemon on the same machine. See _stream_timeout.
 _OLLAMA_CONNECT_TIMEOUT_S = 5.0
@@ -218,8 +235,76 @@ def _stream_timeout(timeout: float) -> httpx.Timeout:
     ``timeout`` — a first token can legitimately wait for the model to load.
     """
 
-    connect = min(_OLLAMA_CONNECT_TIMEOUT_S, max(timeout, 1.0))
-    return httpx.Timeout(timeout, connect=connect, write=10.0, pool=10.0)
+    return stream_timeouts(
+        timeout,
+        connect_default=_OLLAMA_CONNECT_TIMEOUT_S,
+        honour_connect_env=False,
+    )
+
+
+def _ollama_num_ctx(cfg: ChatConfig) -> int | None:
+    """``options.num_ctx`` to send, or ``None`` to keep Ollama's default.
+
+    Ollama's default context is a few thousand tokens and it silently drops
+    the start of a longer prompt (the system prompt first). The caller's
+    context window is sent when it gave one, capped at
+    :data:`_OLLAMA_NUM_CTX_CEILING`: an unknown local model falls back to the
+    engine's 200k default window, and Ollama allocates the KV cache for the
+    whole ``num_ctx`` up front, which on a small GPU means an out-of-memory
+    load or a CPU offload many times slower. ``AGENTOS_OLLAMA_NUM_CTX``
+    overrides both (larger or smaller).
+    """
+    raw = os.environ.get(_OLLAMA_NUM_CTX_ENV, "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            log.warning("ollama.invalid_num_ctx_env", raw=raw)
+        else:
+            if value > 0:
+                return value
+    if cfg.context_window_tokens <= 0:
+        return None
+    return min(cfg.context_window_tokens, _OLLAMA_NUM_CTX_CEILING)
+
+
+#: Ollama model families with a native ``think`` switch (Ollama docs,
+#: "Thinking"): a model outside this list only gets ``think`` when its
+#: capabilities say it reasons.
+_OLLAMA_THINKING_FAMILIES = ("qwen3", "deepseek-r1", "deepseek-v3.1", "gpt-oss", "magistral")
+
+#: Variants of those families that do not think (qwen3-coder, *-instruct).
+_OLLAMA_NON_THINKING_VARIANTS = ("coder", "instruct")
+
+_GPT_OSS_THINK_LEVELS = {"minimal": "low", "low": "low", "medium": "medium", "high": "high"}
+
+
+def _ollama_think(cfg: ChatConfig, model: str) -> bool | str | None:
+    """``think`` to send, or ``None`` to leave the model's default.
+
+    Only sent when thinking is on and the model is known to reason: Ollama
+    answers ``think`` for a non-thinking model with a 400, and the catalog
+    has no live capability data for local models, so a reasoning capability
+    or a known thinking family is required. gpt-oss takes a level instead of
+    a boolean.
+    """
+    if not cfg.thinking:
+        return None
+    caps = cfg.model_capabilities
+    model_l = model.lower()
+    known_family = any(family in model_l for family in _OLLAMA_THINKING_FAMILIES) and not any(
+        variant in model_l for variant in _OLLAMA_NON_THINKING_VARIANTS
+    )
+    if not known_family and (caps is None or not caps.supports_reasoning):
+        return None
+    if caps is not None and caps.reasoning_format == "think_tags":
+        # Reasoning arrives inline as <think> tags; the native channel is not
+        # what this model uses.
+        return None
+    if "gpt-oss" in model_l:
+        level = str(cfg.thinking_level or "").strip().lower()
+        return _GPT_OSS_THINK_LEVELS.get(level, "medium")
+    return True
 
 
 def _unreachable_message(exc: Exception, base_url: str) -> str:
@@ -280,6 +365,17 @@ class OllamaProvider:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._proxy = proxy or None
+        self._http = PooledHttpClient(proxy=self._proxy)
+
+    async def aclose(self) -> None:
+        """Close the pooled HTTP client (a later request opens a new one)."""
+        await self._http.aclose()
+
+    async def __aenter__(self) -> OllamaProvider:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        await self.aclose()
 
     @property
     def model(self) -> str:
@@ -297,7 +393,11 @@ class OllamaProvider:
         config: ChatConfig | None = None,
     ) -> AsyncIterator[StreamEvent]:
         cfg = config or ChatConfig()
-        return self._stream(messages, tools, cfg)
+        return guard_tool_stream(
+            lambda: self._stream(messages, tools, cfg),
+            provider=self.provider_name,
+            model=self._model,
+        )
 
     async def _stream(
         self,
@@ -323,6 +423,12 @@ class OllamaProvider:
             # and Anthropic payload["stop_sequences"]. Dropping them let the model run
             # past a prompt boundary and hallucinate the next turn (#3033).
             payload["options"]["stop"] = list(cfg.stop_sequences)
+        num_ctx = _ollama_num_ctx(cfg)
+        if num_ctx is not None:
+            payload["options"]["num_ctx"] = num_ctx
+        think = _ollama_think(cfg, self._model)
+        if think is not None:
+            payload["think"] = think
         if tools:
             payload["tools"] = [_build_ollama_tool(t) for t in tools]
             # Ollama's native /api/chat exposes no forced tool_choice parameter,
@@ -346,131 +452,133 @@ class OllamaProvider:
             else None
         )
 
+        idle_timeout = resolve_stream_idle_timeout(cfg.stream_idle_timeout)
         try:
-            async with httpx.AsyncClient(
+            client = self._http.get()
+            async with client.stream(
+                "POST",
+                f"{self._base_url}/api/chat",
+                json=payload,
                 timeout=_stream_timeout(cfg.timeout),
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-            ) as client:
-                async with client.stream(
-                    "POST",
-                    f"{self._base_url}/api/chat",
-                    json=payload,
-                ) as response:
-                    if response.status_code != 200:
-                        body = await response.aread()
-                        yield ErrorEvent(
-                            message=_http_error_message(
-                                response.status_code,
-                                _format_error_body(body),
-                                self._model,
-                                self._base_url,
-                            ),
-                            code=str(response.status_code),
-                            retry_after_seconds=retry_after_from_response(response),
-                        )
+            ) as response:
+                if response.status_code != 200:
+                    body = await response.aread()
+                    yield ErrorEvent(
+                        message=_http_error_message(
+                            response.status_code,
+                            _format_error_body(body),
+                            self._model,
+                            self._base_url,
+                        ),
+                        code=str(response.status_code),
+                        retry_after_seconds=retry_after_from_response(response),
+                    )
+                    return
+
+                async for line in iter_lines_with_idle_timeout(
+                    response.aiter_lines(), idle_timeout, is_data=is_nonempty_line
+                ):
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if not isinstance(chunk, dict):
+                        continue
+
+                    # Ollama reports a failure after the 200 as an NDJSON
+                    # line ``{"error": "..."}`` and ends the stream with no
+                    # ``done`` chunk. It carried no ``message`` so it was
+                    # skipped and the loop fell through to a DoneEvent,
+                    # which the runtime recorded as a success (#2118).
+                    raw_error = chunk.get("error")
+                    if raw_error:
+                        yield _mid_stream_error_event(raw_error)
                         return
 
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+                    raw_message = chunk.get("message", {})
+                    msg_chunk = raw_message if isinstance(raw_message, dict) else {}
+                    chunk_model = chunk.get("model")
+                    if isinstance(chunk_model, str) and chunk_model:
+                        response_model = chunk_model
 
-                        if not isinstance(chunk, dict):
-                            continue
+                    # Native thinking channel (Ollama `think` support)
+                    thinking = msg_chunk.get("thinking", "")
+                    if isinstance(thinking, str) and thinking:
+                        reasoning_parts.append(thinking)
+                        yield ThinkingDeltaEvent(text=thinking)
 
-                        # Ollama reports a failure after the 200 as an NDJSON
-                        # line ``{"error": "..."}`` and ends the stream with no
-                        # ``done`` chunk. It carried no ``message`` so it was
-                        # skipped and the loop fell through to a DoneEvent,
-                        # which the runtime recorded as a success (#2118).
-                        raw_error = chunk.get("error")
-                        if raw_error:
-                            yield _mid_stream_error_event(raw_error)
-                            return
+                    # Text content
+                    text = msg_chunk.get("content", "")
+                    if isinstance(text, str) and text:
+                        if think_splitter is not None:
+                            visible, think_text = think_splitter.feed(text)
+                            if visible:
+                                yield TextDeltaEvent(text=visible)
+                            if think_text:
+                                reasoning_parts.append(think_text)
+                                yield ThinkingDeltaEvent(text=think_text)
+                        else:
+                            yield TextDeltaEvent(text=text)
 
-                        raw_message = chunk.get("message", {})
-                        msg_chunk = raw_message if isinstance(raw_message, dict) else {}
-                        chunk_model = chunk.get("model")
-                        if isinstance(chunk_model, str) and chunk_model:
-                            response_model = chunk_model
+                    # Ollama delivers tool_calls in a single chunk (non-streaming)
+                    raw_tool_calls = msg_chunk.get("tool_calls", [])
+                    if isinstance(raw_tool_calls, list):
+                        for raw_tool_call in raw_tool_calls:
+                            tool_call = _parse_tool_call(
+                                raw_tool_call,
+                                len(pending_tool_calls),
+                            )
+                            if tool_call is not None:
+                                pending_tool_calls.append(tool_call)
 
-                        # Native thinking channel (Ollama `think` support)
-                        thinking = msg_chunk.get("thinking", "")
-                        if isinstance(thinking, str) and thinking:
-                            reasoning_parts.append(thinking)
-                            yield ThinkingDeltaEvent(text=thinking)
+                    # Final chunk carries usage stats
+                    if chunk.get("done"):
+                        input_tokens = _coerce_int(chunk.get("prompt_eval_count"))
+                        output_tokens = _coerce_int(chunk.get("eval_count"))
+                        raw_done_reason = chunk.get("done_reason")
+                        if isinstance(raw_done_reason, str) and raw_done_reason:
+                            done_reason = raw_done_reason
 
-                        # Text content
-                        text = msg_chunk.get("content", "")
-                        if isinstance(text, str) and text:
-                            if think_splitter is not None:
-                                visible, think_text = think_splitter.feed(text)
-                                if visible:
-                                    yield TextDeltaEvent(text=visible)
-                                if think_text:
-                                    reasoning_parts.append(think_text)
-                                    yield ThinkingDeltaEvent(text=think_text)
-                            else:
-                                yield TextDeltaEvent(text=text)
+                # Resolve any partial <think> tag held back at end of stream.
+                if think_splitter is not None:
+                    visible, think_text = think_splitter.flush()
+                    if visible:
+                        yield TextDeltaEvent(text=visible)
+                    if think_text:
+                        reasoning_parts.append(think_text)
+                        yield ThinkingDeltaEvent(text=think_text)
 
-                        # Ollama delivers tool_calls in a single chunk (non-streaming)
-                        raw_tool_calls = msg_chunk.get("tool_calls", [])
-                        if isinstance(raw_tool_calls, list):
-                            for raw_tool_call in raw_tool_calls:
-                                tool_call = _parse_tool_call(
-                                    raw_tool_call,
-                                    len(pending_tool_calls),
-                                )
-                                if tool_call is not None:
-                                    pending_tool_calls.append(tool_call)
-
-                        # Final chunk carries usage stats
-                        if chunk.get("done"):
-                            input_tokens = _coerce_int(chunk.get("prompt_eval_count"))
-                            output_tokens = _coerce_int(chunk.get("eval_count"))
-                            raw_done_reason = chunk.get("done_reason")
-                            if isinstance(raw_done_reason, str) and raw_done_reason:
-                                done_reason = raw_done_reason
-
-                    # Resolve any partial <think> tag held back at end of stream.
-                    if think_splitter is not None:
-                        visible, think_text = think_splitter.flush()
-                        if visible:
-                            yield TextDeltaEvent(text=visible)
-                        if think_text:
-                            reasoning_parts.append(think_text)
-                            yield ThinkingDeltaEvent(text=think_text)
-
-                    # Emit tool events after streaming completes
-                    for call in pending_tool_calls:
-                        yield ToolUseStartEvent(tool_use_id=call["id"], tool_name=call["name"])
-                        args_json = json.dumps(call["arguments"])
-                        yield ToolUseDeltaEvent(tool_use_id=call["id"], json_fragment=args_json)
-                        yield ToolUseEndEvent(
-                            tool_use_id=call["id"],
-                            tool_name=call["name"],
-                            arguments=call["arguments"],
-                        )
-
-                    yield DoneEvent(
-                        # Ollama parses tool calls whole, so a call that arrived
-                        # is runnable whatever ``done_reason`` says.
-                        stop_reason=(
-                            StopReason.TOOL_USE
-                            if pending_tool_calls
-                            else normalize_stop_reason(done_reason)
-                        ),
-                        raw_stop_reason=done_reason,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        reasoning_content="".join(reasoning_parts) or None,
-                        model=response_model,
+                # Emit tool events after streaming completes
+                for call in pending_tool_calls:
+                    yield ToolUseStartEvent(tool_use_id=call["id"], tool_name=call["name"])
+                    args_json = json.dumps(call["arguments"])
+                    yield ToolUseDeltaEvent(tool_use_id=call["id"], json_fragment=args_json)
+                    yield ToolUseEndEvent(
+                        tool_use_id=call["id"],
+                        tool_name=call["name"],
+                        arguments=call["arguments"],
                     )
 
+                yield DoneEvent(
+                    # Ollama parses tool calls whole, so a call that arrived
+                    # is runnable whatever ``done_reason`` says.
+                    stop_reason=(
+                        StopReason.TOOL_USE
+                        if pending_tool_calls
+                        else normalize_stop_reason(done_reason)
+                    ),
+                    raw_stop_reason=done_reason,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    reasoning_content="".join(reasoning_parts) or None,
+                    model=response_model,
+                )
+
+        except StreamIdleTimeoutError as exc:
+            yield stream_idle_error_event(exc)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             yield ErrorEvent(
                 message=_unreachable_message(exc, self._base_url),
@@ -483,22 +591,18 @@ class OllamaProvider:
 
     async def list_models(self) -> list[ModelInfo]:
         try:
-            async with httpx.AsyncClient(
-                timeout=5.0,
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-            ) as client:
-                resp = await client.get(f"{self._base_url}/api/tags")
-                resp.raise_for_status()
-                data = resp.json()
-                return [
-                    ModelInfo(
-                        provider=self.provider_name,
-                        model_id=m["name"],
-                        display_name=m.get("name", ""),
-                        context_window=_context_window(m),
-                    )
-                    for m in data.get("models", [])
-                ]
+            client = self._http.get()
+            resp = await client.get(f"{self._base_url}/api/tags", timeout=5.0)
+            resp.raise_for_status()
+            data = resp.json()
+            return [
+                ModelInfo(
+                    provider=self.provider_name,
+                    model_id=m["name"],
+                    display_name=m.get("name", ""),
+                    context_window=_context_window(m),
+                )
+                for m in data.get("models", [])
+            ]
         except Exception:
             return []

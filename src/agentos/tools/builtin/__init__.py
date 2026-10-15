@@ -27,6 +27,7 @@ _NAMES = [
     "sessions",
     "session_search",
     "shell",
+    "tool_search",
     "web",
     "web_fetch",
     "x_search",

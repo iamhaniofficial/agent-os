@@ -100,9 +100,10 @@ def test_subagent_prompt_compact_keeps_only_agents_and_tools(tmp_path) -> None:
         session_key="agent:main:subagent:run-1",
     )
 
-    assert isinstance(assembled, tuple)
-    dynamic_suffix = assembled[1]
-    assert "AGENTS.md body" in dynamic_suffix
-    assert "TOOLS.md body" in dynamic_suffix
-    assert "USER.md body" not in dynamic_suffix
-    assert "SOUL.md body" not in dynamic_suffix
+    # Workspace files are frozen per session, so they live in the cached
+    # system prompt (no per-turn dynamic suffix is left here).
+    assert isinstance(assembled, str)
+    assert "AGENTS.md body" in assembled
+    assert "TOOLS.md body" in assembled
+    assert "USER.md body" not in assembled
+    assert "SOUL.md body" not in assembled

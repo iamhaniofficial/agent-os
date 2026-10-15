@@ -350,7 +350,8 @@ class MemorySyncManager:
         it unchanged.
         """
         if changes is None or deletes is None:
-            current = self._scan_files()
+            # A recursive walk of memory/ and knowledge_base/: off the loop.
+            current = await asyncio.to_thread(self._scan_files)
 
             changes = set()
             deletes = set()
@@ -387,10 +388,12 @@ class MemorySyncManager:
                 if is_kb:
                     from .ingest import extract_document_text
 
-                    content = extract_document_text(abs_path)
+                    content = await asyncio.to_thread(extract_document_text, abs_path)
                     source = MemorySource.knowledge_base
                 else:
-                    content = abs_path.read_text(encoding="utf-8", errors="replace")
+                    content = await asyncio.to_thread(
+                        abs_path.read_text, encoding="utf-8", errors="replace"
+                    )
                     source = MemorySource.memory
                 n = await self._store.index_file(
                     path=rel_path,
@@ -458,7 +461,7 @@ class MemorySyncManager:
                 if not self._running:
                     break
 
-                current = self._scan_files()
+                current = await asyncio.to_thread(self._scan_files)
                 now = asyncio.get_running_loop().time()
 
                 for path, mtime in current.items():

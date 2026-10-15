@@ -18,7 +18,19 @@ app = typer.Typer(help="Inspect the fixed per-request context cost.")
 _PROFILE_ORDER = ("full", "coding", "messaging", "memory_only", "minimal")
 
 
-def _measure() -> ContextBreakdown:
+def _defer_loading_configured() -> bool:
+    """``tools.defer_loading`` as the gateway would resolve it (file + env)."""
+
+    try:
+        from agentos.gateway.config import GatewayConfig
+        from agentos.tools.deferred import defer_loading_enabled
+
+        return defer_loading_enabled(GatewayConfig.load())
+    except Exception:  # noqa: BLE001 - an unreadable config keeps the default
+        return True
+
+
+def _measure(defer_loading: bool = True) -> ContextBreakdown:
     from agentos.engine.context_breakdown import build_breakdown, tokens_from_chars
     from agentos.tools.policy_config import profile_allowlist
     from agentos.tools.registry import get_default_registry
@@ -27,9 +39,11 @@ def _measure() -> ContextBreakdown:
     registry = get_default_registry()
     available = frozenset(registry.list_names())
 
+    # What a request carries, so deferred tools (``tools.defer_loading``) are
+    # priced as the tool_search catalog line they cost, not their full schema.
     def cost_for(allowed: set[str] | None) -> tuple[int, int]:
         ctx = ToolContext(allowed_tools=allowed)
-        definitions = registry.to_tool_definitions(ctx)
+        definitions = registry.request_tool_definitions(ctx, defer_loading=defer_loading)
         from agentos.engine.context_breakdown import tool_payload_chars
 
         chars = sum(tool_payload_chars(d) for d in definitions)
@@ -43,8 +57,17 @@ def _measure() -> ContextBreakdown:
             continue
         profiles[name] = cost_for(allowed)
 
-    definitions = registry.to_tool_definitions(ToolContext())
+    definitions = registry.request_tool_definitions(ToolContext(), defer_loading=defer_loading)
     return build_breakdown(tools=definitions, profiles=profiles)
+
+
+def _deferred_count(defer_loading: bool = True) -> int:
+    from agentos.tools.registry import get_default_registry
+    from agentos.tools.types import ToolContext
+
+    if not defer_loading:
+        return 0
+    return len(get_default_registry().deferred_tools(ToolContext()))
 
 
 @app.callback(invoke_without_command=True)
@@ -59,10 +82,16 @@ def context(
     turn, so it is usually the largest thing an operator can actually change.
     """
 
-    breakdown = _measure()
+    defer_loading = _defer_loading_configured()
+    breakdown = _measure(defer_loading)
+    deferred_count = _deferred_count(defer_loading)
 
     if json_output:
-        print_json(breakdown.to_dict())
+        payload = breakdown.to_dict()
+        # Same facts as the text output's deferred line.
+        payload["defer_loading"] = defer_loading
+        payload["deferred_tools"] = deferred_count
+        print_json(payload)
         return
 
     console.print()
@@ -80,6 +109,13 @@ def context(
             f"{section.tokens:,}",
         )
     console.print(section_table)
+    if deferred_count:
+        console.print(
+            f"{deferred_count} more tools are deferred: left out of each request until "
+            "the model loads them with tool_search. Set tools.defer_loading = false "
+            "to send every tool.",
+            style="dim",
+        )
 
     largest = breakdown.largest_tools(top)
     if largest:

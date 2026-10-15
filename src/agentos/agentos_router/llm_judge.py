@@ -38,6 +38,7 @@ from agentos.agentos_router.strategy_common import (
     truncate_body,
 )
 from agentos.provider.selector import build_provider
+from agentos.provider.transport import aclose_provider
 from agentos.provider.types import ChatConfig, Message, ToolDefinition, ToolInputSchema
 from agentos.router_tiers import (
     DEFAULT_TEXT_TIER,
@@ -717,6 +718,8 @@ class LLMJudgeStrategy:
         except Exception as exc:  # noqa: BLE001 - degrade to judge_unavailable
             log.warning("llm_judge.call_failed", error=str(exc), exc_info=True)
             return self._unavailable_classify(valid_tiers, flags, reason=str(exc))
+        finally:  # the judge may run on a per-call loop: do not leak its sockets
+            await aclose_provider(self._provider)
 
         if verdict is None:
             return self._unavailable_classify(valid_tiers, flags, reason="unparseable judge output")

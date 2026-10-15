@@ -7,6 +7,7 @@ This module NEVER re-executes tools. It only reads
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from agentos.observability.decision_log import (
     DecisionEntry,
@@ -53,8 +54,9 @@ def format_transcript(entry: DecisionEntry) -> str:
             f"system={entry.system_prompt_hash} "
             f"tools={entry.tool_list_hash}"
         ),
-        "  Pipeline steps:",
     ]
+    lines.extend(_timing_lines(entry.timing))
+    lines.append("  Pipeline steps:")
     for step in entry.pipeline_steps:
         status = "OK" if step.applied else f"FAIL({step.fallback_reason})"
         lines.append(
@@ -64,3 +66,53 @@ def format_transcript(entry: DecisionEntry) -> str:
             f"confidence={step.confidence}"
         )
     return "\n".join(lines)
+
+
+def _timing_lines(timing: dict[str, Any]) -> list[str]:
+    """Render the schema-16 ``timing`` breakdown; nothing for older rows."""
+
+    if not isinstance(timing, dict) or not timing:
+        return []
+
+    def val(key: str, source: dict[str, Any] = timing) -> str:
+        value = source.get(key)
+        return "-" if value is None else f"{value}"
+
+    def ms(key: str, source: dict[str, Any] = timing) -> str:
+        value = source.get(key)
+        return "-" if value is None else f"{value}ms"
+
+    lines = [
+        (
+            f"  Timing: total={ms('total_ms')} pre_provider={ms('pre_provider_ms')} "
+            f"first_text={ms('first_text_ms')} provider={ms('provider_ms')} "
+            f"tools={ms('tool_ms')} approvals={ms('approval_wait_ms')} "
+            f"finalize={ms('finalize_ms')} iterations={val('iterations')}"
+        )
+    ]
+    stages = timing.get("stages")
+    if isinstance(stages, dict) and stages:
+        lines.append("  Stages: " + " ".join(f"{name}={value}ms" for name, value in stages.items()))
+    calls = timing.get("provider_calls")
+    if isinstance(calls, list):
+        for index, call in enumerate(calls, start=1):
+            if not isinstance(call, dict):
+                continue
+            lines.append(
+                f"    - call {index}: start=+{ms('request_started_ms', call)} "
+                f"first_event={ms('first_event_ms', call)} "
+                f"first_text={ms('first_text_ms', call)} "
+                f"done={ms('stream_done_ms', call)} "
+                f"tokens in={val('input_tokens', call)} out={val('output_tokens', call)}"
+            )
+    batches = timing.get("tool_batch_detail")
+    if isinstance(batches, list):
+        for index, batch in enumerate(batches, start=1):
+            if not isinstance(batch, dict):
+                continue
+            lines.append(
+                f"    - tool batch {index}: start=+{ms('started_ms', batch)} "
+                f"duration={ms('duration_ms', batch)} calls={val('calls', batch)} "
+                f"approvals={ms('approval_wait_ms', batch)}"
+            )
+    return lines

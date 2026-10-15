@@ -198,6 +198,10 @@ base_url = "https://openrouter.ai/api/v1"
 # Env override: AGENTOS_CACHE_MODE=auto|on|off (legacy AGENTOS_CACHE_ENABLED is deprecated).
 # [prompt_cache]
 # mode = "auto"
+# ttl: how long Anthropic keeps the cached system prompt and tools, "5m"
+# (default) or "1h". A 1h cache write costs 2x the input price instead of
+# 1.25x; worth it when a session pauses longer than 5 minutes. Env: AGENTOS_CACHE_TTL.
+# ttl = "5m"
 
 # Prompt-ingress safety controls.
 # wrap_untrusted_workspace: wrap untrusted workspace files with safety bounding markers.
@@ -262,6 +266,11 @@ source = "workspace"
 # overhead so a full MEMORY.md and a full USER.md both fit without either
 # block being dropped whole at the injection boundary.
 # inject_limit = 6400
+#
+# Hard deadline (seconds) for the external [memory.provider] recall that runs
+# before each turn. A late recall does not hold the turn: it finishes in the
+# background and stands in on the next turn if that one is late too.
+# recall_timeout_seconds = 1.5
 
 # [memory.provider]
 # Optional external memory provider layered on top of built-in memory. When a
@@ -339,10 +348,19 @@ max_skill_view_chars = 10000
 max_concurrency = 4
 # Waiting tasks per session before new follow-up work is rejected.
 max_pending_per_session = 64
+# Run the independent reads before a turn's first model request (memory
+# recall, project knowledge, router context, first-turn memory index warm)
+# concurrently. The prompt is the same either way; false restores serial order.
+# concurrent_turn_setup = true
 
 [agentos_router]
 enabled = true           # auto tier router
 auto_thinking = true
+# Lower the tier's thinking level on cheap tiers (c0 -> at most low, c1 -> at
+# most medium) when the level is the shipped tier default. Never raises a
+# level, never changes the model, and skips router-control pins and tier levels
+# set to something other than the shipped value. false keeps each tier's level.
+effort_by_tier = true
 rollout_phase = "full"
 strategy = "pilot-v1"    # "pilot-v1" (default; local ONNX+MiniLM router,
                          # English-optimized, no LLM call). Needs the
@@ -508,6 +526,18 @@ thinking_level = "medium"
 # calls. When false, AgentOS sends no tool definitions and executes no tools.
 enabled = true
 
+# Leave rarely used tools (audio generation, project and skill administration,
+# browser, x_search, http_request, ...) out of each request.
+# The model loads the ones a task needs with the tool_search tool; they stay
+# loaded for the rest of the session. Set false to send every tool on every
+# request. A surface narrowed by an allowlist or profile defers nothing.
+defer_loading = true
+
+# Ask the model for several independent tool calls in one response
+# (parallel_tool_calls), sent only to api.openai.com and OpenRouter; other
+# OpenAI-compatible endpoints get nothing. false sends nothing, as before.
+parallel_calls = true
+
 # Base allowlist. Tool schemas are the fixed overhead on every provider call in
 # every turn — on a stock install roughly 7,300 tokens — so this is usually the
 # largest thing you can change. Run `agentos context` to see the current cost
@@ -543,6 +573,20 @@ tool_result_store_retention_seconds = 604800
 enabled = true
 # model = ""            # None = use session model
 # timeout_seconds = 30.0
+# Compact between turns, in the background, once the history reaches
+# proactive_ratio of the compaction trigger; the next turn then does not wait
+# for the summarizer.
+# proactive = true
+# proactive_ratio = 0.70
+# Seconds the session must stay idle after the turn before the background
+# summarizer starts (a turn that starts first cancels it for free). A job
+# cancelled mid-summary doubles the wait for that session, up to 300 s, until
+# one completes. 0 = start at once.
+# proactive_idle_seconds = 20
+# Scale the request-size estimate by the input tokens providers report
+# (per provider/model, clamped 0.7-1.25; estimated usage and requests with
+# images/documents are not counted); false = raw chars/4 estimate.
+# estimate_calibration = true
 
 [auxiliary]
 # The model for work AgentOS does on its own behalf rather than as part of a

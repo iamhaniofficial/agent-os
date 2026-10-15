@@ -747,6 +747,12 @@ def build_task_runtime_run_kwargs(
         # Only forward when set so web/CLI legacy paths keep
         # ``TurnRunner.run`` falling back to ``message`` as semantic input.
         kwargs["semantic_message"] = run.semantic_message
+    persisted_user_message_id = getattr(run, "persisted_user_message_id", None)
+    if isinstance(persisted_user_message_id, str) and persisted_user_message_id:
+        # The user row sessions.send persisted for this turn; the history load
+        # takes it out wherever it sits (follow-ups land before the previous
+        # turn's reply) instead of trimming whatever row came last.
+        kwargs["persisted_user_message_id"] = persisted_user_message_id
     return kwargs
 
 

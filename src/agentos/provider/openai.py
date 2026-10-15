@@ -8,6 +8,7 @@ import os
 import re
 import sys
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -17,7 +18,6 @@ if TYPE_CHECKING:
 import httpx
 import structlog
 
-from agentos.env import trust_env as _trust_env
 from agentos.execution_status import compact_provider_status, derive_is_error
 from agentos.secrets import clean_header_secret
 
@@ -32,6 +32,15 @@ from .request_proof import (
 )
 from .retry_after import retry_after_from_response
 from .text_tool_protocol import parse_text_tool_calls
+from .transport import (
+    PooledHttpClient,
+    StreamIdleTimeoutError,
+    guard_tool_stream,
+    iter_lines_with_idle_timeout,
+    resolve_stream_idle_timeout,
+    stream_idle_error_event,
+    stream_timeouts,
+)
 from .types import (
     ChatConfig,
     DoneEvent,
@@ -43,6 +52,7 @@ from .types import (
     StreamEvent,
     TextDeltaEvent,
     ThinkingDeltaEvent,
+    ToolChoice,
     ToolDefinition,
     ToolUseDeltaEvent,
     ToolUseEndEvent,
@@ -383,6 +393,66 @@ def _usage_fields(usage: Mapping[str, Any] | None) -> tuple[int, int, int, int, 
     )
 
 
+def _usage_reports_cache_reads(usage: Mapping[str, Any]) -> bool:
+    prompt_details = usage.get("prompt_tokens_details")
+    if isinstance(prompt_details, Mapping) and "cached_tokens" in prompt_details:
+        return True
+    return "prompt_cache_hit_tokens" in usage
+
+
+class _UsageAccumulator:
+    """Merge every usage object a stream carries into one set of counts.
+
+    Gateways split usage across chunks: OpenCAP puts the cache detail
+    (``prompt_tokens_details.cached_tokens`` / ``cache_write_tokens``) on the
+    finish chunk and then sends a trailing billing chunk with only
+    ``prompt_tokens`` / ``completion_tokens`` / ``cost``, sometimes all zeros,
+    and sometimes leads with an ``"estimated": true`` chunk. Keeping only the
+    last chunk recorded cached=0 (or input=0) for a fully cached request.
+
+    Per field, a later non-zero value wins; a zero or missing one never
+    overwrites a non-zero value; a value from an ``estimated`` chunk never
+    overwrites a real one.
+    """
+
+    def __init__(self) -> None:
+        self._values: list[float] = [0, 0, 0, 0, 0, 0.0]
+        self._estimated = [False] * 6
+        #: Whether any real usage object reported cache reads at all; ``False``
+        #: means "unknown", not "zero cache hits".
+        self.cache_reads_reported = False
+
+    def add(self, usage: Mapping[str, Any] | None) -> None:
+        if not isinstance(usage, Mapping) or not usage:
+            return
+        estimated = bool(usage.get("estimated"))
+        if not estimated and _usage_reports_cache_reads(usage):
+            self.cache_reads_reported = True
+        for index, value in enumerate(_usage_fields(usage)):
+            if not value:
+                continue
+            if estimated and self._values[index] and not self._estimated[index]:
+                continue
+            self._values[index] = value
+            self._estimated[index] = estimated
+
+    @property
+    def input_estimated(self) -> bool:
+        """Whether the input count came only from an ``estimated`` usage chunk."""
+        return bool(self._values[0]) and self._estimated[0]
+
+    def fields(self) -> tuple[int, int, int, int, int, float]:
+        values = self._values
+        return (
+            int(values[0]),
+            int(values[1]),
+            int(values[2]),
+            int(values[3]),
+            int(values[4]),
+            float(values[5]),
+        )
+
+
 def _provider_billed_cost(provider_kind: str, raw_billed_cost: float) -> tuple[float, str]:
     """Return trusted provider-billed cost and its source marker."""
     if provider_kind == "openrouter" and raw_billed_cost > 0.0:
@@ -434,11 +504,138 @@ def _mid_stream_error_event(raw: Any) -> ErrorEvent:
 
 
 def _stream_timeout(timeout: float) -> httpx.Timeout:
-    connect = _coerce_float(os.environ.get("AGENTOS_LLM_STREAM_CONNECT_TIMEOUT_SECONDS"))
-    if connect <= 0:
-        connect = 12.0
-    connect = min(connect, max(timeout, 1.0))
-    return httpx.Timeout(timeout, connect=connect, write=10.0, pool=10.0)
+    return stream_timeouts(timeout)
+
+
+def _merge_reasoning_detail(details: list[dict[str, Any]], fragment: dict[str, Any]) -> None:
+    """Fold one streamed ``reasoning_details`` fragment into ``details``.
+
+    OpenRouter streams each reasoning block as fragments that share an
+    ``index``: the text / summary / encrypted data arrive in pieces and the
+    signature on a later piece. Replay needs one entry per block, so fragments
+    of the same ``index`` and ``type`` are concatenated; every other field
+    keeps its first non-empty value, except ``signature``, where the last one
+    wins.
+    """
+    index = fragment.get("index")
+    kind = fragment.get("type")
+    target: dict[str, Any] | None = None
+    for existing in reversed(details):
+        if existing.get("type") != kind:
+            continue
+        if index is not None and existing.get("index") == index:
+            target = existing
+        elif index is None and existing.get("index") is None and existing is details[-1]:
+            target = existing
+        break
+    if target is None:
+        details.append(dict(fragment))
+        return
+    for key, value in fragment.items():
+        if key in {"text", "summary", "data"} and isinstance(value, str):
+            previous = target.get(key)
+            target[key] = (previous if isinstance(previous, str) else "") + value
+        elif key == "signature":
+            if value:
+                target[key] = value
+        elif target.get(key) in (None, "") and value not in (None, ""):
+            target[key] = value
+
+
+def _openai_supports_prompt_cache_key(provider_kind: str, base_url: str) -> bool:
+    """``prompt_cache_key`` is an api.openai.com field.
+
+    OpenAI-compatible gateways and local servers either ignore it or reject an
+    unknown field with a 400, so it is only sent to OpenAI itself.
+    """
+    if provider_kind != "openai":
+        return False
+    return httpx.URL(base_url).host == "api.openai.com"
+
+
+def _prompt_cache_key(
+    cfg: ChatConfig,
+    *,
+    model: str,
+    openai_messages: list[dict[str, Any]],
+    tools_payload: list[dict[str, Any]] | None,
+) -> str | None:
+    if cfg.prompt_cache_key:
+        return cfg.prompt_cache_key[:64]
+    if cfg.cache_mode == "off":
+        return None
+    # Requests that share the system prompt and tools share a cache-routing
+    # key, so OpenAI sends them to the machines already holding that prefix.
+    system = openai_messages[0] if openai_messages and openai_messages[0].get("role") else None
+    stable_prefix = {
+        "model": model,
+        "system": system if system and system.get("role") == "system" else None,
+        "tools": tools_payload or [],
+    }
+    return f"agentos-{_stable_json_hash(stable_prefix)}"
+
+
+def _build_openai_tool_choice(tool_choice: Any) -> Any:
+    """Translate ``ChatConfig.tool_choice`` into the Chat Completions shape.
+
+    OpenAI-style values (``"auto"``, ``"required"``, ``"none"``,
+    ``{"type": "function", ...}``) pass through unchanged; a :class:`ToolChoice`
+    and Anthropic-native dicts (``{"type": "tool", "name": ...}``,
+    ``{"type": "any"}``) are translated instead of forwarded verbatim.
+    """
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, ToolChoice):
+        if tool_choice.type == "tool":
+            if not tool_choice.name:
+                return "required"
+            return {"type": "function", "function": {"name": tool_choice.name}}
+        return {"auto": "auto", "any": "required", "none": "none"}[tool_choice.type]
+    if isinstance(tool_choice, str):
+        if tool_choice == "any":
+            return "required"
+        return tool_choice if tool_choice in {"auto", "none", "required"} else "auto"
+    if isinstance(tool_choice, dict):
+        choice_type = tool_choice.get("type")
+        if choice_type == "tool":
+            name = tool_choice.get("name")
+            return {"type": "function", "function": {"name": name}} if name else "required"
+        if choice_type == "any":
+            return "required"
+        if choice_type in {"auto", "none"}:
+            return choice_type
+    return tool_choice
+
+
+def _accepts_parallel_tool_calls_opt_in(provider_kind: str, base_url: str, model: str) -> bool:
+    """Whether ``parallel_tool_calls: true`` may be sent to this endpoint.
+
+    The engine asks for parallel tool calls on every request, so the opt-in
+    only goes where the field is documented: api.openai.com (minus the o-series
+    reasoning models, which reject it) and OpenRouter. Other OpenAI-compatible
+    servers (DeepSeek, Zhipu, Gemini-compatible, Ollama, gateways, local
+    servers) either reject unknown fields or are unverified, so they get none.
+    An explicit ``False`` is a correctness request and is not gated.
+    """
+    if provider_kind == "openrouter":
+        return True
+    if provider_kind != "openai" or not base_url:
+        return False
+    if httpx.URL(base_url).host != "api.openai.com":
+        return False
+    model_name = model.rsplit("/", 1)[-1].strip().lower()
+    return not model_name.startswith(("o1", "o3", "o4"))
+
+
+def _parallel_tool_calls(cfg: ChatConfig, *, accepts_opt_in: bool = True) -> bool | None:
+    if cfg.parallel_tool_calls is False or (cfg.parallel_tool_calls and accepts_opt_in):
+        return cfg.parallel_tool_calls
+    choice = cfg.tool_choice
+    if isinstance(choice, ToolChoice) and choice.disable_parallel_tool_use is not None:
+        return not choice.disable_parallel_tool_use
+    if isinstance(choice, dict) and isinstance(choice.get("disable_parallel_tool_use"), bool):
+        return not choice["disable_parallel_tool_use"]
+    return None
 
 
 def _synthesize_text_tool_events(
@@ -501,15 +698,26 @@ def _synthesize_text_tool_events(
     return events
 
 
+def _is_truncated_json(parts: list[str]) -> bool:
+    text = "".join(parts)
+    if not text.strip():
+        return False
+    try:
+        json.loads(text)
+    except json.JSONDecodeError:
+        return True
+    return False
+
+
 def _build_openai_tool(tool: ToolDefinition) -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.input_schema.model_dump(exclude_none=True),
-        },
+    function: dict[str, Any] = {
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.input_schema.model_dump(exclude_none=True),
     }
+    if tool.strict:
+        function["strict"] = True
+    return {"type": "function", "function": function}
 
 
 def _openrouter_model_likely_supports_explicit_prompt_cache(model: str) -> bool:
@@ -520,17 +728,126 @@ def _openrouter_model_is_anthropic(model: str) -> bool:
     return model.strip().lower().startswith("anthropic/")
 
 
+@dataclass(frozen=True)
+class _AnthropicCacheGateway:
+    """An OpenAI-compatible gateway that forwards cache hints to Anthropic.
+
+    ``style`` says which hint it understands for Claude models:
+
+    - ``"top_level"``: a request-level ``cache_control`` that the gateway turns
+      into Anthropic's automatic caching, whose breakpoint advances with the
+      conversation (OpenRouter).
+    - ``"rolling_block"``: an explicit ``cache_control`` on the last content
+      part of the last user / tool message, moved forward every request, the
+      same rolling marker the Anthropic provider places. For a gateway that
+      caches the system prompt and tools on its own, so only the conversation
+      tail needs a marker and the gateway's markers plus ours stay within
+      Anthropic's limit of four. No row uses it today; add one only for a
+      gateway measured to forward the marker.
+    """
+
+    name: str
+    provider_kinds: frozenset[str]
+    hosts: frozenset[str]
+    model_prefixes: tuple[str, ...]
+    model_substrings: tuple[str, ...]
+    style: str
+
+    def serves(self, provider_kind: str, base_url: str, model: str) -> bool:
+        host = (httpx.URL(base_url).host or "").lower() if base_url else ""
+        if provider_kind not in self.provider_kinds and host not in self.hosts:
+            return False
+        model_l = model.strip().lower()
+        return model_l.startswith(self.model_prefixes) or any(
+            part in model_l for part in self.model_substrings
+        )
+
+
+#: Gateways known to forward cache hints to Anthropic. Add a row to support
+#: another one; every upstream not listed here (api.openai.com, DeepSeek,
+#: Gemini-compatible, Zhipu, local servers) gets no Anthropic-style hints.
+_ANTHROPIC_CACHE_GATEWAYS: tuple[_AnthropicCacheGateway, ...] = (
+    _AnthropicCacheGateway(
+        name="openrouter",
+        provider_kinds=frozenset({"openrouter"}),
+        hosts=frozenset({"openrouter.ai"}),
+        model_prefixes=("anthropic/", "~anthropic/"),
+        model_substrings=(),
+        style="top_level",
+    ),
+    # No OpenCAP row: measured 2026-10-13, it ignores per-message cache_control markers.
+)
+
+
+def _anthropic_cache_gateway(
+    *, provider_kind: str, base_url: str, model: str, cfg: ChatConfig
+) -> _AnthropicCacheGateway | None:
+    if cfg.cache_mode not in {"auto", "on"}:
+        return None
+    for gateway in _ANTHROPIC_CACHE_GATEWAYS:
+        if gateway.serves(provider_kind, base_url, model):
+            return gateway
+    return None
+
+
 def _openrouter_anthropic_should_use_top_level_cache(
     *,
     provider_kind: str,
     model: str,
     cfg: ChatConfig,
+    base_url: str = "",
 ) -> bool:
-    return (
-        provider_kind == "openrouter"
-        and cfg.cache_mode in {"auto", "on"}
-        and _openrouter_model_is_anthropic(model)
+    gateway = _anthropic_cache_gateway(
+        provider_kind=provider_kind, base_url=base_url, model=model, cfg=cfg
     )
+    return gateway is not None and gateway.style == "top_level"
+
+
+#: Anthropic accepts at most this many ``cache_control`` markers per request.
+_MAX_CACHE_BREAKPOINTS = 4
+
+
+def _count_cache_markers(value: Any) -> int:
+    if isinstance(value, list):
+        return sum(_count_cache_markers(item) for item in value)
+    if isinstance(value, dict):
+        own = 1 if value.get("cache_control") else 0
+        return own + sum(_count_cache_markers(v) for k, v in value.items() if k != "cache_control")
+    return 0
+
+
+def _mark_rolling_cache_breakpoint(openai_messages: list[dict[str, Any]]) -> bool:
+    """Put ``cache_control`` on the last text part of the last user/tool message.
+
+    A string content becomes one text part carrying the marker (the same
+    prompt for the gateway's Anthropic translation). Returns whether a marker
+    was placed; nothing is placed past Anthropic's limit of four.
+    """
+    if _count_cache_markers(openai_messages) >= _MAX_CACHE_BREAKPOINTS:
+        return False
+    for message in reversed(openai_messages):
+        role = message.get("role")
+        if role == "assistant":
+            # Cache the prefix up to the newest *input*; an assistant tail
+            # (prefill) is not something the next request repeats.
+            continue
+        if role not in {"user", "tool"}:
+            return False
+        content = message.get("content")
+        if isinstance(content, str):
+            if not content:
+                return False
+            message["content"] = [
+                {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+            ]
+            return True
+        if isinstance(content, list):
+            for part in reversed(content):
+                if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+                    part["cache_control"] = {"type": "ephemeral"}
+                    return True
+        return False
+    return False
 
 
 def _stable_json_hash(value: Any) -> str:
@@ -551,13 +868,79 @@ def _openrouter_non_system_prefix_item_hashes(
     return hashes
 
 
+#: ``reasoning_details[].format`` prefix -> model family that produced it.
+_REASONING_FORMAT_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("anthropic", "anthropic"),
+    ("openai", "openai"),
+    ("azure-openai", "openai"),
+    ("google", "google"),
+    ("xai", "xai"),
+)
+#: OpenRouter model-id vendor prefix -> model family.
+_OPENROUTER_VENDOR_FAMILIES: dict[str, str] = {
+    "anthropic": "anthropic",
+    "openai": "openai",
+    "google": "google",
+    "x-ai": "xai",
+}
+
+
+def _reasoning_detail_family(detail: Mapping[str, Any]) -> str:
+    fmt = str(detail.get("format") or "").strip().lower()
+    for prefix, family in _REASONING_FORMAT_FAMILIES:
+        if fmt.startswith(prefix):
+            return family
+    return "unknown"
+
+
+def _openrouter_model_family(model: str | None) -> str:
+    vendor = (model or "").strip().lower().lstrip("~").split("/", 1)[0]
+    return _OPENROUTER_VENDOR_FAMILIES.get(vendor, "unknown")
+
+
+def _replayable_reasoning_details(
+    details: list[dict[str, Any]], model: str | None
+) -> list[dict[str, Any]] | None:
+    """``details`` when every block was produced by ``model``'s family, else None.
+
+    A message does not record which model produced it, and a router or
+    ``/model`` switch can put a different family on the next request. Claude
+    signatures, OpenAI / Gemini encrypted reasoning are only valid for the
+    family that issued them, so the blocks are replayed all-or-nothing: the
+    sequence may not be reordered or partially edited. Details whose
+    ``format`` names no known family (plain-text reasoning from GLM, DeepSeek,
+    ...) are only replayed to a model that is also outside the known families.
+    """
+    family = _openrouter_model_family(model)
+    if all(_reasoning_detail_family(detail) == family for detail in details):
+        return details
+    return None
+
+
 def _attach_reasoning_content(
     msg: Message,
     payload: dict[str, Any],
     *,
     include_reasoning_content: bool = True,
     require_assistant_reasoning_content: bool = False,
+    provider_kind: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
+    if (
+        provider_kind == "openrouter"
+        and include_reasoning_content
+        and msg.role == "assistant"
+        and msg.reasoning_details
+    ):
+        # OpenRouter's replay form: the response's ``reasoning_details``
+        # exactly as received (order and content unmodified). It carries the
+        # signatures / encrypted blobs that let Claude, GPT, Gemini and GLM keep
+        # their reasoning across tool calls, and supersedes plain text. Only
+        # replayed to the family that produced it (see the helper).
+        replayable = _replayable_reasoning_details(msg.reasoning_details, model)
+        if replayable is not None:
+            payload["reasoning_details"] = replayable
+            return payload
     if include_reasoning_content and msg.role == "assistant" and msg.reasoning_content:
         payload["reasoning_content"] = msg.reasoning_content
     elif (
@@ -604,6 +987,7 @@ def _build_openai_messages(
     include_reasoning_content: bool = True,
     require_assistant_reasoning_content: bool = False,
     provider_kind: str | None = None,
+    model: str | None = None,
 ) -> list[dict[str, Any]]:
     """Convert a agentos Message into one or more OpenAI-format message dicts.
 
@@ -621,6 +1005,8 @@ def _build_openai_messages(
                 {"role": msg.role, "content": msg.content},
                 include_reasoning_content=include_reasoning_content,
                 require_assistant_reasoning_content=require_assistant_reasoning_content,
+                provider_kind=provider_kind,
+                model=model,
             )
         ]
 
@@ -681,6 +1067,8 @@ def _build_openai_messages(
                 result,
                 include_reasoning_content=include_reasoning_content,
                 require_assistant_reasoning_content=require_assistant_reasoning_content,
+                provider_kind=provider_kind,
+                model=model,
             )
         ]
 
@@ -693,6 +1081,8 @@ def _build_openai_messages(
                 {"role": msg.role, "content": parts},
                 include_reasoning_content=include_reasoning_content,
                 require_assistant_reasoning_content=require_assistant_reasoning_content,
+                provider_kind=provider_kind,
+                model=model,
             )
         ]
     content_text = " ".join(p["text"] for p in parts if p["type"] == "text")
@@ -702,6 +1092,8 @@ def _build_openai_messages(
             {"role": msg.role, "content": content_text},
             include_reasoning_content=include_reasoning_content,
             require_assistant_reasoning_content=require_assistant_reasoning_content,
+            provider_kind=provider_kind,
+            model=model,
         )
     ]
 
@@ -729,6 +1121,17 @@ class OpenAIProvider:
         inferred_kind = "openrouter" if "openrouter.ai" in self._base_url else "openai"
         self._provider_kind = provider_kind or inferred_kind
         self._provider_routing: Mapping[str, str] = provider_routing or {}
+        self._http = PooledHttpClient(proxy=self._proxy)
+
+    async def aclose(self) -> None:
+        """Close the pooled HTTP client (a later request opens a new one)."""
+        await self._http.aclose()
+
+    async def __aenter__(self) -> OpenAIProvider:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        await self.aclose()
 
     @property
     def model(self) -> str:
@@ -776,7 +1179,11 @@ class OpenAIProvider:
         config: ChatConfig | None = None,
     ) -> AsyncIterator[StreamEvent]:
         cfg = config or ChatConfig()
-        return self._stream(messages, tools, cfg)
+        return guard_tool_stream(
+            lambda: self._stream(messages, tools, cfg),
+            provider=self._provider_kind,
+            model=self._model,
+        )
 
     async def _stream(
         self,
@@ -819,6 +1226,7 @@ class OpenAIProvider:
                         _is_direct_deepseek_v4_request(self._provider_kind, self._model)
                     ),
                     provider_kind=self._provider_kind,
+                    model=self._model,
                 )
             )
 
@@ -842,8 +1250,17 @@ class OpenAIProvider:
                 provider_kind=self._provider_kind,
                 model=self._model,
                 cfg=cfg,
+                base_url=self._base_url,
             ):
                 payload["cache_control"] = {"type": "ephemeral"}
+        cache_gateway = _anthropic_cache_gateway(
+            provider_kind=self._provider_kind,
+            base_url=self._base_url,
+            model=self._model,
+            cfg=cfg,
+        )
+        if cache_gateway is not None and cache_gateway.style == "rolling_block":
+            _mark_rolling_cache_breakpoint(openai_messages)
         if _should_send_temperature(
             self._provider_kind,
             self._base_url,
@@ -856,8 +1273,26 @@ class OpenAIProvider:
             payload["stop"] = cfg.stop_sequences
         if tools:
             payload["tools"] = [_build_openai_tool(t) for t in tools]
-            if cfg.tool_choice is not None:
-                payload["tool_choice"] = cfg.tool_choice
+            tool_choice_payload = _build_openai_tool_choice(cfg.tool_choice)
+            if tool_choice_payload is not None:
+                payload["tool_choice"] = tool_choice_payload
+            parallel_tool_calls = _parallel_tool_calls(
+                cfg,
+                accepts_opt_in=_accepts_parallel_tool_calls_opt_in(
+                    self._provider_kind, self._base_url, self._model
+                ),
+            )
+            if parallel_tool_calls is not None:
+                payload["parallel_tool_calls"] = parallel_tool_calls
+        if _openai_supports_prompt_cache_key(self._provider_kind, self._base_url):
+            cache_key = _prompt_cache_key(
+                cfg,
+                model=self._model,
+                openai_messages=openai_messages,
+                tools_payload=payload.get("tools"),
+            )
+            if cache_key:
+                payload["prompt_cache_key"] = cache_key
         pinned_provider = self._provider_routing.get(self._model)
         if pinned_provider:
             if self._provider_kind == "openrouter":
@@ -979,6 +1414,10 @@ class OpenAIProvider:
         # tool_call accumulator: index -> {id, name, json_parts}
         pending_calls: dict[int, dict[str, Any]] = {}
         reasoning_parts: list[str] = []
+        reasoning_details: list[dict[str, Any]] = []
+        usage_acc = _UsageAccumulator()
+        saw_done_marker = False
+        idle_timeout = resolve_stream_idle_timeout(cfg.stream_idle_timeout)
         assistant_text_parts: list[str] = []
         # think_tags models interleave reasoning into the content stream; the
         # splitter routes it to reasoning_parts so it never reaches user text.
@@ -1029,267 +1468,288 @@ class OpenAIProvider:
             )
 
         try:
-            async with httpx.AsyncClient(
-                timeout=(
-                    _stream_timeout(cfg.timeout)
-                    if self._provider_kind == "openrouter"
-                    else cfg.timeout
-                ),
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-            ) as client:
-                async with client.stream(
-                    "POST",
-                    self._api_url("/v1/chat/completions"),
-                    headers=headers,
-                    json=payload,
-                ) as response:
-                    if response.status_code != 200:
-                        body = await read_bounded_body(response)
-                        message = _format_chat_http_error(
-                            self._provider_kind,
-                            response.status_code,
-                            body,
-                        )
-                        # Diagnostic: dump payload head (no auth headers)
-                        # so 400s from picky upstreams are debuggable. Truncated
-                        # to keep memory low.
-                        _body_text = (
-                            body.decode("utf-8", errors="replace")
-                            if isinstance(body, bytes)
-                            else str(body)
-                        )
-                        try:
-                            _payload_head = json.dumps(
-                                payload,
-                                ensure_ascii=False,
-                            )[:4000]
-                        except Exception:  # noqa: BLE001
-                            _payload_head = repr(payload)[:4000]
-                        log.warning(
-                            "provider.chat_http_error",
-                            provider=self._provider_kind,
-                            model=self._model,
-                            status_code=response.status_code,
-                            message=message,
-                            response_body=_body_text[:2000],
-                            request_payload_head=_payload_head,
-                        )
-                        yield ErrorEvent(
-                            message=message,
-                            code=str(response.status_code),
-                            retry_after_seconds=retry_after_from_response(response),
-                        )
+            client = self._http.get()
+            async with client.stream(
+                "POST",
+                self._api_url("/v1/chat/completions"),
+                headers=headers,
+                json=payload,
+                timeout=stream_timeouts(cfg.timeout),
+            ) as response:
+                if response.status_code != 200:
+                    body = await read_bounded_body(response)
+                    message = _format_chat_http_error(
+                        self._provider_kind,
+                        response.status_code,
+                        body,
+                    )
+                    # Diagnostic: dump payload head (no auth headers)
+                    # so 400s from picky upstreams are debuggable. Truncated
+                    # to keep memory low.
+                    _body_text = (
+                        body.decode("utf-8", errors="replace")
+                        if isinstance(body, bytes)
+                        else str(body)
+                    )
+                    try:
+                        _payload_head = json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                        )[:4000]
+                    except Exception:  # noqa: BLE001
+                        _payload_head = repr(payload)[:4000]
+                    log.warning(
+                        "provider.chat_http_error",
+                        provider=self._provider_kind,
+                        model=self._model,
+                        status_code=response.status_code,
+                        message=message,
+                        response_body=_body_text[:2000],
+                        request_payload_head=_payload_head,
+                    )
+                    yield ErrorEvent(
+                        message=message,
+                        code=str(response.status_code),
+                        retry_after_seconds=retry_after_from_response(response),
+                    )
+                    return
+
+                async for line in iter_lines_with_idle_timeout(
+                    response.aiter_lines(), idle_timeout
+                ):
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        saw_done_marker = True
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if not isinstance(chunk, dict):
+                        continue
+
+                    # OpenAI-compatible gateways report a failure that
+                    # happens after the 200 as a chunk carrying ``error``
+                    # (OpenRouter: ``{"error": {"code": 502, ...}}``)
+                    # and then close the stream, usually without
+                    # ``[DONE]``. That chunk has no ``choices`` so it
+                    # used to fall straight through to the DoneEvent
+                    # below, which the runtime counted as a success
+                    # against the circuit breaker (#2118, #2214).
+                    if chunk.get("error"):
+                        yield _mid_stream_error_event(chunk["error"])
                         return
 
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
+                    chunk_model = chunk.get("model")
+                    if chunk_model:
+                        actual_model = chunk_model
 
-                        if not isinstance(chunk, dict):
-                            continue
-
-                        # OpenAI-compatible gateways report a failure that
-                        # happens after the 200 as a chunk carrying ``error``
-                        # (OpenRouter: ``{"error": {"code": 502, ...}}``)
-                        # and then close the stream, usually without
-                        # ``[DONE]``. That chunk has no ``choices`` so it
-                        # used to fall straight through to the DoneEvent
-                        # below, which the runtime counted as a success
-                        # against the circuit breaker (#2118, #2214).
-                        if chunk.get("error"):
-                            yield _mid_stream_error_event(chunk["error"])
-                            return
-
-                        chunk_model = chunk.get("model")
-                        if chunk_model:
-                            actual_model = chunk_model
-
-                        # Usage may appear in the final chunk
-                        if chunk.get("usage"):
-                            (
-                                input_tokens,
-                                output_tokens,
-                                reasoning_tokens,
-                                cached_tokens,
-                                cache_write_tokens,
-                                raw_billed_cost,
-                            ) = _usage_fields(chunk["usage"])
-                            billed_cost, cost_source = _provider_billed_cost(
-                                self._provider_kind,
-                                raw_billed_cost,
-                            )
-
-                        # `or []` / `or {}` throughout, not a get() default: several
-                        # OpenAI-compatible gateways send these keys with an explicit
-                        # null rather than omitting them, and a get() default only
-                        # covers the missing case.
-                        for choice in chunk.get("choices") or []:
-                            finish = choice.get("finish_reason")
-                            if finish:
-                                stop_reason = finish
-
-                            delta = choice.get("delta") or {}
-
-                            # Text content
-                            text = delta.get("content")
-                            if text:
-                                emitted_stream_event = True
-                                if think_splitter is not None:
-                                    visible, thinking = think_splitter.feed(text)
-                                    if visible:
-                                        yield TextDeltaEvent(text=visible)
-                                        assistant_text_parts.append(visible)
-                                    if thinking:
-                                        reasoning_parts.append(thinking)
-                                        yield ThinkingDeltaEvent(text=thinking)
-                                else:
-                                    yield TextDeltaEvent(text=text)
-                                    assistant_text_parts.append(text)
-
-                            # Reasoning content (always parsed, not gated on thinking)
-                            reasoning_details = delta.get("reasoning_details")
-                            if reasoning_details:
-                                for detail in reasoning_details:
-                                    if isinstance(detail, dict):
-                                        text_val = detail.get("text", "")
-                                        if text_val:
-                                            reasoning_parts.append(text_val)
-                                            yield ThinkingDeltaEvent(text=text_val)
-                            reasoning_str = delta.get("reasoning_content")
-                            if reasoning_str:
-                                reasoning_parts.append(reasoning_str)
-                                yield ThinkingDeltaEvent(text=reasoning_str)
-
-                            # Tool calls (may stream over multiple chunks)
-                            for tc in delta.get("tool_calls") or []:
-                                idx = _resolve_tool_call_index(
-                                    tc,
-                                    pending_calls,
-                                    provider_kind=self._provider_kind,
-                                )
-                                function = tc.get("function") or {}
-                                thought_sig = _extract_thought_signature(tc)
-                                if idx not in pending_calls:
-                                    pending_calls[idx] = {
-                                        "id": tc.get("id") or "",
-                                        "name": function.get("name") or "",
-                                        "parts": [],
-                                        "thought_signature": thought_sig,
-                                        "started": False,
-                                    }
-                                else:
-                                    # id/name may arrive in later chunks. Once the start
-                                    # event has published an id it is kept: the later
-                                    # delta/end events must name that same id.
-                                    if tc.get("id") and not pending_calls[idx]["started"]:
-                                        pending_calls[idx]["id"] = tc["id"]
-                                    fname = function.get("name") or ""
-                                    if fname:
-                                        pending_calls[idx]["name"] = fname
-                                    if thought_sig and not pending_calls[idx].get(
-                                        "thought_signature"
-                                    ):
-                                        pending_calls[idx]["thought_signature"] = thought_sig
-
-                                fragment = function.get("arguments") or ""
-                                # ToolUseStartEvent publishes the id, so it waits for the
-                                # real one; a synthetic id is minted only once an argument
-                                # fragment (or the end of the stream) forces the start.
-                                call = pending_calls[idx]
-                                if not call["started"] and (call["id"] or fragment):
-                                    call["id"] = call["id"] or f"call_{uuid4().hex[:12]}"
-                                    call["started"] = True
-                                    emitted_stream_event = True
-                                    yield ToolUseStartEvent(
-                                        tool_use_id=call["id"],
-                                        tool_name=call["name"],
-                                    )
-                                if fragment:
-                                    pending_calls[idx]["parts"].append(fragment)
-                                    emitted_stream_event = True
-                                    yield ToolUseDeltaEvent(
-                                        tool_use_id=pending_calls[idx]["id"],
-                                        json_fragment=fragment,
-                                    )
-
-                    # Resolve any partial <think> tag held back at end of stream.
-                    if think_splitter is not None:
-                        visible, thinking = think_splitter.flush()
-                        if visible:
-                            emitted_stream_event = True
-                            yield TextDeltaEvent(text=visible)
-                            assistant_text_parts.append(visible)
-                        if thinking:
-                            reasoning_parts.append(thinking)
-                            yield ThinkingDeltaEvent(text=thinking)
-
-                    # Emit ToolUseEnd for each completed call
-                    for call in pending_calls.values():
-                        if not call["started"]:
-                            call["id"] = call["id"] or f"call_{uuid4().hex[:12]}"
-                            call["started"] = True
-                            yield ToolUseStartEvent(tool_use_id=call["id"], tool_name=call["name"])
-                        full_json = "".join(call["parts"])
-                        try:
-                            args = json.loads(full_json) if full_json else {}
-                        except json.JSONDecodeError:
-                            args = {"_raw": full_json}
-                        emitted_stream_event = True
-                        yield ToolUseEndEvent(
-                            tool_use_id=call["id"],
-                            tool_name=call["name"],
-                            arguments=args,
-                            thought_signature=call.get("thought_signature"),
+                    # Usage may appear in the final chunk, or be split across
+                    # several (see _UsageAccumulator).
+                    if chunk.get("usage"):
+                        usage_acc.add(chunk["usage"])
+                        (
+                            input_tokens,
+                            output_tokens,
+                            reasoning_tokens,
+                            cached_tokens,
+                            cache_write_tokens,
+                            raw_billed_cost,
+                        ) = usage_acc.fields()
+                        billed_cost, cost_source = _provider_billed_cost(
+                            self._provider_kind,
+                            raw_billed_cost,
                         )
 
-                    # Last-resort text-protocol compatibility: some upstreams
-                    # leak a native XML tool call as text instead of structured
-                    # tool_calls. Only synthesize calls when no structured calls
-                    # arrived, tools were offered, and the parsed tool name is
-                    # explicitly allowed by this turn.
-                    synthesized_tool_call = False
-                    if not pending_calls and tools and assistant_text_parts:
-                        full_text = "".join(assistant_text_parts)
-                        for event in _synthesize_text_tool_events(full_text, tools):
+                    # `or []` / `or {}` throughout, not a get() default: several
+                    # OpenAI-compatible gateways send these keys with an explicit
+                    # null rather than omitting them, and a get() default only
+                    # covers the missing case.
+                    for choice in chunk.get("choices") or []:
+                        finish = choice.get("finish_reason")
+                        if finish:
+                            stop_reason = finish
+
+                        delta = choice.get("delta") or {}
+
+                        # Text content
+                        text = delta.get("content")
+                        if text:
                             emitted_stream_event = True
-                            if isinstance(event, ToolUseEndEvent):
-                                synthesized_tool_call = True
-                            yield event
+                            if think_splitter is not None:
+                                visible, thinking = think_splitter.feed(text)
+                                if visible:
+                                    yield TextDeltaEvent(text=visible)
+                                    assistant_text_parts.append(visible)
+                                if thinking:
+                                    reasoning_parts.append(thinking)
+                                    yield ThinkingDeltaEvent(text=thinking)
+                            else:
+                                yield TextDeltaEvent(text=text)
+                                assistant_text_parts.append(text)
 
-                    # Assemble reasoning from structured fields
-                    reasoning_text = "".join(reasoning_parts)
+                        # Reasoning content (always parsed, not gated on thinking)
+                        delta_reasoning_details = delta.get("reasoning_details")
+                        if delta_reasoning_details:
+                            for detail in delta_reasoning_details:
+                                if isinstance(detail, dict):
+                                    _merge_reasoning_detail(reasoning_details, detail)
+                                    text_val = detail.get("text", "")
+                                    if text_val:
+                                        reasoning_parts.append(text_val)
+                                        yield ThinkingDeltaEvent(text=text_val)
+                        reasoning_str = delta.get("reasoning_content")
+                        if reasoning_str:
+                            reasoning_parts.append(reasoning_str)
+                            yield ThinkingDeltaEvent(text=reasoning_str)
 
-                    # Fallback: <think> tag extraction from accumulated text
-                    caps = cfg.model_capabilities
-                    if not reasoning_text and caps and caps.reasoning_format == "think_tags":
-                        full_text = "".join(assistant_text_parts)
-                        reasoning_text = _extract_think_tags(full_text)
+                        # Tool calls (may stream over multiple chunks)
+                        for tc in delta.get("tool_calls") or []:
+                            idx = _resolve_tool_call_index(
+                                tc,
+                                pending_calls,
+                                provider_kind=self._provider_kind,
+                            )
+                            function = tc.get("function") or {}
+                            thought_sig = _extract_thought_signature(tc)
+                            if idx not in pending_calls:
+                                pending_calls[idx] = {
+                                    "id": tc.get("id") or "",
+                                    "name": function.get("name") or "",
+                                    "parts": [],
+                                    "thought_signature": thought_sig,
+                                    "started": False,
+                                }
+                            else:
+                                # id/name may arrive in later chunks. Once the start
+                                # event has published an id it is kept: the later
+                                # delta/end events must name that same id.
+                                if tc.get("id") and not pending_calls[idx]["started"]:
+                                    pending_calls[idx]["id"] = tc["id"]
+                                fname = function.get("name") or ""
+                                if fname:
+                                    pending_calls[idx]["name"] = fname
+                                if thought_sig and not pending_calls[idx].get("thought_signature"):
+                                    pending_calls[idx]["thought_signature"] = thought_sig
 
-                    yield DoneEvent(
-                        stop_reason=normalize_stop_reason(
-                            stop_reason,
-                            has_tool_calls=bool(pending_calls) or synthesized_tool_call,
-                        ),
-                        raw_stop_reason=stop_reason,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        reasoning_content=reasoning_text or None,
-                        reasoning_tokens=reasoning_tokens,
-                        cached_tokens=cached_tokens,
-                        cache_write_tokens=cache_write_tokens,
-                        billed_cost=billed_cost,
-                        model=actual_model,
-                        cost_source=cost_source,
+                            fragment = function.get("arguments") or ""
+                            # ToolUseStartEvent publishes the id, so it waits for the
+                            # real one; a synthetic id is minted only once an argument
+                            # fragment (or the end of the stream) forces the start.
+                            call = pending_calls[idx]
+                            if not call["started"] and (call["id"] or fragment):
+                                call["id"] = call["id"] or f"call_{uuid4().hex[:12]}"
+                                call["started"] = True
+                                emitted_stream_event = True
+                                yield ToolUseStartEvent(
+                                    tool_use_id=call["id"],
+                                    tool_name=call["name"],
+                                )
+                            if fragment:
+                                pending_calls[idx]["parts"].append(fragment)
+                                emitted_stream_event = True
+                                yield ToolUseDeltaEvent(
+                                    tool_use_id=pending_calls[idx]["id"],
+                                    json_fragment=fragment,
+                                )
+
+                # Resolve any partial <think> tag held back at end of stream.
+                if think_splitter is not None:
+                    visible, thinking = think_splitter.flush()
+                    if visible:
+                        emitted_stream_event = True
+                        yield TextDeltaEvent(text=visible)
+                        assistant_text_parts.append(visible)
+                    if thinking:
+                        reasoning_parts.append(thinking)
+                        yield ThinkingDeltaEvent(text=thinking)
+
+                # A stream that closed with neither ``[DONE]`` nor a
+                # finish_reason was cut; if a tool call's arguments are not
+                # valid JSON, it was cut inside that call. End here without
+                # ToolUseEnd/Done so the stream guard can retry the request
+                # instead of running a call with truncated arguments.
+                if (
+                    pending_calls
+                    and not saw_done_marker
+                    and stop_reason is None
+                    and any(_is_truncated_json(call["parts"]) for call in pending_calls.values())
+                ):
+                    log.warning(
+                        "provider.tool_stream_truncated",
+                        provider=self._provider_kind,
+                        model=self._model,
+                        open_tools=[call["name"] for call in pending_calls.values()],
+                    )
+                    return
+
+                # Emit ToolUseEnd for each completed call
+                for call in pending_calls.values():
+                    if not call["started"]:
+                        call["id"] = call["id"] or f"call_{uuid4().hex[:12]}"
+                        call["started"] = True
+                        yield ToolUseStartEvent(tool_use_id=call["id"], tool_name=call["name"])
+                    full_json = "".join(call["parts"])
+                    try:
+                        args = json.loads(full_json) if full_json else {}
+                    except json.JSONDecodeError:
+                        args = {"_raw": full_json}
+                    emitted_stream_event = True
+                    yield ToolUseEndEvent(
+                        tool_use_id=call["id"],
+                        tool_name=call["name"],
+                        arguments=args,
+                        thought_signature=call.get("thought_signature"),
                     )
 
+                # Last-resort text-protocol compatibility: some upstreams
+                # leak a native XML tool call as text instead of structured
+                # tool_calls. Only synthesize calls when no structured calls
+                # arrived, tools were offered, and the parsed tool name is
+                # explicitly allowed by this turn.
+                synthesized_tool_call = False
+                if not pending_calls and tools and assistant_text_parts:
+                    full_text = "".join(assistant_text_parts)
+                    for event in _synthesize_text_tool_events(full_text, tools):
+                        emitted_stream_event = True
+                        if isinstance(event, ToolUseEndEvent):
+                            synthesized_tool_call = True
+                        yield event
+
+                # Assemble reasoning from structured fields
+                reasoning_text = "".join(reasoning_parts)
+
+                # Fallback: <think> tag extraction from accumulated text
+                caps = cfg.model_capabilities
+                if not reasoning_text and caps and caps.reasoning_format == "think_tags":
+                    full_text = "".join(assistant_text_parts)
+                    reasoning_text = _extract_think_tags(full_text)
+
+                yield DoneEvent(
+                    stop_reason=normalize_stop_reason(
+                        stop_reason,
+                        has_tool_calls=bool(pending_calls) or synthesized_tool_call,
+                    ),
+                    raw_stop_reason=stop_reason,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    reasoning_content=reasoning_text or None,
+                    reasoning_tokens=reasoning_tokens,
+                    cached_tokens=cached_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    billed_cost=billed_cost,
+                    model=actual_model,
+                    cost_source=cost_source,
+                    reasoning_details=reasoning_details or None,
+                    cache_usage_reported=usage_acc.cache_reads_reported,
+                    usage_estimated=usage_acc.input_estimated,
+                )
+
+        except StreamIdleTimeoutError as exc:
+            yield stream_idle_error_event(exc)
         except httpx.TimeoutException as exc:
             if self._provider_kind == "openrouter" and not emitted_stream_event:
                 log.warning(
@@ -1331,16 +1791,12 @@ class OpenAIProvider:
         fallback_headers["Accept"] = "application/json"
 
         try:
-            async with httpx.AsyncClient(
-                timeout=cfg.timeout,
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-            ) as client:
-                response = await client.post(
-                    self._api_url("/v1/chat/completions"),
-                    headers=fallback_headers,
-                    json=fallback_payload,
-                )
+            response = await self._http.get().post(
+                self._api_url("/v1/chat/completions"),
+                headers=fallback_headers,
+                json=fallback_payload,
+                timeout=stream_timeouts(cfg.timeout),
+            )
         except httpx.TimeoutException:
             log.warning(
                 "openrouter.non_stream_fallback_timeout",
@@ -1381,10 +1837,15 @@ class OpenAIProvider:
             cache_write_tokens,
             raw_billed_cost,
         ) = _usage_fields(data.get("usage"))
+        raw_usage = data.get("usage")
+        cache_usage_reported = isinstance(raw_usage, Mapping) and _usage_reports_cache_reads(
+            raw_usage
+        )
         billed_cost, cost_source = _provider_billed_cost(self._provider_kind, raw_billed_cost)
         stop_reason: str | None = None
         assistant_text_parts: list[str] = []
         reasoning_parts: list[str] = []
+        message_reasoning_details: list[dict[str, Any]] = []
         emitted_structured_tool = False
 
         for choice in data.get("choices") or []:
@@ -1401,6 +1862,7 @@ class OpenAIProvider:
             if reasoning_details:
                 for detail in reasoning_details:
                     if isinstance(detail, dict):
+                        message_reasoning_details.append(detail)
                         text_val = detail.get("text", "")
                         if text_val:
                             reasoning_parts.append(text_val)
@@ -1459,6 +1921,9 @@ class OpenAIProvider:
             billed_cost=billed_cost,
             model=actual_model,
             cost_source=cost_source,
+            reasoning_details=message_reasoning_details or None,
+            cache_usage_reported=cache_usage_reported,
+            usage_estimated=isinstance(raw_usage, Mapping) and bool(raw_usage.get("estimated")),
         )
 
     async def list_models(self) -> list[ModelInfo]:
@@ -1467,24 +1932,20 @@ class OpenAIProvider:
             headers["x-api-key"] = self._api_key
         headers.update(openrouter_app_headers(self._base_url))
         try:
-            async with httpx.AsyncClient(
-                timeout=10.0,
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-            ) as client:
-                resp = await client.get(self._api_url("/v1/models"), headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                return [
-                    ModelInfo(
-                        provider=self._provider_kind,
-                        model_id=m["id"],
-                        display_name=m.get("name", m.get("id", "")),
-                        context_window=m.get("context_length", 0),
-                        max_output_tokens=(m.get("top_provider") or {}).get("max_completion_tokens")
-                        or 0,
-                    )
-                    for m in data.get("data", [])
-                ]
+            client = self._http.get()
+            resp = await client.get(self._api_url("/v1/models"), headers=headers, timeout=10.0)
+            resp.raise_for_status()
+            data = resp.json()
+            return [
+                ModelInfo(
+                    provider=self._provider_kind,
+                    model_id=m["id"],
+                    display_name=m.get("name", m.get("id", "")),
+                    context_window=m.get("context_length", 0),
+                    max_output_tokens=(m.get("top_provider") or {}).get("max_completion_tokens")
+                    or 0,
+                )
+                for m in data.get("data", [])
+            ]
         except Exception:
             return []

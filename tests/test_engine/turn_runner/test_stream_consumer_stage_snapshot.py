@@ -129,17 +129,9 @@ def _patch_thinking(runner: TurnRunner) -> None:
 
 
 def _patch_compaction_history(runner: TurnRunner) -> None:
-    async def _t3(self, *_a, **_kw):  # noqa: ARG002
-        return "not_applicable"
-
-    async def _preflight(self, *_a, **_kw):  # noqa: ARG002
-        return None
-
     async def _load_history(self, *_a, **_kw):  # noqa: ARG002
         return None
 
-    runner._maybe_compact_on_t3_upgrade = _t3.__get__(runner, TurnRunner)
-    runner._maybe_preflight_compact = _preflight.__get__(runner, TurnRunner)
     runner._load_history = _load_history.__get__(runner, TurnRunner)
 
 
@@ -550,7 +542,7 @@ async def test_stream_consumer_stage_snapshot(
     if case.expected_done_present:
         assert any(isinstance(e, DoneEvent) for e in yielded)
 
-    # In-turn compaction observation: persist call count + system-prompt refresh count.
+    # In-turn compaction observation: persist call count; no system-prompt refresh.
     sm = runner._session_manager
     assert isinstance(sm, _RecordingSessionManager)
     persist_calls = [c for c in sm.calls if c[0] == "persist"]
@@ -558,9 +550,6 @@ async def test_stream_consumer_stage_snapshot(
         f"{case_id}: persist call count diverged "
         f"({len(persist_calls)} vs {case.expected_compaction_persist_calls})"
     )
-    expected_prompt_refresh_calls = (
-        case.expected_compaction_persist_calls
-        if case.expected_prompt_refresh_calls is None
-        else case.expected_prompt_refresh_calls
-    )
-    assert len(_MAILBOX.refresh_prompt_calls) == expected_prompt_refresh_calls
+    # The system prompt is never rebuilt on compaction (the summary is a
+    # message), so it stays byte-identical across it.
+    assert _MAILBOX.refresh_prompt_calls == []

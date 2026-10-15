@@ -169,7 +169,8 @@ CREATE TABLE IF NOT EXISTS transcript_entries (
     provenance_source_session_key TEXT,
     provenance_source_channel TEXT,
     provenance_source_tool TEXT,
-    schema_version INTEGER NOT NULL DEFAULT 1
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    provider_messages TEXT
 )
 """
 
@@ -203,7 +204,8 @@ CREATE TABLE IF NOT EXISTS compacted_transcript_entries (
     provenance_source_channel TEXT,
     provenance_source_tool TEXT,
     archived_at INTEGER NOT NULL,
-    schema_version INTEGER NOT NULL DEFAULT 1
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    provider_messages TEXT
 )
 """
 
@@ -499,6 +501,7 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
     json_fields = {
         "delivery_context",
         "tool_calls",
+        "provider_messages",
         "turn_usage",
         "origin",
         "details",
@@ -592,6 +595,7 @@ class SessionStorage:
         await self._migrate_transcript_fts_tokenizer()
         await self._migrate_transcript_reasoning_content_column()
         await self._migrate_transcript_turn_usage_column()
+        await self._migrate_transcript_provider_messages_column()
         await self._migrate_summary_metadata_columns()
         await self._migrate_memory_durable_receipt_coverage_columns()
         await self._migrate_session_project_id_column()
@@ -687,6 +691,22 @@ class SessionStorage:
                 "ALTER TABLE transcript_entries ADD COLUMN turn_usage TEXT"
             )
             await self._conn.commit()
+
+    async def _migrate_transcript_provider_messages_column(self) -> None:
+        """Idempotently add the structured provider-message record column.
+
+        Old rows keep ``NULL`` and load through the legacy reconstruction;
+        new assistant rows carry the exact provider-facing messages.
+        """
+        assert self._conn is not None
+        for table in ("transcript_entries", "compacted_transcript_entries"):
+            async with self._conn.execute(f"PRAGMA table_info({table})") as cur:
+                columns = [row[1] for row in await cur.fetchall()]
+            if "provider_messages" not in columns:
+                await self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN provider_messages TEXT"
+                )
+                await self._conn.commit()
 
     async def _migrate_summary_metadata_columns(self) -> None:
         """Idempotently add structured compaction summary metadata columns."""
@@ -1431,7 +1451,8 @@ class SessionStorage:
                 provenance_source_session_key,
                 provenance_source_channel,
                 provenance_source_tool,
-                schema_version
+                schema_version,
+                provider_messages
             FROM compacted_transcript_entries
             WHERE session_id = ?
             UNION ALL
@@ -1453,7 +1474,8 @@ class SessionStorage:
                 provenance_source_session_key,
                 provenance_source_channel,
                 provenance_source_tool,
-                schema_version
+                schema_version,
+                provider_messages
             FROM transcript_entries
             WHERE session_id = ?
             ORDER BY created_at ASC, id ASC
@@ -1497,7 +1519,8 @@ class SessionStorage:
                 provenance_source_channel,
                 provenance_source_tool,
                 archived_at,
-                schema_version
+                schema_version,
+                provider_messages
             )
             SELECT
                 ?,
@@ -1520,7 +1543,8 @@ class SessionStorage:
                 provenance_source_channel,
                 provenance_source_tool,
                 archived_at,
-                schema_version
+                schema_version,
+                provider_messages
             FROM compacted_transcript_entries
             WHERE session_id = ?
             ORDER BY created_at ASC, original_entry_id ASC, id ASC
@@ -1837,7 +1861,8 @@ class SessionStorage:
                 provenance_source_session_key,
                 provenance_source_channel,
                 provenance_source_tool,
-                schema_version
+                schema_version,
+                provider_messages
             FROM compacted_transcript_entries
             WHERE session_id = ? AND compaction_id = ?
             ORDER BY created_at ASC, original_entry_id ASC, id ASC
