@@ -1572,11 +1572,15 @@ the model loads on demand through `tool_search`, which the command counts on
 its own line. `agentos config set tools.defer_loading false` sends every tool
 on every request again.
 
-Two turn-speed switches, both on by default: `agentos config set
-tools.parallel_calls false` stops asking api.openai.com and OpenRouter for
-parallel tool calls, and `agentos config set agentos_router.effort_by_tier
-false` keeps each router tier's own thinking level instead of lowering it on
-cheap tiers (c0 at most `low`, c1 at most `medium`).
+Two turn-speed switches, both on by default. The first stops asking
+api.openai.com and OpenRouter for parallel tool calls; the second keeps each
+router tier's own thinking level instead of lowering it on cheap tiers (c0 at
+most `low`, c1 at most `medium`):
+
+```sh
+agentos config set tools.parallel_calls false
+agentos config set agentos_router.effort_by_tier false
+```
 
 Every CLI command logs to stderr at `INFO` and above, so its output is only
 the command's own. Set `AGENTOS_LOG_LEVEL=debug` to see the debug-level events
