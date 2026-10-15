@@ -19,7 +19,7 @@ import os
 import platform
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -110,6 +110,13 @@ from agentos.engine.turn_runner.harness import (
     _TurnRunnerTurnErrorPersistAdapter,
     _TurnRunnerTurnMemoryCaptureAdapter,
 )
+from agentos.engine.turn_runner.pre_provider_io import (
+    MEMORY_CONTEXT_KEY,
+    PROJECT_KNOWLEDGE_KEY,
+    PreProviderIO,
+    RecallBudget,
+    merge_extra_context_block,
+)
 from agentos.engine.turn_runner.stream_consumer_stage import _StreamState
 from agentos.engine.turn_timing import TurnTiming, emit_turn_timing_log
 from agentos.engine.types import (
@@ -198,6 +205,9 @@ _DEFAULT_LLM_TIMEOUT_SECONDS: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
 _ROUTER_PREV_ASSISTANT_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_TURNS: Final[int] = 4
+# Newest transcript rows read for the router context before falling back to
+# the whole transcript (only when the window lacks what the context needs).
+_ROUTER_CONTEXT_WINDOW_ENTRIES: Final[int] = 128
 _CONTEXT_SUMMARY_MARKER: Final[str] = "[Context Summary]"
 # Extra-context keys whose value is fixed for the life of a session (or changes
 # only on an explicit edit); rendered into the cached system prompt.
@@ -2017,6 +2027,110 @@ class TurnRunner:
             return ""
         return str(getattr(session, "session_id", "") or "")
 
+    # Default hard deadline for provider recall; ``[memory]
+    # recall_timeout_seconds`` overrides it.
+    RECALL_TIMEOUT_SECONDS_DEFAULT = 1.5
+    _recall_budget_state: RecallBudget | None = None
+
+    def _recall_budget(self) -> RecallBudget:
+        budget = self._recall_budget_state
+        if budget is None:
+            budget = self._recall_budget_state = RecallBudget()
+        return budget
+
+    def _recall_timeout_seconds(self) -> float:
+        value = getattr(getattr(self._config, "memory", None), "recall_timeout_seconds", None)
+        if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+            return self.RECALL_TIMEOUT_SECONDS_DEFAULT
+        return float(value)
+
+    async def _fetch_prefetch_block(
+        self,
+        *,
+        agent_id: str,
+        session_id: str,
+        message: str,
+        timeout: float | None = None,
+    ) -> str:
+        """Return the provider's fenced recall block for ``message``, or ``""``.
+
+        Bounded by ``[memory] recall_timeout_seconds``: a recall that misses
+        the deadline is not cancelled; it finishes in the background and its
+        block can stand in on the session's next turn (see ``RecallBudget``).
+        """
+        manager = self._provider_manager_for(agent_id)
+        if manager is None or not message:
+            return ""
+        return await self._recall_budget().recall(
+            (agent_id, session_id) if session_id else None,
+            lambda: manager.prefetch_all(message, session_id=session_id),
+            timeout=self._recall_timeout_seconds() if timeout is None else timeout,
+            log_fields={"agent_id": agent_id},
+        )
+
+    async def _recall_block_for_turn(self, *, agent_id: str, session_key: str, message: str) -> str:
+        return await self._fetch_prefetch_block(
+            agent_id=agent_id,
+            session_id=await self._resolve_session_id_for_prefetch(session_key),
+            message=message,
+        )
+
+    def _concurrent_turn_setup(self) -> bool:
+        task_runtime = getattr(self._config, "task_runtime", None)
+        return getattr(task_runtime, "concurrent_turn_setup", True) is not False
+
+    def _start_pre_provider_io(
+        self,
+        *,
+        agent_id: str,
+        session_key: str,
+        runtime_message: str,
+        router_exclude_last_user: bool,
+    ) -> PreProviderIO:
+        """Start the independent pre-provider reads (see ``pre_provider_io``)."""
+        from agentos.tools.deferred import hydrate_loaded_tools
+
+        concurrent = self._concurrent_turn_setup()
+        return PreProviderIO(
+            concurrent=concurrent,
+            # Gated on provider presence so the disabled default adds only a
+            # dict lookup.
+            recall=(
+                (
+                    lambda: self._recall_block_for_turn(
+                        agent_id=agent_id,
+                        session_key=session_key,
+                        message=runtime_message,
+                    )
+                )
+                if self._provider_manager_for(agent_id) is not None
+                else None
+            ),
+            project_knowledge=lambda: self._project_knowledge_block(session_key),
+            hydrate_tools=lambda: hydrate_loaded_tools(self._session_manager, session_key),
+            router_context=(
+                (
+                    lambda: self._router_previous_assistant_context(
+                        session_key,
+                        exclude_last_user=router_exclude_last_user,
+                    )
+                )
+                if concurrent
+                else None
+            ),
+            memory_warm=self._memory_warm_for(agent_id, session_key) if concurrent else None,
+        )
+
+    def _memory_warm_for(
+        self, agent_id: str, session_key: str
+    ) -> Callable[[], Coroutine[Any, Any, None]] | None:
+        sync_manager = (
+            self._memory_sync_managers.get(agent_id) if self._memory_sync_managers else None
+        )
+        if sync_manager is None:
+            return None
+        return lambda: sync_manager.warm_session(session_key)
+
     async def _augment_extra_context_with_prefetch(
         self,
         *,
@@ -2024,7 +2138,7 @@ class TurnRunner:
         session_id: str,
         message: str,
         extra_context: dict[str, str] | None,
-        timeout: float = 3.0,
+        timeout: float | None = None,
     ) -> dict[str, str] | None:
         """Return ``extra_context`` with the provider's fenced recall injected.
 
@@ -2035,33 +2149,13 @@ class TurnRunner:
         inject nothing, returning the context unchanged. No-op (returns the
         input object) when no provider is configured.
         """
-        manager = self._provider_manager_for(agent_id)
-        if manager is None or not message:
-            return extra_context
-        try:
-            block = await asyncio.wait_for(
-                manager.prefetch_all(message, session_id=session_id),
-                timeout=timeout,
-            )
-        except TimeoutError:
-            log.warning(
-                "turn_runner.memory_prefetch_timeout",
-                agent_id=agent_id,
-                timeout_seconds=timeout,
-            )
-            return extra_context
-        except Exception as exc:  # noqa: BLE001 — recall is best-effort
-            log.warning(
-                "turn_runner.memory_prefetch_failed",
-                agent_id=agent_id,
-                error=str(exc),
-            )
-            return extra_context
-        if not block:
-            return extra_context
-        merged = dict(extra_context) if extra_context else {}
-        merged["Memory Context"] = block
-        return merged
+        block = await self._fetch_prefetch_block(
+            agent_id=agent_id,
+            session_id=session_id,
+            message=message,
+            timeout=timeout,
+        )
+        return merge_extra_context_block(extra_context, MEMORY_CONTEXT_KEY, block)
 
     # Injection ceiling for project knowledge. Kept equal to
     # SessionManager.PROJECT_KNOWLEDGE_MAX_CHARS (a release-consistency test
@@ -2076,7 +2170,12 @@ class TurnRunner:
         session_key: str,
         extra_context: dict[str, str] | None,
     ) -> dict[str, str] | None:
-        """Return ``extra_context`` with the session's project knowledge injected.
+        """Return ``extra_context`` with the session's project knowledge injected."""
+        block = await self._project_knowledge_block(session_key)
+        return merge_extra_context_block(extra_context, PROJECT_KNOWLEDGE_KEY, block)
+
+    async def _project_knowledge_block(self, session_key: str) -> str | None:
+        """Return the session's wrapped project-knowledge block, or ``None``.
 
         Sessions grouped into a project share the project's free-form
         knowledge text: it is read fresh from storage each turn (an edit is
@@ -2087,10 +2186,10 @@ class TurnRunner:
         file content. Best-effort: any failure injects nothing.
         """
         if self._session_manager is None or not session_key:
-            return extra_context
+            return None
         getter = getattr(self._session_manager, "get_project_knowledge_for_session", None)
         if not callable(getter):
-            return extra_context
+            return None
         try:
             knowledge = await getter(session_key)
         except Exception as exc:  # noqa: BLE001 — knowledge injection is best-effort
@@ -2099,17 +2198,13 @@ class TurnRunner:
                 session_key=session_key,
                 error=str(exc),
             )
-            return extra_context
+            return None
         if not knowledge:
-            return extra_context
+            return None
         cap = self.PROJECT_KNOWLEDGE_INJECT_MAX_CHARS
         if len(knowledge) > cap:
             knowledge = knowledge[:cap] + "\n... [project knowledge truncated]"
-        merged = dict(extra_context) if extra_context else {}
-        merged["Project Knowledge"] = injection_guard.wrap_untrusted(
-            knowledge, source="project:knowledge"
-        )
-        return merged
+        return injection_guard.wrap_untrusted(knowledge, source="project:knowledge")
 
     async def _capture_turn_memory(
         self,
@@ -2793,31 +2888,19 @@ class TurnRunner:
             extra_prompt_context = input_out.extra_prompt_context
             normalization_metadata = input_out.normalization_metadata
 
-            # External memory provider PREFETCH (Plan B): inject this turn's
-            # recalled context as a per-turn volatile block. Gated on provider
-            # presence first so the disabled default adds only a dict lookup;
-            # bounded by a modest timeout so a slow provider cannot stall turns.
-            if self._provider_manager_for(agent_id) is not None:
-                extra_prompt_context = await self._augment_extra_context_with_prefetch(
-                    agent_id=agent_id,
-                    session_id=await self._resolve_session_id_for_prefetch(session_key),
-                    message=runtime_message,
-                    extra_context=extra_prompt_context,
-                )
-
-            # Project knowledge: sessions grouped into a project share the
-            # project's knowledge text as a per-turn prompt block. Read fresh
-            # each turn so a knowledge edit lands on the next turn.
-            extra_prompt_context = await self._augment_extra_context_with_project_knowledge(
+            # Provider recall (deadline-bounded), project knowledge, the
+            # deferred-tool hydrate and the router-context read do not depend
+            # on each other: they start together here and are applied at their
+            # old points in the old order (recall block, then project
+            # knowledge; hydrate before the tool list is built).
+            pre_io = self._start_pre_provider_io(
+                agent_id=agent_id,
                 session_key=session_key,
-                extra_context=extra_prompt_context,
+                runtime_message=runtime_message,
+                router_exclude_last_user=history_has_persisted_user or persist_input,
             )
-
-            # Loaded deferred tools persist with the session; read them back
-            # before the tool list for this turn is built.
-            from agentos.tools.deferred import hydrate_loaded_tools
-
-            await hydrate_loaded_tools(self._session_manager, session_key)
+            extra_prompt_context = await pre_io.extra_prompt_context(extra_prompt_context)
+            await pre_io.hydrate_tools()
             timing.stage_start("provider_and_tools")
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
@@ -2889,6 +2972,7 @@ class TurnRunner:
                     ),
                     ingress_pipeline_steps=ingress_pipeline_steps,
                     normalization_metadata=normalization_metadata,
+                    router_context=pre_io.router_context(),
                 )
             )
             timing.stage_end("prompt_assembler")
@@ -2982,6 +3066,7 @@ class TurnRunner:
                     request_timeout=request_timeout,
                     max_provider_retries=max_provider_retries,
                     length_capped_continuations=length_capped_continuations,
+                    pending_memory_warm=pre_io.memory_warm(),
                 )
             )
             timing.stage_end("agent_bootstrap")
@@ -5013,9 +5098,34 @@ class TurnRunner:
         *,
         exclude_last_user: bool = False,
     ) -> dict[str, Any]:
-        """Return transcript context for the V4 router, excluding the current user turn."""
+        """Return transcript context for the V4 router, excluding the current user turn.
+
+        Reads the newest ``_ROUTER_CONTEXT_WINDOW_ENTRIES`` rows first: the
+        context only needs the last few user texts and the last assistant
+        text, and deserializing a long session's whole transcript on every
+        turn is the expensive part. When the window does not hold all of
+        that, the whole transcript is read as before, so the result is the
+        same either way.
+        """
         if self._session_manager is None:
             return {}
+        get_recent = getattr(type(self._session_manager), "get_recent_transcript", None)
+        if get_recent is not None:
+            try:
+                recent = list(
+                    await self._session_manager.get_recent_transcript(
+                        session_key, _ROUTER_CONTEXT_WINDOW_ENTRIES
+                    )
+                    or []
+                )
+            except Exception:  # noqa: BLE001 - fall back to the full read below
+                recent = None
+            if recent is not None:
+                context, complete = self._router_context_from_entries(
+                    recent, exclude_last_user=exclude_last_user
+                )
+                if complete or len(recent) < _ROUTER_CONTEXT_WINDOW_ENTRIES:
+                    return context
         get_transcript = getattr(self._session_manager, "get_transcript", None)
         if not callable(get_transcript):
             return {}
@@ -5026,7 +5136,23 @@ class TurnRunner:
         except Exception:  # noqa: BLE001 - router context must never block a turn
             log.debug("turn_runner.router_context_failed", session_key=session_key)
             return {}
-        entries = list(transcript or [])
+        context, _complete = self._router_context_from_entries(
+            list(transcript or []), exclude_last_user=exclude_last_user
+        )
+        return context
+
+    def _router_context_from_entries(
+        self,
+        entries: list[Any],
+        *,
+        exclude_last_user: bool,
+    ) -> tuple[dict[str, Any], bool]:
+        """Build the router context from ``entries`` (oldest first).
+
+        The flag says whether ``entries`` held everything the context can use
+        (a full set of recent user texts and an assistant text), i.e. whether
+        any older rows could still change the result.
+        """
         user_texts: list[str] = []
         for index, entry in enumerate(entries):
             if getattr(entry, "role", None) != "user":
@@ -5045,6 +5171,7 @@ class TurnRunner:
         context: dict[str, Any] = {}
         if user_texts:
             context["history_user_texts"] = user_texts[-_ROUTER_HISTORY_USER_MAX_TURNS:]
+        users_complete = len(user_texts) >= _ROUTER_HISTORY_USER_MAX_TURNS
 
         for entry in reversed(entries):
             if getattr(entry, "role", None) != "assistant":
@@ -5063,8 +5190,8 @@ class TurnRunner:
                 and token_count > 0
             ):
                 context["prev_assistant_usage"] = {"output_tokens": token_count}
-            return context
-        return context
+            return context, users_complete
+        return context, False
 
     def _resolve_prompt_config(self, turn: Any) -> tuple[str, list | None, str | None]:
         """Resolve final system prompt and cache breakpoints from pipeline output."""

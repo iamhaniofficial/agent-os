@@ -266,6 +266,11 @@ source = "workspace"
 # overhead so a full MEMORY.md and a full USER.md both fit without either
 # block being dropped whole at the injection boundary.
 # inject_limit = 6400
+#
+# Hard deadline (seconds) for the external [memory.provider] recall that runs
+# before each turn. A late recall does not hold the turn: it finishes in the
+# background and stands in on the next turn if that one is late too.
+# recall_timeout_seconds = 1.5
 
 # [memory.provider]
 # Optional external memory provider layered on top of built-in memory. When a
@@ -343,6 +348,10 @@ max_skill_view_chars = 10000
 max_concurrency = 4
 # Waiting tasks per session before new follow-up work is rejected.
 max_pending_per_session = 64
+# Run the independent reads before a turn's first model request (memory
+# recall, project knowledge, router context, first-turn memory index warm)
+# concurrently. The prompt is the same either way; false restores serial order.
+# concurrent_turn_setup = true
 
 [agentos_router]
 enabled = true           # auto tier router

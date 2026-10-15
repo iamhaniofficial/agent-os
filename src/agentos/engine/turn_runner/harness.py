@@ -485,6 +485,7 @@ class _TurnRunnerMemorySnapshotAdapter(MemorySnapshotPort):
         *,
         agent_id: str,
         session_key: str,
+        warmed: bool = False,
     ) -> _MemorySnapshotResult:
         from agentos.engine.runtime import MemorySnapshot
         from agentos.session.keys import (
@@ -495,7 +496,7 @@ class _TurnRunnerMemorySnapshotAdapter(MemorySnapshotPort):
         sync_manager = (
             runner._memory_sync_managers.get(agent_id) if runner._memory_sync_managers else None
         )
-        if sync_manager is not None:
+        if sync_manager is not None and not warmed:
             await sync_manager.warm_session(session_key)
 
         private_memory_allowed = allows_private_memory_prompt_injection(session_key)
