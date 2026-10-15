@@ -30,6 +30,7 @@ available without `uv tool list` or `pip show`.
 | `agentos chat` | Start interactive terminal chat. |
 | `agentos agent` | Run a single automation-friendly agent turn. |
 | `agentos sessions` | List, inspect, rename, resume, abort, delete, or export sessions. |
+| `agentos acp` | Drive external coding harnesses (Claude Code, Codex, Gemini CLI, ...) over ACP: `list`, `doctor`, `run`, `sessions`, `cancel`, `close`. |
 | `agentos projects` | Group sessions into projects with shared knowledge injected into every member session. |
 | `agentos wallet` | Create, import, export and unlock wallets in the engine's vault; show balances. |
 | `agentos trade` | Quote and swap tokens on Base / Robinhood Chain through the AgentOS Aggregator (default) or Uniswap; orders, approvals, history, PnL; Uniswap V4 liquidity; DCA mandates; price triggers (stop-loss, take-profit, trailing stop, buy-the-dip, alerts); brackets (take-profit + stop-loss on one position, one cancels the other). |
@@ -884,6 +885,41 @@ that `--search`, `resume`, and `show` all accept in place of the key. Inside a
 chat, `/rename <name>` does the same for the session you are in (no name
 clears it). Names are trimmed, collapsed to one line, and capped at 120
 characters.
+
+## ACP coding harnesses
+
+```sh
+agentos acp list                                   # every harness, launch source, missing CLIs
+agentos acp list --json
+agentos acp doctor                                 # check every harness on this machine
+agentos acp doctor claude --probe                  # also spawn it and run ACP initialize (30 s cap)
+agentos acp run claude "Summarize this repo" --cwd ~/code/app
+agentos acp run codex "Fix the failing test" --permissions approve-all --oneshot
+agentos acp run claude "Keep going" --resume <acp-session-id>
+agentos acp run gemini "Explain src/" --mode read-only --json
+agentos acp sessions                               # gateway sessions, else stored records
+agentos acp cancel agent:main:acp:1a2b3c4d
+agentos acp close agent:main:acp:1a2b3c4d --discard
+```
+
+`list` and `doctor` ask the running gateway (`acp.agents`, `acp.doctor`) and
+fall back to this machine's config and `PATH` when no gateway answers;
+`--local` skips the gateway. `doctor <id>` exits 1 when that harness cannot
+launch. `run` needs no gateway: it starts the harness itself, streams the
+reply to stdout, prints progress and a `Stats:` line (runtime, tokens, cost
+when the harness reports it) to stderr, and exits 1 on an error or refusal,
+130 when cancelled. Options: `--cwd` (default: current directory), `--mode`
+(ACP session mode id the harness offers), `--oneshot` (discard the resume
+record afterwards), `--resume <acp-session-id>`, `--model`, `--timeout`
+seconds (default `[acp] turn_timeout_s`), `--permissions approve-reads`
+(default: reads allowed, everything else rejected) `| approve-all |
+deny-all`, `--verbose`, `--json` (one result object, no live text). Harness
+questions are declined. `sessions` falls back to `<state>/acp/sessions/`
+when the gateway is down; `cancel` and `close` need the gateway (`--discard`
+also deletes the resume record). Every command takes `--config <path>`
+except `cancel`/`close`.
+
+Read: [`acp-agents.md`](acp-agents.md)
 
 ## Projects
 

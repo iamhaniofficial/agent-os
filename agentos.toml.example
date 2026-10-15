@@ -764,3 +764,25 @@ cron_default_mode = "bypass"            # off | bypass | full
 # telegram = 10.0
 # [budgets.channel_daily_warn]
 # telegram = 8.0
+
+# [acp]
+# External coding harnesses (Claude Code, Codex, Gemini CLI, Cursor, Copilot,
+# OpenCode, ...) driven over the Agent Client Protocol. The agent delegates with
+# sessions_spawn(runtime="acp", acp_agent="claude"); `agentos acp run` drives one
+# by hand. Harnesses keep their own logins. See docs/acp-agents.md.
+# enabled = true                         # false refuses ACP spawns and `agentos acp run`
+# default_agent = "claude"               # harness used when a spawn names none
+# allowed_agents = ["*"]                 # ids the agent may launch; "*" = any
+# permission_mode = "ask"                # ask | approve-reads | approve-all | deny-all
+# non_interactive_permissions = "fail"   # ask with nobody to answer: fail | deny
+# approval_timeout_s = 900               # an unanswered prompt is rejected after this
+# turn_timeout_s = 0                     # wall-clock limit per harness turn; 0 = none
+# max_concurrent = 8                     # live harness sessions per gateway (1-64)
+# state_dir = "~/.agentos/state/acp"     # records, leases, logs, Codex home, worktrees
+# isolate_codex_home = true              # Codex gets its own CODEX_HOME (login copied, cwd trusted)
+# install_missing_adapters = true        # allow the npx -y / uvx adapter download on first use
+# stream_delivery = "final_only"         # final_only | live
+# [acp.agents.cursor]                    # per-harness launch override
+# command = "agent"                      # replaces the built-in command (with args)
+# args = ["acp"]
+# env = {}                               # extra environment for this harness only

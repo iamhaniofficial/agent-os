@@ -39,6 +39,8 @@ root release README with task-oriented guides.
   authoring.
 - [`features/browser.md`](features/browser.md) - browser automation and
   Chrome attachment.
+- [`acp-agents.md`](acp-agents.md) - delegate coding work to Claude Code,
+  Codex, Gemini CLI, Cursor and other ACP harnesses.
 - [`features/compaction-and-cache.md`](features/compaction-and-cache.md) -
   long-session compaction and prompt-cache continuity.
 - [`features/browser.md`](features/browser.md) - browser automation:

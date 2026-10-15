@@ -53,6 +53,17 @@ right operating instructions only when a task needs them.
 
 Read: [`features/skills.md`](features/skills.md)
 
+### ACP coding harnesses
+
+The agent can hand coding work to Claude Code, Codex, Gemini CLI, Cursor,
+GitHub Copilot, OpenCode and 20 more external coding agents over the Agent
+Client Protocol: `sessions_spawn(runtime="acp")` starts the harness as a
+child session with structured events, permission prompts routed to the
+approval queue, resume, cancel, and token/cost accounting, and the result is
+pushed back to the parent. `agentos acp run` drives one by hand.
+
+Read: [`acp-agents.md`](acp-agents.md)
+
 ### Browser automation
 
 The `browser` tool drives a real Chromium — navigate, read pages as
