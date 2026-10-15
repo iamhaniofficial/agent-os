@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from agentos.acp.policy import AcpConfig, is_unattended_ctx
 from agentos.acp.registry import get_harness, normalize_agent_id
 from agentos.acp.types import (
     PermissionDecision,
@@ -34,7 +35,6 @@ from agentos.util.bounded_registry import BoundedRegistry
 
 if TYPE_CHECKING:
     from agentos.application.approval_queue import ApprovalQueue
-    from agentos.gateway.config import AcpConfig
 
 log = structlog.get_logger(__name__)
 
@@ -198,21 +198,6 @@ def reject_decision(options: list[PermissionOptionInfo]) -> PermissionDecision:
     return picked if picked is not None else "cancel"
 
 
-def _default_surface(_session_key: str) -> str | None:
-    """Interaction mode of the tool call that is driving the harness, if any.
-
-    Mirrors ``tools/builtin/shell.py``: an ``UNATTENDED`` tool context means
-    there is no live operator to ask.
-    """
-    from agentos.tools.types import current_tool_context
-
-    ctx = current_tool_context.get()
-    if ctx is None:
-        return None
-    mode = getattr(ctx, "interaction_mode", None)
-    return str(getattr(mode, "value", mode) or "") or None
-
-
 class ApprovalQueuePermissionBridge:
     """:class:`~agentos.acp.types.PermissionBridge` over ``ApprovalQueue``.
 
@@ -258,10 +243,19 @@ class ApprovalQueuePermissionBridge:
         *,
         permission_mode: str | None = None,
         interactive: bool | None = None,
+        requester_ctx: Any = None,
     ) -> None:
-        """Record a session's effective mode and whether a human can answer."""
+        """Record a session's effective mode and whether a human can answer.
+
+        Pass the spawning turn's ``ToolContext`` as ``requester_ctx``: an
+        ``UNATTENDED`` interaction mode (cron, channel automation) marks the
+        session as having no operator, exactly as ``tools/builtin/shell.py``
+        decides it for exec approvals. ``interactive`` overrides that.
+        """
         if permission_mode:
             self._session_modes[session_key] = permission_mode
+        if interactive is None and requester_ctx is not None:
+            interactive = not is_unattended_ctx(requester_ctx)
         if interactive is not None:
             self._session_surfaces[session_key] = "interactive" if interactive else "unattended"
 
@@ -295,17 +289,14 @@ class ApprovalQueuePermissionBridge:
     def is_unattended(self, session_key: str) -> bool:
         """Whether no operator can answer prompts for ``session_key``.
 
-        Order: the surface recorded by :meth:`bind_session`, the injected
-        resolver, then the current tool context (as ``shell.py`` does).
-        Unknown means interactive: the gateway always has the Web UI.
+        Order: the surface recorded by :meth:`bind_session`, then the injected
+        resolver. Unknown means interactive: the gateway always has the Web UI.
         """
         bound = self._session_surfaces.get(session_key)
         if bound is not None:
             return bound == "unattended"
-        for resolver in (self._surface, _default_surface):
-            if resolver is None:
-                continue
-            value = resolver(session_key)
+        if self._surface is not None:
+            value = self._surface(session_key)
             if value:
                 return str(value).lower() == "unattended"
         # The gateway always has the Web UI / desktop approval surface.

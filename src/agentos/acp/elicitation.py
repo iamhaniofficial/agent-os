@@ -29,12 +29,12 @@ from urllib.parse import urlsplit
 import structlog
 
 from agentos.acp.permissions import agent_display_name
+from agentos.acp.policy import AcpConfig
 from agentos.acp.registry import normalize_agent_id
 from agentos.acp.types import ElicitationRequest, ElicitationResponse
 
 if TYPE_CHECKING:
     from agentos.application.approval_queue import ApprovalQueue
-    from agentos.gateway.config import AcpConfig
 
 log = structlog.get_logger(__name__)
 

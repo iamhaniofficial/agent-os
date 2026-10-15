@@ -18,7 +18,7 @@ from agentos.acp.permissions import (
 from agentos.acp.types import PermissionOptionInfo, PermissionPromptUnavailableError
 from agentos.application import approval_queue as approval_queue_mod
 from agentos.gateway.config import AcpConfig
-from agentos.tools.types import InteractionMode, ToolContext, current_tool_context
+from agentos.tools.types import InteractionMode, ToolContext
 
 
 def _bridge(tmp_path, **cfg):
@@ -182,14 +182,17 @@ async def test_no_surface_deny_rejects(tmp_path) -> None:
     queue.close()
 
 
-async def test_unattended_tool_context_is_detected_like_shell(tmp_path) -> None:
+async def test_unattended_requester_ctx_is_detected_like_shell(tmp_path) -> None:
     bridge, queue = _bridge(tmp_path)
-    token = current_tool_context.set(ToolContext(interaction_mode=InteractionMode.UNATTENDED))
-    try:
-        with pytest.raises(PermissionPromptUnavailableError):
-            await bridge.decide(perm_request())
-    finally:
-        current_tool_context.reset(token)
+    bridge.bind_session(
+        "agent:main:acp:0123abcd",
+        requester_ctx=ToolContext(interaction_mode=InteractionMode.UNATTENDED),
+    )
+    assert bridge.is_unattended("agent:main:acp:0123abcd")
+    with pytest.raises(PermissionPromptUnavailableError):
+        await bridge.decide(perm_request())
+    bridge.bind_session("agent:main:acp:other", requester_ctx=ToolContext())
+    assert not bridge.is_unattended("agent:main:acp:other")
     queue.close()
 
 

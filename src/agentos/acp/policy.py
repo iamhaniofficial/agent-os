@@ -11,19 +11,34 @@ session whose every permission prompt would fail.
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import Any, Literal, Protocol, cast
 
 import structlog
 
 from agentos.acp.registry import get_harness, normalize_agent_id
 from agentos.acp.types import AcpAgentNotAllowedError, AcpError
 
-if TYPE_CHECKING:
-    from agentos.gateway.config import AcpConfig
-
 log = structlog.get_logger(__name__)
 
 PermissionMode = Literal["ask", "approve-all", "approve-reads", "deny-all"]
+
+
+class AcpConfig(Protocol):
+    """The ``[acp]`` fields this package reads.
+
+    ``agentos.gateway.config.AcpConfig`` satisfies it; typing against this
+    shape keeps ``agentos.acp`` free of a ``gateway`` import edge (the
+    gateway imports ``acp``, see ``tests/test_ci/test_architecture_import_contracts.py``).
+    """
+
+    enabled: bool
+    allowed_agents: list[str]
+    permission_mode: Literal["ask", "approve-all", "approve-reads", "deny-all"]
+    non_interactive_permissions: Literal["fail", "deny"]
+    approval_timeout_s: int
+    max_concurrent: int
+    agents: Any
+
 
 PERMISSION_MODES: tuple[PermissionMode, ...] = ("approve-all", "approve-reads", "ask", "deny-all")
 
@@ -52,7 +67,10 @@ def _ctx_attr(ctx: Any, name: str, default: Any = None) -> Any:
     return getattr(ctx, name, default)
 
 
-def _is_unattended(ctx: Any) -> bool:
+def is_unattended_ctx(ctx: Any) -> bool:
+    """``True`` when ``ctx`` (a ``ToolContext`` or a dict) says no operator is
+    present -- the same ``interaction_mode is UNATTENDED`` test
+    ``tools/builtin/shell.py`` applies before queueing an exec approval."""
     mode = _ctx_attr(ctx, "interaction_mode")
     return str(getattr(mode, "value", mode) or "").lower() == "unattended"
 
@@ -110,7 +128,7 @@ def check_spawn_allowed(
         )
     mode = permission_mode or config.permission_mode
     if (
-        _is_unattended(requester_ctx)
+        is_unattended_ctx(requester_ctx)
         and mode == "ask"
         and config.non_interactive_permissions == "fail"
     ):
@@ -210,9 +228,11 @@ __all__ = [
     "PERMISSION_MODES",
     "AcpAdmission",
     "AcpConcurrencyLimitError",
+    "AcpConfig",
     "AcpPermissionModeNotAllowedError",
     "PermissionMode",
     "agent_allowed",
     "check_spawn_allowed",
     "effective_permission_mode",
+    "is_unattended_ctx",
 ]
