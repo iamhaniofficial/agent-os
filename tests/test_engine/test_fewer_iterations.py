@@ -195,8 +195,12 @@ def test_effort_by_tier_logs_the_lowered_level() -> None:
     events = [e for e in logs if e["event"] == "turn_runner.effort_by_tier"]
     assert len(events) == 1
     assert events[0]["tier"] == "c0"
-    assert events[0]["level"] == "low"
+    # ``thinking_level`` on purpose: ``level`` is structlog's own key and is
+    # overwritten by the log level, which hid the value in the gateway log.
+    assert events[0]["thinking_level"] == "low"
+    assert "level" not in events[0] or events[0]["level"] != "low"
     assert events[0]["tier_level"] == "high"
+    assert events[0]["source"] == "tier_default"
 
 
 def test_effort_by_tier_switch_off_keeps_tier_level() -> None:
@@ -210,9 +214,10 @@ def test_effort_by_tier_leaves_explicit_levels_alone() -> None:
     assert _runner(llm_thinking="xhigh")._resolve_turn_thinking(_turn("c0")) == (
         ThinkingLevel.XHIGH
     )
-    # A controller-chosen level is a per-turn decision, not the tier default.
+    # A controller-chosen level is router-owned too and is capped the same way
+    # (pilot-v1 sets it on every routed turn, so this is the default path).
     controller = _turn("c0", thinking_level_source="controller")
-    assert _runner()._resolve_turn_thinking(controller) == ThinkingLevel.HIGH
+    assert _runner()._resolve_turn_thinking(controller) == ThinkingLevel.LOW
     # An explicit model overrode the route: the tier says nothing about it.
     overridden = _turn("c0", routing_applied=False)
     assert _runner()._resolve_turn_thinking(overridden) == ThinkingLevel.HIGH

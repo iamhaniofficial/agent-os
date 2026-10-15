@@ -644,6 +644,9 @@ _HEARTBEAT_ACK_TOKEN: Final[str] = "HEARTBEAT_OK"
 # Markdown a model puts around a bare token. The system prompt itself shows the
 # sentinels as code spans, so `NO_REPLY` and **HEARTBEAT_OK** are ordinary replies.
 _SENTINEL_WRAPPERS: Final[str] = "`*_~"
+# Thinking-level sources the router owns; effort-by-tier may cap these.
+_EFFORT_BY_TIER_SOURCES: frozenset[str] = frozenset({"tier_default", "controller"})
+
 _THINKING_ALIASES: Final[dict[str, str]] = {
     "x-high": "xhigh",
     "x_high": "xhigh",
@@ -4120,11 +4123,14 @@ class TurnRunner:
     def _effort_by_tier(self, level: ThinkingLevel, metadata: Mapping[str, Any]) -> ThinkingLevel:
         """Cap a router-chosen thinking level at the routed tier's ceiling.
 
-        Only the shipped tier level is capped (``tier_default``): an
-        operator-configured tier level, a controller-chosen level, a
-        router-control hold (the user picked the route), an explicit
-        ``[llm] thinking`` (handled before this) or a route the turn did not
-        honor stay as they are. ``[agentos_router] effort_by_tier = false``
+        Router-owned levels are capped: the shipped tier level
+        (``tier_default``) and the pilot controller's per-turn pick
+        (``controller``), which is what the default ``pilot-v1`` strategy
+        uses on every routed turn. User intent is never capped: an
+        operator-configured tier level (``tier_config``), a router-control
+        hold (the user picked the route), an explicit ``[llm] thinking``
+        (handled before this) or a route the turn did not honor stay as they
+        are. ``[agentos_router] effort_by_tier = false``
         turns it off. The model choice is never touched.
         """
         from agentos.router_tiers import effort_for_tier
@@ -4134,7 +4140,7 @@ class TurnRunner:
             return level
         if metadata.get("router_control_hold_applied"):
             return level
-        if metadata.get("thinking_level_source") != "tier_default":
+        if metadata.get("thinking_level_source") not in _EFFORT_BY_TIER_SOURCES:
             return level
         if metadata.get("routing_applied") is False:
             return level
@@ -4144,8 +4150,9 @@ class TurnRunner:
             log.info(
                 "turn_runner.effort_by_tier",
                 tier=tier,
-                level=capped.value,
+                thinking_level=capped.value,
                 tier_level=level.value,
+                source=metadata.get("thinking_level_source"),
             )
         return capped
 

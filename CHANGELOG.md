@@ -26,7 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   tier table gives the routed tier, turns routed to `c0` run at most at `low`
   and turns routed to `c1` at most at `medium`; `c2`, `c3` and the image tier
   are unchanged. A level is only lowered, never raised, and the model choice
-  never changes. Left alone: `[llm] thinking`, a router-controller level, an
+  never changes. The pilot controller's per-turn level is capped the same
+  way (it is the router's own pick). Left alone: `[llm] thinking`, an
   explicit model override, a route or model the user pinned with router
   control, and a tier level the operator set to something other than the
   shipped value. Lowered turns log `turn_runner.effort_by_tier`.
