@@ -71,6 +71,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `--json`. (#3648)
 
 ### Changed
+- Approvals: when several `exec` calls of one batch need approval on the Web
+  UI or the desktop app, all of them are now asked at once instead of each
+  one only after the previous answer. The wait for the operator no longer
+  holds the call's exclusive batch slot (the same applies to sandbox
+  approval prompts); once approved, the commands still run one at a time
+  and their results keep the order the model asked for them.
 - Anthropic prompt cache now covers the whole conversation, not only the
   system prompt: breakpoints on the system prompt, the last tool definition
   and a rolling one on the last block of the last user message (at most four),
@@ -158,6 +164,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   sessions (canonical `agent:<id>:subagent:<run>` keys included) skip it.
 
 ### Fixed
+- Engine: a tool call still queued when a tool batch ran out of time could be
+  started anyway (and killed a moment later) when the running call's own
+  timeout fired first; the two expire at the same instant. It now times out
+  unstarted like every other queued call. This was also the cause of the
+  `test_batch_deadline_times_out_running_and_queued_calls` flake on Windows
+  CI, which now uses a fake clock.
 - Engine: the request right after an in-turn compaction lost most of its
   system prompt (the Skills and Local Toolchain sections, ~60% of it in a
   live session) because the compaction rebuilt the prompt without the

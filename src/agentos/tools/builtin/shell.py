@@ -41,6 +41,7 @@ from agentos.sandbox.integration import (
 )
 from agentos.sandbox.policy import build_policy, select_level
 from agentos.sandbox.types import DenialReason, DenialResult, SandboxPolicy, SandboxRequest
+from agentos.tools.batch_slot import wait_outside_tool_slot
 from agentos.tools.builtin.artifacts import publish_inline_artifacts
 from agentos.tools.builtin.shell_policy import check_safe_bin
 from agentos.tools.env_passthrough import build_subprocess_env
@@ -1752,7 +1753,11 @@ async def _check_exec_approval(
         approval_id = queue.request(namespace="exec", params=params)
         if _wait_for_inline_browser_approval(background):
             try:
-                await queue.wait(approval_id, timeout=_APPROVAL_RETRY_WAIT_SECONDS)
+                # Free this call's batch slot while the operator decides, so
+                # the other exec calls of the batch can ask at the same time.
+                await wait_outside_tool_slot(
+                    queue.wait(approval_id, timeout=_APPROVAL_RETRY_WAIT_SECONDS)
+                )
             except TimeoutError:
                 pass
             entry = queue.get(approval_id)
@@ -1827,7 +1832,9 @@ async def _check_exec_approval(
         # back approval_pending — otherwise the model sees pending and pivots
         # to a different tool before the human finishes clicking approve.
         try:
-            await queue.wait(approval_id, timeout=_APPROVAL_RETRY_WAIT_SECONDS)
+            await wait_outside_tool_slot(
+                queue.wait(approval_id, timeout=_APPROVAL_RETRY_WAIT_SECONDS)
+            )
         except TimeoutError:
             pass
         entry = queue.get(approval_id)
