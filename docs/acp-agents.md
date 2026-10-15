@@ -220,6 +220,7 @@ max_concurrent = 8                  # live harness sessions per gateway (1-64)
 isolate_codex_home = true
 install_missing_adapters = true     # allow npx -y / uvx downloads on first use
 stream_delivery = "final_only"      # final_only | live
+allowed_cwds = []                   # extra dirs a harness may use as cwd (besides workspace / worktrees)
 
 [acp.agents.cursor]                 # per-harness override
 command = "agent"
