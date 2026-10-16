@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [2026.10.16] - 2026-10-16
+
 ### Added
 - ACP coding harnesses. The agent can delegate coding work to Claude Code,
   Codex, Gemini CLI, Cursor, GitHub Copilot, OpenCode and 20 more external
@@ -40,9 +42,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   tool inspects and controls them, `worktree=true` gives the harness its own
   git worktree, and `[acp] allowed_cwds` lets it work outside the workspace.
 
-## [2026.10.13] - 2026-10-13
-
-### Added
 - Turn timing trace. Every turn now records where its wall-clock time goes:
   per stage, per provider call (time to first event, first text, end of
   stream, tokens) and per tool batch (duration, calls, approval wait), plus
@@ -84,15 +83,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   notice; subagent and cron sessions are skipped; the
   in-turn check stays as the safety net. `[compaction] proactive = false`
   turns it off.
-- Suggested next prompt. When a turn finishes, the chat input in the web
-  console, the desktop app and `agentos chat` shows the message the user is
-  most likely to send next as grey placeholder text; `Tab` takes it into the
-  input and `Enter` sends it. Clients ask for it through the new
-  `chat.suggestNext` RPC, answered by the auxiliary model (task
-  `suggest_next`, preferring the router's cheapest text tier) from the last
-  exchange. Errored or aborted turns get none and cost no call, and answers
-  are cached per reply so clients sharing a session share one call. On by
-  default; `[sessions] suggest_next = false` turns it off.
 - Prompt caching: `[prompt_cache] ttl = "1h"` (env `AGENTOS_CACHE_TTL`) keeps
   Anthropic's cached system prompt and tool list for an hour instead of five
   minutes. Default unchanged (`5m`). (#3648)
@@ -310,6 +300,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   arguments (OpenAI-compatible). The provider now retries such a stream once,
   transparently, as long as no text was streamed yet; otherwise it reports
   the interruption instead of retrying and duplicating output. (#3648)
+
+## [2026.10.13] - 2026-10-13
+
+### Added
+- Suggested next prompt. When a turn finishes, the chat input in the web
+  console, the desktop app and `agentos chat` shows the message the user is
+  most likely to send next as grey placeholder text; `Tab` takes it into the
+  input and `Enter` sends it. Clients ask for it through the new
+  `chat.suggestNext` RPC, answered by the auxiliary model (task
+  `suggest_next`, preferring the router's cheapest text tier) from the last
+  exchange. Errored or aborted turns get none and cost no call, and answers
+  are cached per reply so clients sharing a session share one call. On by
+  default; `[sessions] suggest_next = false` turns it off.
+
+### Fixed
 - Providers: a 429 that said `Retry-After: 2` failed over to another model at
   once -- losing the prompt cache and changing the cost -- and three of them
   marked the primary provider down for a minute. The providers threw the
