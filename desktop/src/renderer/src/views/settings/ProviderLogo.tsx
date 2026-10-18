@@ -42,7 +42,7 @@ const MARKS: Record<string, string> = {
  * the plate edge to edge.
  */
 const RASTER: Record<string, { src: string; bleed?: boolean }> = {
-  bankr: { src: bankr },
+  bankr: { src: bankr, bleed: true },
   opencap: { src: opencap, bleed: true },
   surplus: { src: surplus },
 }
