@@ -336,14 +336,14 @@ def _cron_job_view(job: Any) -> dict[str, Any]:
         "last_run_at": last_run_at.isoformat() if last_run_at is not None else "",
         "elevated": (
             cron_tool_policy_elevated(job.tool_policy)
-            if isinstance(getattr(job, "tool_policy", None), dict)
-            and "elevated" in job.tool_policy
+            if isinstance(getattr(job, "tool_policy", None), dict) and "elevated" in job.tool_policy
             else (
                 configured_cron_default_elevated(_gateway_config)
                 if getattr(job, "handler_key", None) == "agent_run"
                 else None
             )
-        ) or "",
+        )
+        or "",
     }
 
 
@@ -466,11 +466,7 @@ def _parse_cron_delivery(raw: Any) -> dict[str, Any] | None:
         # was already promoted to mode='channel' above, so the only way to land
         # here is an explicitly contradictory mode: nothing legitimate is lost
         # by refusing it.
-        stray = [
-            f
-            for f in ("channel_name", "channel_id", "account_id", "thread_id")
-            if parsed[f]
-        ]
+        stray = [f for f in ("channel_name", "channel_id", "account_id", "thread_id") if parsed[f]]
         if stray:
             raise SafeToolError(
                 f"delivery.{stray[0]} conflicts with delivery.mode='{mode}' — "
@@ -513,12 +509,9 @@ def _validate_cron_delivery_channel(channel_name: str) -> None:
     if not known:
         # A live manager with nothing in it is a real answer, not a missing one:
         # no channel delivery can succeed at all.
-        raise SafeToolError(
-            "no channels are configured, so a cron job cannot deliver to one"
-        )
+        raise SafeToolError("no channels are configured, so a cron job cannot deliver to one")
     raise SafeToolError(
-        f"no channel named '{channel_name}' is configured; "
-        f"available: {', '.join(sorted(known))}"
+        f"no channel named '{channel_name}' is configured; available: {', '.join(sorted(known))}"
     )
 
 
@@ -887,9 +880,7 @@ def _session_storage_or_none() -> Any:
                 },
                 "account_id": {
                     "type": "string",
-                    "description": (
-                        "Optional account binding for multi-account channels."
-                    ),
+                    "description": ("Optional account binding for multi-account channels."),
                 },
                 "thread_id": {
                     "type": "string",
@@ -952,9 +943,7 @@ async def cron(
     if action in ("get", "update", "remove", "run", "runs") and not job_id:
         raise SafeToolError(f"'job_id' required for {action}")
     if action != "update" and enabled is not None:
-        raise SafeToolError(
-            "'enabled' is only accepted by update; a new job always starts enabled"
-        )
+        raise SafeToolError("'enabled' is only accepted by update; a new job always starts enabled")
 
     # Dispatch to injected scheduler
     if _scheduler is None:
@@ -1033,7 +1022,8 @@ async def cron(
                         if getattr(j, "handler_key", None) == "agent_run"
                         else None
                     )
-                ) or "",
+                )
+                or "",
             }
             for j in jobs
         ]
@@ -1765,7 +1755,12 @@ def _lookup_config_path(data: Any, parts: list[str]) -> tuple[bool, Any]:
 
 @tool(
     name="gateway",
-    description="Gateway control: restart and configuration management.",
+    description=(
+        "Gateway control: restart and configuration management. 'restart' restarts "
+        "the gateway in place once this turn ends (safe mode drains active turns, "
+        "force cancels them, including this one) and posts a confirmation to this "
+        "chat after boot; it only works when [gateway_control] chat_restart = true."
+    ),
     params={
         "action": {
             "type": "string",
@@ -1779,6 +1774,13 @@ def _lookup_config_path(data: Any, parts: list[str]) -> tuple[bool, Any]:
             "type": "string",
             "description": "Config value as JSON string (required for config_set)",
         },
+        "mode": {
+            "type": "string",
+            "description": (
+                "restart only: 'safe' (default, drain active turns for up to 30s) "
+                "or 'force' (cancel them now)"
+            ),
+        },
     },
     required=["action"],
     exposed_by_default=False,
@@ -1787,6 +1789,7 @@ async def gateway(
     action: str,
     key: str | None = None,
     value: str | None = None,
+    mode: str | None = None,
 ) -> str:
     if action not in _VALID_GATEWAY_ACTIONS:
         raise ToolError(f"Invalid action: {action}. Must be restart|config_get|config_set")
@@ -1811,7 +1814,7 @@ async def gateway(
     config = _gateway_config
 
     if action == "restart":
-        raise ToolError("Gateway restart not supported via tool")
+        return _restart_gateway_from_tool(config, mode)
 
     if action == "config_get":
         assert key is not None
@@ -1836,6 +1839,9 @@ async def gateway(
         return json.dumps({"action": "config_get", "key": key, "value": val})
 
     # config_set
+    # NOTE: no GatewayConfig has a ``patch`` method, so this branch always
+    # ends in "Config modification not supported"; left as is (out of scope
+    # for the restart work).
     if hasattr(config, "patch"):
         await config.patch({key: parsed_value})
         return json.dumps(
@@ -1846,3 +1852,73 @@ async def gateway(
             }
         )
     raise ToolError("Config modification not supported")
+
+
+_CHAT_RESTART_DISABLED = (
+    "Gateway restart from chat is disabled; an operator must set "
+    "[gateway_control] chat_restart = true and restart the gateway once."
+)
+
+
+def _restart_gateway_from_tool(config: Any, mode: str | None) -> str:
+    """Schedule an in-place restart on the agent's behalf.
+
+    Same gate as a channel caller of ``gateway.restart``: the model acting
+    is never more trusted than a paired chat sender. The restart runs once
+    this turn ends (``restart.ACK_GRACE_S`` plus the drain), so the model
+    can still finish its reply; the confirmation after boot is posted to
+    the chat this turn came from.
+    """
+    from agentos.gateway.restart import (
+        RestartOrigin,
+        RestartPendingError,
+        RestartUnsupportedError,
+        drain_timeout_for,
+        get_restarter,
+        normalize_mode,
+    )
+    from agentos.tools.types import current_tool_context
+
+    control = getattr(config, "gateway_control", None)
+    if not bool(getattr(control, "chat_restart", False)):
+        raise SafeToolError(_CHAT_RESTART_DISABLED)
+    try:
+        resolved_mode = normalize_mode(mode)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    restarter = get_restarter()
+    if restarter is None:
+        raise SafeToolError("Gateway restart is unavailable in this runtime.")
+    origin = RestartOrigin.from_tool_context(current_tool_context.get())
+    try:
+        req = restarter.request(reason="agent_tool", mode=resolved_mode, origin=origin)
+    except RestartPendingError:
+        pending = restarter.pending
+        return json.dumps(
+            {
+                "action": "restart",
+                "accepted": False,
+                "alreadyPending": True,
+                "restartId": pending.restart_id if pending else None,
+            }
+        )
+    except RestartUnsupportedError as exc:
+        raise SafeToolError(str(exc)) from exc
+    return json.dumps(
+        {
+            "action": "restart",
+            "accepted": True,
+            "restartId": req.restart_id,
+            "mode": req.mode,
+            "drainTimeoutSeconds": drain_timeout_for(req.mode),
+            "note": (
+                "The gateway restarts once this turn ends"
+                + (
+                    f" (safe mode waits up to {int(drain_timeout_for(req.mode))}s for active turns)"
+                    if req.mode == "safe"
+                    else " (force: active turns, including this one, are cancelled)"
+                )
+                + ". Finish your reply now; a confirmation is posted to this chat after boot."
+            ),
+        }
+    )

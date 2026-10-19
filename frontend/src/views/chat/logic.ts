@@ -1383,3 +1383,42 @@ export function popPendingTail(queue: PendingItem[]): RecoverResult {
     recovered: true,
   }
 }
+
+/** How long `/restart` watches for the socket to come back before giving up on its toast. */
+export const GATEWAY_RECONNECT_WATCH_MS = 90_000
+
+/**
+ * Call `onBack` the first time the RPC socket reconnects after dropping —
+ * what `/restart` needs to say "Gateway is back". A `connected` seen before
+ * any drop is the current connection, not the new one. Returns a disposer;
+ * the watch also disposes itself after `timeoutMs`.
+ */
+export function watchGatewayReconnect(
+  rpc: { on: (event: string, handler: (state: unknown) => void) => () => void },
+  onBack: () => void,
+  timeoutMs = GATEWAY_RECONNECT_WATCH_MS,
+): () => void {
+  let dropped = false
+  let done = false
+  let unsubscribe: () => void = () => {}
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const finish = () => {
+    if (done) return
+    done = true
+    unsubscribe()
+    if (timer !== null) clearTimeout(timer)
+  }
+  unsubscribe = rpc.on('_state', (state) => {
+    if (done) return
+    if (state === 'disconnected' || state === 'connecting') {
+      dropped = true
+      return
+    }
+    if (state === 'connected' && dropped) {
+      finish()
+      onBack()
+    }
+  })
+  timer = setTimeout(finish, timeoutMs)
+  return finish
+}

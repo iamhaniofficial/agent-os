@@ -1309,6 +1309,31 @@ Bind precedence:
 5. config host
 6. `127.0.0.1`
 
+## Gateway Control
+
+The gateway can restart itself in place on request (`/restart` in a chat, the
+`gateway.restart` RPC, `agentos gateway restart`; see
+[Gateway](gateway.md#when-to-restart)). Who may ask depends on the surface:
+
+```toml
+[gateway_control]
+chat_restart = false   # /restart from paired channels and the agent's gateway tool
+```
+
+- Operators on a Control surface — the web console, the desktop app, the CLI —
+  can always restart the gateway. They already hold `updates.apply` and
+  `config.patch`, which are strictly more powerful.
+- A paired channel sender (`/restart` on Telegram, Discord, Slack, …), a
+  connection bound to an agent, and the agent's own `gateway` tool are refused
+  unless `chat_restart` is `true`. Any paired sender may restart once it is;
+  there is no owner or admin tier.
+
+`chat_restart` defaults to `false`. Changing it requires one restart of the
+gateway (`agentos gateway restart`, or `/restart` from the web console), after
+which chat restarts are accepted. Environment override:
+`AGENTOS_GATEWAY_GATEWAY_CONTROL__CHAT_RESTART=true`. In-place restart is not
+available on Windows.
+
 ## Update Notifications
 
 On commands that connect to the gateway, the CLI checks PyPI at most once every

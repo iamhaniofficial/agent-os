@@ -177,6 +177,11 @@ export const chat = defineNamespace('chat', {
   slashRoutingAlready: 'Automatic routing already active',
   slashRouterUnpinFailed: 'Router unpin failed: {message}',
   slashUseNeedsModel: 'Usage: /use <model-id>',
+  slashRestartRequested: 'Restarting the gateway… draining active turns first',
+  slashRestartForced: 'Restarting the gateway now (force)',
+  slashRestartPending: 'A gateway restart is already in progress',
+  slashRestartDone: 'Gateway is back',
+  slashRestartFailed: 'Restart failed: {message}',
   slashUnsupported: 'Unsupported command: {command}',
 
   // Composer route picker.

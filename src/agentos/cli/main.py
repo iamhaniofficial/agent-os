@@ -854,9 +854,14 @@ def gateway_restart(
     shutdown_timeout: float = typer.Option(
         10.0, "--shutdown-timeout", help="Shutdown wait timeout"
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="In-place restart only: cancel active turns instead of draining them",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
-    """Restart the recorded gateway process."""
+    """Restart the gateway: the recorded process, or a healthy unmanaged one in place."""
     from agentos.cli.gateway_cmd import restart_gateway
 
     restart_gateway(
@@ -866,6 +871,7 @@ def gateway_restart(
         config_path=config_path,
         health_timeout=health_timeout,
         shutdown_timeout=shutdown_timeout,
+        force=force,
         json_output=json_output,
     )
 

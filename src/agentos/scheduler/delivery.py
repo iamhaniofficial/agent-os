@@ -472,39 +472,18 @@ class DeliveryChain:
             )
             return _failed(f"no adapter is registered for channel {channel_name!r}")
         try:
-            from agentos.channels.types import OutgoingMessage
+            from agentos.channels.addressing import build_outgoing_for_target
 
-            if channel_name == "slack":
-                if thread_id:
-                    msg = OutgoingMessage(
-                        content=text,
-                        reply_to=thread_id,
-                        metadata={"channel": channel_id},
-                    )
-                else:
-                    msg = OutgoingMessage(
-                        content=text,
-                        reply_to="cron",
-                        metadata={"channel": channel_id, "thread_ts": None},
-                    )
-            elif channel_name == "email" and configured_recipient and channel_id:
-                msg = OutgoingMessage(
-                    content=text, reply_to=channel_id, metadata={"to": channel_id}
-                )
-            else:
-                # A thread id names a conversation *inside* the chat, so it is
-                # what the message is addressed to, with the chat carried
-                # beside it in ``metadata["channel"]`` — the rule
-                # ``channel_dispatch._route_envelope_reply_message`` states for
-                # the in-turn reply. Dropping it delivered a job scheduled in a
-                # Telegram forum topic to the group's General topic, and one
-                # scheduled in a Discord thread to the parent channel.
-                thread_metadata = {"channel": channel_id} if thread_id and channel_id else {}
-                msg = OutgoingMessage(
-                    content=text,
-                    reply_to=thread_id or channel_id or None,
-                    metadata=thread_metadata,
-                )
+            # Thread-in-chat addressing lives in ``channels.addressing`` so the
+            # gateway's own out-of-turn sends (the restart announcement) follow
+            # the same rule as cron delivery.
+            msg = build_outgoing_for_target(
+                channel_type=channel_name,
+                to=channel_id,
+                thread_id=thread_id,
+                text=text,
+                configured_recipient=configured_recipient,
+            )
             await asyncio.wait_for(adapter.send(msg), timeout=30.0)
             log.info("delivery.channel_sent", job_id=job_id, channel=channel_name)
             return "delivered"

@@ -46,6 +46,7 @@ import contextlib
 import hmac
 import os
 import secrets
+import tempfile
 import threading
 from collections import OrderedDict
 from collections.abc import Iterator
@@ -194,6 +195,33 @@ class AgentSurface:
         if path is not None:
             with contextlib.suppress(OSError):
                 path.unlink()
+
+    def export_operator_secret_file(self, state_dir: Path | None = None) -> Path | None:
+        """Write the desktop-handed secret to a fresh 0600 file for a re-exec.
+
+        :meth:`load_operator_secret_from_env` deletes the file the desktop
+        handed us, so a gateway that re-executes itself in place has to hand
+        the secret on the same way or the desktop renderer reconnects as an
+        agent. The new image reads and deletes this file at boot exactly as
+        it does the desktop's. Returns ``None`` when no desktop secret is
+        held. Only the path is logged, never the secret.
+        """
+        secret = self._env_secret
+        if not secret:
+            return None
+        directory = default_operator_secret_path(state_dir).parent
+        directory.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(directory, 0o700)
+        fd, raw_path = tempfile.mkstemp(prefix="operator-secret.reexec-", dir=str(directory))
+        try:
+            os.write(fd, (secret + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        path = Path(raw_path)
+        os.chmod(path, 0o600)
+        log.info("agent_surface.operator_secret_exported", path=str(path))
+        return path
 
     def load_operator_secret_from_env(self, environ: dict[str, str] | None = None) -> bool:
         """Read the desktop's secret at boot and scrub every trace of it.

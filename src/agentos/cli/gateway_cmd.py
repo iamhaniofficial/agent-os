@@ -6,6 +6,9 @@ import asyncio
 import json
 import os
 import sys
+import time
+from pathlib import Path
+from typing import Any
 
 import typer
 from rich.markup import escape
@@ -156,9 +159,20 @@ def run_gateway(
             await server._task
         except (KeyboardInterrupt, asyncio.CancelledError):
             await server.close("keyboard_interrupt")
+        # An in-place restart ends the server task from inside its own
+        # ``close()``. Let it finish closing the services here, inside the
+        # loop, before ``asyncio.run`` tears the loop down under it.
+        restarter = getattr(server, "_restarter", None)
+        restart_task = getattr(restarter, "task", None)
+        if restart_task is not None:
+            try:
+                await restart_task
+            except asyncio.CancelledError:
+                pass
 
     try:
         asyncio.run(_run())
+        _exec_pending_restart()
     except ValueError as exc:
         from agentos.onboarding.next_steps import env_recovery_commands
         from agentos.onboarding.status import get_onboarding_status
@@ -195,12 +209,23 @@ def run_gateway(
             console.print(f"{entry['label']}: {entry['command']}")
         if config.config_path:
             console.print(
-                "Inspect onboarding: agentos onboard status"
-                f"{config_cli_arg(config.config_path)}"
+                f"Inspect onboarding: agentos onboard status{config_cli_arg(config.config_path)}"
             )
         raise typer.Exit(code=1) from exc
     except KeyboardInterrupt:
         console.print("\n[yellow]Gateway stopped.[/yellow]")
+
+
+def _exec_pending_restart() -> None:
+    """Replace the process with the re-exec image a ``/restart`` planned.
+
+    Runs outside any event loop; a no-op when no restart is pending.
+    """
+    from agentos.gateway.restart import get_restarter
+
+    restarter = get_restarter()
+    if restarter is not None:
+        restarter.exec_if_pending()
 
 
 def _resolve_lifecycle_host(*, bind: str, listen: str) -> str:
@@ -309,9 +334,7 @@ def _emit_status_with_versions(
     from agentos import __version__
 
     cli_version = __version__
-    mismatch = bool(
-        gateway_version and gateway_version != cli_version
-    )
+    mismatch = bool(gateway_version and gateway_version != cli_version)
 
     if json_output:
         payload = result.to_payload()
@@ -353,9 +376,7 @@ def status_gateway(
 
     if gateway_url:
         result = remote_gateway_status(gateway_url)
-        version = (
-            gateway_handshake_version(gateway_url=gateway_url) if result.ok else None
-        )
+        version = gateway_handshake_version(gateway_url=gateway_url) if result.ok else None
         _emit_status_with_versions(result, gateway_version=version, json_output=json_output)
         return
 
@@ -387,6 +408,130 @@ def stop_gateway(
     _emit_lifecycle_result(manager.stop(), json_output=json_output)
 
 
+class _RestartRpcRefusedError(Exception):
+    """``gateway.restart`` could not be made, or the gateway said no."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _gateway_pid_record(config: GatewayConfig) -> dict[str, Any] | None:
+    """The ``gateway.pid`` record every ``gateway run`` writes: ``pid`` + ``start_ts``.
+
+    ``start_ts`` is what tells a re-executed gateway (same pid) apart from
+    the one that accepted the restart.
+    """
+    path = Path(config.state_dir or default_agentos_home() / "state") / "gateway.pid"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _call_gateway_restart(
+    *, gateway_url: str, config_path: str | None, mode: str
+) -> dict[str, Any]:
+    """Ask the gateway at ``gateway_url`` to restart itself in place (``gateway.restart``)."""
+
+    from agentos.cli import gateway_client as gcm
+    from agentos.cli.gateway_rpc import _target_gateway_url, default_gateway_token
+
+    async def _go() -> dict[str, Any]:
+        client = gcm.GatewayClient()
+        try:
+            url = _target_gateway_url(gateway_url=gateway_url, config_path=config_path)
+            await client.connect(url, token=default_gateway_token(config_path))
+            payload = await client.call("gateway.restart", {"mode": mode, "reason": "cli"})
+            return payload if isinstance(payload, dict) else {}
+        except gcm.GatewayRPCError as exc:
+            raise _RestartRpcRefusedError(str(exc.code or "RPC_ERROR"), str(exc.message)) from exc
+        except SystemExit as exc:
+            raise _RestartRpcRefusedError("GATEWAY_UNAVAILABLE", str(exc)) from exc
+        except (ConnectionError, OSError) as exc:
+            raise _RestartRpcRefusedError("GATEWAY_UNAVAILABLE", str(exc)) from exc
+        finally:
+            await client.close()
+
+    return asyncio.run(_go())
+
+
+def restart_gateway_in_place(
+    manager: GatewayLifecycleManager,
+    *,
+    config_path: str | None,
+    mode: str = "safe",
+) -> GatewayLifecycleResult:
+    """Restart a healthy gateway this CLI does not manage, through the gateway itself.
+
+    The pidfile path only works for a gateway ``agentos gateway start``
+    spawned. One started by the desktop app, launchd, systemd or a terminal
+    shows up as ``unmanaged``; it can still restart itself in place over
+    ``gateway.restart`` (same pid, so every launcher keeps tracking it). The
+    restart is confirmed by a changed ``start_ts`` in ``gateway.pid`` plus a
+    passing readiness probe. A refusal (Windows, no gateway) keeps the
+    ``unmanaged`` result and its exit code 3 with the RPC error in details.
+    """
+    from agentos.cli.gateway_rpc import _format_url_host
+
+    config = _load_config_or_exit(config_path)
+    before = _gateway_pid_record(config) or {}
+    before_ts = before.get("start_ts")
+    # The gateway this command was pointed at (``--port``/``--listen``), not
+    # the CLI's default endpoint: ``probe_host`` already maps a wildcard bind
+    # to loopback the way the health probe does.
+    gateway_url = f"ws://{_format_url_host(manager.probe_host)}:{manager.port}/ws"
+    try:
+        payload = _call_gateway_restart(gateway_url=gateway_url, config_path=config_path, mode=mode)
+    except _RestartRpcRefusedError as exc:
+        result = manager._unmanaged_result("restart", ok=False)
+        result.details = {"rpc": {"code": exc.code, "message": exc.message}}
+        if exc.code == "RESTART_UNSUPPORTED":
+            result.message = exc.message
+        return result
+
+    details: dict[str, Any] = {
+        "restartId": payload.get("restartId"),
+        "mode": payload.get("mode") or mode,
+        "alreadyPending": bool(payload.get("alreadyPending")),
+        "inPlace": True,
+    }
+    deadline = (
+        time.monotonic() + max(manager.shutdown_timeout, 0.0) + max(manager.health_timeout, 0.0)
+    )
+    while True:
+        record = _gateway_pid_record(config) or {}
+        start_ts = record.get("start_ts")
+        if start_ts and start_ts != before_ts and manager._probe_ready():
+            return manager._result(
+                "restart",
+                "running",
+                pid=record.get("pid"),
+                managed=False,
+                message="Gateway restarted in place.",
+                details=details,
+            )
+        if time.monotonic() > deadline:
+            break
+        time.sleep(manager.poll_interval)
+    return manager._result(
+        "restart",
+        "restart_timeout",
+        ok=False,
+        pid=before.get("pid"),
+        managed=False,
+        code="RESTART_TIMEOUT",
+        message=(
+            "The gateway accepted the restart but has not come back yet; "
+            "check 'agentos gateway status'."
+        ),
+        details=details,
+        exit_code_value=1,
+    )
+
+
 def restart_gateway(
     port: int | None = typer.Option(18791, "--port", "-p", help="Port to restart"),
     bind: str | None = typer.Option("127.0.0.1", "--bind", "-b", help="Host to restart"),
@@ -396,9 +541,14 @@ def restart_gateway(
     shutdown_timeout: float = typer.Option(
         10.0, "--shutdown-timeout", help="Shutdown wait timeout"
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="In-place restart only: cancel active turns instead of draining them",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
-    """Restart the recorded gateway process."""
+    """Restart the gateway: the recorded process, or a healthy unmanaged one in place."""
 
     manager = _lifecycle_manager(
         port=port,
@@ -408,4 +558,11 @@ def restart_gateway(
         health_timeout=health_timeout,
         shutdown_timeout=shutdown_timeout,
     )
-    _emit_lifecycle_result(manager.restart(), json_output=json_output)
+    status = manager.status()
+    if status.state == "unmanaged":
+        result = restart_gateway_in_place(
+            manager, config_path=config_path, mode="force" if force else "safe"
+        )
+    else:
+        result = manager.restart()
+    _emit_lifecycle_result(result, json_output=json_output)
