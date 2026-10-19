@@ -503,7 +503,9 @@ async def test_concurrent_setup_sends_byte_identical_requests(tmp_path: Path) ->
     serial, serial_sync = await _drive_three_turns(serial_dir, concurrent=False)
 
     def _normalised(provider: _RecordingProvider, root: Path) -> list[str]:
-        return [json.dumps(r, sort_keys=True).replace(str(root), "<ws>") for r in provider.requests]
+        # json.dumps doubles a Windows path's backslashes, so match the escaped form.
+        root_text = json.dumps(str(root))[1:-1]
+        return [json.dumps(r, sort_keys=True).replace(root_text, "<ws>") for r in provider.requests]
 
     assert len(concurrent.requests) == 3
     assert _normalised(concurrent, concurrent_dir) == _normalised(serial, serial_dir)
