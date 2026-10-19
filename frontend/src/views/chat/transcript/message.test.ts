@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { render } from '../markdown'
-import { createMessageRenderer, historyTurnMeta } from './message'
+import { createMessageRenderer, historyTurnMeta, systemRowTone } from './message'
 import { createThinkingBlock } from './thinking'
 
 const chatCss = readFileSync('src/views/chat/chat.css', 'utf8')
@@ -140,6 +140,15 @@ describe('message renderer', () => {
     expect(failed.querySelector('.msg-body')).toHaveAttribute('data-tone', 'error')
     const note = renderer.addMessage('system', 'Context compacted')!
     expect(note.querySelector('.msg-body')).not.toHaveAttribute('data-tone')
+  })
+
+  it('draws a stopped turn ("Cancelled after …") as a notice, never as an error', () => {
+    const { renderer } = makeRenderer()
+    const row = renderer.addMessage('system', 'Cancelled after 6 tool calls (1:42).')!
+    expect(row.querySelector('.msg-body')).toHaveAttribute('data-tone', 'notice')
+    expect(systemRowTone('Error: boom')).toBe('error')
+    expect(systemRowTone('Canceled by the user')).toBe('notice')
+    expect(systemRowTone('Cancellation policy changed')).toBe('')
   })
 
   it('attaches model, token, cost, cache, and reasoning metadata', () => {

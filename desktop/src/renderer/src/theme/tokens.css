@@ -926,6 +926,34 @@
   .composer textarea::placeholder {
     color: var(--dim);
   }
+  /* The controls' fieldset (Composer.tsx): no box of its own, so the row
+     lays out as if it were not there; it exists to switch them all off. */
+  .composer-fieldset {
+    display: contents;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    min-width: 0;
+  }
+  /* Switched off (a coding harness's session that was ended): the reason
+     sits above the composer at full contrast, the controls go quiet. */
+  .composer-disabled-note {
+    margin: 0 0 6px;
+    padding: 0 14px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--muted-foreground);
+  }
+  .composer[data-disabled='true'] {
+    background: color-mix(in srgb, var(--elevated) 70%, transparent);
+    box-shadow: none;
+  }
+  .composer[data-disabled='true'] :is(textarea, button) {
+    cursor: not-allowed;
+  }
+  .composer[data-disabled='true'] :is(.composer-chip, .composer-send, .composer-route) {
+    opacity: 0.4;
+  }
   /* The key that takes the suggested next prompt, shown while it is the placeholder. */
   .composer-suggestion-key {
     flex-shrink: 0;

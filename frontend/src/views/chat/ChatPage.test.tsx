@@ -347,6 +347,25 @@ describe('ChatPage', () => {
     expect(thread.querySelector('.msg.system')).toHaveTextContent('Error: the session was closed')
   })
 
+  it('shows a stopped turn as a notice, not as a red error', async () => {
+    mockRpc = makeRpc()
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'commands.list_for_surface') {
+        return Promise.resolve({ surface: 'web_chat', commands: SLASH_CATALOG })
+      }
+      if (args[0] === 'chat.history')
+        return Promise.resolve({ messages: [], history_scope: 'complete' })
+      return Promise.resolve({})
+    })
+    renderPage()
+    const thread = document.querySelector('.chat-thread') as HTMLElement
+    await waitFor(() => expect(thread.querySelector('.chat-empty')).not.toBeNull())
+    act(() => {
+      mockRpc.emit('session.event.error', { code: 'ACP_CANCELLED', message: 'cancelled' }, {})
+    })
+    expect(thread.querySelector('.msg.error')).toHaveAttribute('data-tone', 'notice')
+  })
+
   it('clears the thread when a reset bumps the session epoch', async () => {
     mockRpc = makeRpc()
     let historyReads = 0

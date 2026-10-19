@@ -156,6 +156,18 @@ function appendSubagentDisclosure(body: HTMLElement, text: string): void {
   body.appendChild(details)
 }
 
+/**
+ * How a persisted `system` row reads. A failed turn persists "Error: …"
+ * (engine runtime, ACP dispatch): an error. A turn someone stopped persists
+ * "Cancelled …" (ACP dispatch): a notice, never the error style.
+ */
+export function systemRowTone(text: string): 'error' | 'notice' | '' {
+  const head = text.trim()
+  if (/^error:/i.test(head)) return 'error'
+  if (/^cancell?ed\b/i.test(head)) return 'notice'
+  return ''
+}
+
 function icon(pathData: string[]): SVGSVGElement {
   const ns = 'http://www.w3.org/2000/svg'
   const svg = document.createElementNS(ns, 'svg')
@@ -334,9 +346,10 @@ export function createMessageRenderer(deps: MessageRendererDeps) {
       appendSubagentCompletion(body, visibleText)
     } else if (visibleText) {
       body.textContent = role === 'user' ? stripTimePrefix(visibleText) : visibleText
-      // A failed turn persists as a `system` row "Error: …" (engine runtime,
-      // ACP dispatch); the skins draw it as an error, not as a quiet note.
-      if (role === 'system' && /^error:/i.test(visibleText.trim())) body.dataset.tone = 'error'
+      if (role === 'system') {
+        const tone = systemRowTone(visibleText)
+        if (tone) body.dataset.tone = tone
+      }
     }
   }
 

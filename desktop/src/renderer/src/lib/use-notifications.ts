@@ -21,6 +21,7 @@ import type { OrderKind, Token } from '~/views/trading/types'
 import { bindActivation, notify } from './notifications/dispatch'
 import {
   diffSessionRuns,
+  taskEpochMs,
   excerpt,
   formatDuration,
   isMuted,
@@ -71,12 +72,18 @@ function useSessionRunSignals(): void {
   useEffect(() => {
     if (!connected) return
     const now = Date.now()
-    const runRows = rows.map((r) => ({
-      key: r.key,
-      title: r.title,
-      live: r.live,
-      status: sessionRunStatus(r.raw),
-    }))
+    const runRows = rows.map((r) => {
+      const raw = r.raw as Record<string, unknown>
+      const last = (raw.last_task ?? raw.lastTask) as Record<string, unknown> | null | undefined
+      return {
+        key: r.key,
+        title: r.title,
+        live: r.live,
+        status: sessionRunStatus(r.raw),
+        taskStartedAt: taskEpochMs(last?.started_at ?? last?.startedAt),
+        taskFinishedAt: taskEpochMs(last?.finished_at ?? last?.finishedAt),
+      }
+    })
     const { next, finished } = diffSessionRuns(tracked.current, runRows, now)
     tracked.current = next
     if (!seeded.current) {
