@@ -1193,6 +1193,34 @@
   flex-shrink: 0;
   color: var(--warn);
 }
+/* Copy the contract address: quiet until the row is under the hand. */
+.trd-asset__copy {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  color: var(--dim);
+  opacity: 0.6;
+  transition:
+    color 120ms ease-out,
+    opacity 120ms ease-out,
+    background-color 120ms ease-out;
+}
+tr:hover .trd-asset__copy,
+.trd-asset__copy:focus-visible {
+  opacity: 1;
+}
+.trd-asset__copy:hover {
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--foreground) 12%, transparent);
+}
+.trd-asset__copy:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
 
 /* The allocation rule under the value: the signature ledger line. A full
    track with the share filled from the right, so a 0.3% position reads as a

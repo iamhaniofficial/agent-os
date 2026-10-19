@@ -1,4 +1,4 @@
-import { LoaderCircle, TriangleAlert, X } from 'lucide-react'
+import { Copy, LoaderCircle, TriangleAlert, X } from 'lucide-react'
 import {
   Component,
   useEffect,
@@ -127,6 +127,7 @@ export function AssetCell({
   sub,
   tag,
   wallet,
+  onCopy,
 }: {
   token: Token
   showChain?: boolean
@@ -136,6 +137,9 @@ export function AssetCell({
   /** Whose row this is, when the table mixes wallets: the same token twice
    *  otherwise reads as a duplicate. */
   wallet?: string
+  /** Put the token's contract address on the clipboard. A small icon after
+   *  the ticker; the click stays out of the row it sits in. */
+  onCopy?: () => void
 }) {
   // Not everything is indexed, and a row with two blanks in it reads as a bug.
   // Fall back to what is always true: the address, and that it has no name.
@@ -156,6 +160,21 @@ export function AssetCell({
               strokeWidth={2}
               aria-label={t('trading.holdings.unverified')}
             />
+          ) : null}
+          {onCopy ? (
+            <button
+              type="button"
+              className="trd-asset__copy app-no-drag"
+              aria-label={`${t('trading.holdings.copyAddress')} ${ticker}`}
+              title={`${t('trading.holdings.copyAddress')}: ${token.address}`}
+              data-testid="asset-copy"
+              onClick={(e) => {
+                e.stopPropagation()
+                onCopy()
+              }}
+            >
+              <Copy className="size-3" strokeWidth={1.75} aria-hidden />
+            </button>
           ) : null}
         </span>
         <span className="trd-asset__name">

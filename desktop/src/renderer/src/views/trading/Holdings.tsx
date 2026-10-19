@@ -33,6 +33,7 @@ import { isStockToken } from './markets-logic'
 import { UnwrapNote } from './Orders'
 import { AssetCell, Empty, ErrorState, Skeleton, Tick } from './parts'
 import { isWrappedEth, type Holding, type Wallet } from './types'
+import { copyAddress } from './WalletMenu'
 
 /**
  * The ledger's table. Dense mono figures, a hairline per row, the
@@ -245,6 +246,9 @@ export function Holdings({
                         showChain={showChain}
                         tag={h.hidden ? t('trading.holdings.hidden.junk') : undefined}
                         wallet={walletName(h.wallet)}
+                        onCopy={
+                          h.token.native ? undefined : () => void copyAddress(h.token.address)
+                        }
                       />
                     </td>
                     <td className="trd-col--amount" title={formatAmount(h.amount, 18)}>

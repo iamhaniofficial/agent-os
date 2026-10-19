@@ -18,6 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `agentos upgrade` use the same in-place restart for a healthy gateway they
   do not manage, which they used to refuse (exit 3) or silently skip with the
   old code still running. New RPC `gateway.restart`. Not available on Windows.
+- Desktop Trade tab: each token in the holdings table has a copy icon next to
+  its ticker that puts the token's contract address on the clipboard (native
+  ETH, which has no contract, gets none).
 
 ### Changed
 - The Bankr mark now sits on Bankr's purple tile (the square app icon) wherever
