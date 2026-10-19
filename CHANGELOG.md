@@ -6,11 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- `acp.status {session_key}` gateway RPC: one status object for any ACP
+  session (live, idle or closed) with `agent_name`, `activity`,
+  `activity_kind`, `turn_tool_calls`, `idle`, `closed`, `mode`,
+  `harness_mode`, `cwd` and `last_turn`. `acp.sessions` rows carry the same
+  live progress fields, and a harness that is still starting is listed.
+- ACP completions (`session.event.subagent_completion` and the parent's
+  system message) carry `runtime`, `acp_agent`, `acp_agent_name`, `cwd`,
+  `mode`, `harness_mode` and a structured `usage` object next to the
+  `Stats:` string; other subagents report `runtime: "subagent"`.
+
 ### Changed
 - The Bankr mark now sits on Bankr's purple tile (the square app icon) wherever
   it appears: the Skills page's Bankr tab and catalog cards, the desktop Skills
   panel, and the Bankr LLM Gateway provider tile in desktop Settings and the
   setup wizard, which now fills its plate edge to edge.
+- A finished `oneshot` ACP child is now idle, not closed: a follow-up
+  (`sessions_send`, or the user typing into the child) resumes its harness
+  session in a new process. If the harness cannot resume, a fresh session
+  starts and the turn's text says so. Only `acp close` / `subagents kill`
+  end a session.
+- `[acp] stream_delivery` defaults to `live`: child sessions stream the
+  harness's text as it arrives.
+- `acp.cancel` / `acp.close` also cancel the session's queued and starting
+  turns; `acp.close` reports `closed: true` plus `was_live`.
+- The `sub-agent` skill and the spawn `cwd` refusal agree with the cwd
+  policy: the workspace is for read-only work, writes need an
+  `[acp] allowed_cwds` project or a worktree, and a refusal
+  (`ACP_CWD_NOT_ALLOWED`) names the exact `agentos config set` command.
+
+### Fixed
+- A turn sent into a closed ACP session (or refused for any other reason
+  before the harness ran) was invisible in the desktop: the error event was
+  wiped by the history resync that follows it. Refusals and failed harness
+  turns now log `acp.dispatch.turn_refused` / `acp.dispatch.turn_failed`
+  and leave an `Error: ...` row in the child transcript.
 
 ## [2026.10.16] - 2026-10-16
 

@@ -78,7 +78,8 @@ async def test_spawned_acp_turn_streams_persists_and_announces(tmp_path) -> None
         assert row.input_tokens == 1200 and row.output_tokens == 300
         assert abs(row.total_cost_usd - 0.03) < 1e-9 and row.cost_source == "harness"
         assert row.origin["record_id"] == "rec-1"
-        assert row.origin["closed"] is True  # oneshot by default
+        # oneshot by default: the process is gone but the session is idle, not closed
+        assert row.origin["idle"] is True and not row.origin.get("closed")
         assert row.origin["last_turn"]["input_tokens"] == 1200
 
         completions = await _completions(rig)
@@ -86,7 +87,31 @@ async def test_spawned_acp_turn_streams_persists_and_announces(tmp_path) -> None
         stats = completions[-1]["stats"]
         assert stats.startswith("runtime ") and "tokens 1500 (in 1200 / out 300)" in stats
         assert "cost $0.0300" in stats
-        assert any(n == "session.event.subagent_completion" for _, n, _ in rig.events)
+        live = [p for _, n, p in rig.events if n == "session.event.subagent_completion"]
+        assert live
+        # Contract B: the persisted parent message and the live event carry the
+        # harness identity and structured usage next to the Stats string.
+        for payload in (completions[-1], live[-1]):
+            assert payload["runtime"] == "acp"
+            assert payload["acp_agent"] == "claude"
+            assert payload["acp_agent_name"] == "Claude Code"
+            assert payload["cwd"] == str(rig.workspace.resolve())
+            assert payload["mode"] == "oneshot"
+            assert payload["harness_mode"] is None
+            usage = payload["usage"]
+            assert set(usage) == {
+                "duration_ms",
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "cost_usd",
+                "tool_calls",
+            }
+            assert usage["input_tokens"] == 1200 and usage["output_tokens"] == 300
+            assert usage["total_tokens"] == 1500 and usage["tool_calls"] == 1
+            assert abs(usage["cost_usd"] - 0.03) < 1e-9
+            assert isinstance(usage["duration_ms"], int)
+            assert payload["stats"] == stats
 
 
 async def test_parent_wake_message_carries_stats_line(tmp_path) -> None:
@@ -205,18 +230,192 @@ async def _wait_for_calls(runtime: FakeRuntime, n: int) -> None:
         await asyncio.sleep(0.005)
 
 
-async def test_oneshot_followup_is_refused(tmp_path) -> None:
-    from agentos.tools.types import SafeToolError
-
-    async with acp_rig(tmp_path) as rig:
+async def test_oneshot_followup_resumes_the_harness_session(tmp_path) -> None:
+    """2026-10-19 repro: a follow-up into a finished oneshot child got
+    ACP_SESSION_CLOSED. It now resumes the recorded harness session in a new
+    process, which is closed again after the turn."""
+    runtime = FakeRuntime(
+        [
+            Script(
+                events=[AcpEvent(kind="text_delta", text="first answer")],
+                result=AcpTurnResult(stop_reason="end_turn"),
+            ),
+            Script(
+                events=[AcpEvent(kind="text_delta", text="second answer")],
+                result=AcpTurnResult(stop_reason="end_turn"),
+            ),
+        ]
+    )
+    async with acp_rig(tmp_path, runtime) as rig:
         out = await _spawn(task="once", acp_agent="claude")
+        child = out["session_key"]
         await rig.task_runtime.wait(out["task_id"], timeout=5)
-        try:
-            await sessions_tool.sessions_send(out["session_key"], "more")
-        except SafeToolError as exc:
-            assert "closed" in str(exc) or "oneshot" in str(exc)
-        else:  # pragma: no cover
-            raise AssertionError("expected refusal")
+        await _completions(rig, 1)
+        row = await rig.sessions.get_session(child)
+        assert row.origin["idle"] is True and row.origin["acp_session_id"] == "sess-1"
+        assert runtime.closed == [("rec-1", False)]
+
+        follow = json.loads(await sessions_tool.sessions_send(child, "more"))
+        record = await rig.task_runtime.wait(follow["task_id"], timeout=5)
+        assert str(getattr(record.status, "value", record.status)) == "succeeded"
+
+        ensures = [c[1] for c in runtime.calls if c[0] == "ensure_session"]
+        assert len(ensures) == 2
+        assert ensures[1].resume_session_id == "sess-1"
+        assert ensures[1].extra["record_id"] == "rec-1"
+        assert ensures[1].mode == "oneshot"
+        assert len(runtime.closed) == 2  # closed again after the follow-up
+        row = await rig.sessions.get_session(child)
+        assert row.origin["idle"] is True and not row.origin.get("closed")
+        transcript = await rig.sessions.read_recent_transcript(child, 10)
+        assert [(r["role"], r["content"]) for r in transcript] == [
+            ("user", "once"),
+            ("assistant", "first answer"),
+            ("user", "more"),
+            ("assistant", "second answer"),
+        ]
+        # The parent sent this follow-up, so it is announced like the spawn.
+        completions = await _completions(rig, 2)
+        assert completions[-1]["result"]["text"] == "second answer"
+
+
+async def test_resume_failure_starts_fresh_with_a_notice(tmp_path) -> None:
+    runtime = FakeRuntime()
+    runtime.resume_supported = False
+    async with acp_rig(tmp_path, runtime) as rig:
+        out = await _spawn(task="once", acp_agent="claude")
+        child = out["session_key"]
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        await _completions(rig, 1)
+
+        follow = json.loads(await sessions_tool.sessions_send(child, "again"))
+        record = await rig.task_runtime.wait(follow["task_id"], timeout=5)
+        assert str(getattr(record.status, "value", record.status)) == "succeeded"
+
+        notice = "Started a new Claude Code session; the previous context could not be resumed."
+        deltas = [
+            p["text"] for k, n, p in rig.events if k == child and n == "session.event.text_delta"
+        ]
+        assert any(notice in d for d in deltas)
+        transcript = await rig.sessions.read_recent_transcript(child, 10)
+        assert transcript[-1]["role"] == "assistant"
+        assert transcript[-1]["content"].startswith(notice + "\n\n")
+        assert transcript[-1]["content"].endswith("echo: again")
+        # The new harness session is the one a later follow-up resumes.
+        row = await rig.sessions.get_session(child)
+        assert row.origin["acp_session_id"] == "sess-2"
+
+
+async def test_turn_into_closed_session_is_logged_persisted_and_emitted(tmp_path) -> None:
+    async with acp_rig(tmp_path) as rig:
+        out = await _spawn(task="once", acp_agent="claude", mode="persistent")
+        child = out["session_key"]
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        await rig.manager.close(child, reason="operator_close")
+        row = await rig.sessions.get_session(child)
+        assert row.origin["closed"] is True and row.origin["closed_reason"] == "operator_close"
+
+        # The user types into the closed child (desktop sessions.send path).
+        entry = await rig.sessions.append_message(child, role="user", content="hello?")
+        from agentos.gateway.routing import build_web_route_envelope
+
+        envelope = build_web_route_envelope(
+            session_key=child, agent_id="main", conn_id="c1", channel_id="web:c1"
+        )
+        handle = await rig.task_runtime.enqueue(
+            envelope,
+            "hello?",
+            run_kind="session_turn",
+            persisted_user_message_id=entry.message_id,
+        )
+        record = await rig.task_runtime.wait(handle.task_id, timeout=5)
+        assert str(getattr(record.status, "value", record.status)) == "failed"
+
+        errors = [p for k, n, p in rig.events if k == child and n == "session.event.error"]
+        assert errors and errors[-1]["code"] == "ACP_SESSION_CLOSED"
+        assert "was closed" in errors[-1]["error_message"]
+        assert errors[-1]["terminal_message"]
+        transcript = await rig.sessions.read_recent_transcript(child, 10)
+        assert transcript[-2]["content"] == "hello?"
+        assert transcript[-1]["role"] == "system"
+        assert transcript[-1]["content"].startswith("Error: This Claude Code session")
+        assert "resume_session_id=sess-1" in transcript[-1]["content"]
+        # Shown by chat.history (the UI resyncs from it right after the error).
+        from agentos.chat.history import transcript_entries_to_chat_messages
+
+        history = transcript_entries_to_chat_messages(await rig.sessions.get_transcript(child))
+        assert history[-1]["role"] == "system" and history[-1]["text"].startswith("Error:")
+        row = await rig.sessions.get_session(child)
+        assert row.origin["last_turn"]["error_code"] == "ACP_SESSION_CLOSED"
+
+
+async def test_harness_start_failure_leaves_an_error_row(tmp_path) -> None:
+    from agentos.acp.types import AcpSessionInitError
+
+    runtime = FakeRuntime()
+
+    async def _broken(spec, *, session_key):
+        raise AcpSessionInitError(
+            "ACP agent 'claude' needs claude on PATH", code="ACP_HARNESS_MISSING"
+        )
+
+    runtime.ensure_session = _broken  # type: ignore[method-assign]
+    async with acp_rig(tmp_path, runtime) as rig:
+        out = await _spawn(task="x", acp_agent="claude")
+        child = out["session_key"]
+        record = await rig.task_runtime.wait(out["task_id"], timeout=5)
+        assert str(getattr(record.status, "value", record.status)) == "failed"
+        transcript = await rig.sessions.read_recent_transcript(child, 10)
+        assert [r["role"] for r in transcript] == ["user", "system"]
+        assert transcript[-1]["content"] == "Error: ACP agent 'claude' needs claude on PATH"
+
+
+async def test_user_typed_child_turn_does_not_wake_the_parent(tmp_path) -> None:
+    """A turn the user types into the child (desktop sessions.send on the
+    child key) runs the harness but never announces to / wakes the parent."""
+    async with acp_rig(tmp_path) as rig:
+        sent: list[str] = []
+        original_send = rig.task_runtime.send
+
+        async def _capture(session_key, message, provenance=None, stream_event_sink=None):
+            if session_key == PARENT_KEY:
+                sent.append(message)
+                from types import SimpleNamespace
+
+                return SimpleNamespace(task_id="wake")
+            return await original_send(session_key, message, provenance=provenance)
+
+        rig.task_runtime.send = _capture  # type: ignore[method-assign]
+        out = await _spawn(task="once", acp_agent="claude")
+        child = out["session_key"]
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        assert len(await _completions(rig, 1)) == 1
+        woken = len(sent)
+
+        from agentos.gateway.rpc import get_dispatcher
+        from agentos.gateway.rpc.registry import RpcContext
+
+        ctx = RpcContext(
+            conn_id="desk",
+            config=rig.config,
+            session_manager=rig.sessions,
+            task_runtime=rig.task_runtime,
+        )
+        res = await get_dispatcher().dispatch(
+            "1", "sessions.send", {"key": child, "message": "and one more thing"}, ctx
+        )
+        assert res.ok, res.error
+        record = await rig.task_runtime.wait(res.payload["task_id"], timeout=5)
+        assert str(getattr(record.status, "value", record.status)) == "succeeded"
+        assert record.run_kind == "session_turn"
+        await asyncio.sleep(0.05)
+
+        assert len(await _completions(rig, 1)) == 1  # no second completion row
+        assert len(sent) == woken
+        completions = [p for k, n, p in rig.events if n == "session.event.subagent_completion"]
+        assert len(completions) == 1
+        transcript = await rig.sessions.read_recent_transcript(child, 10)
+        assert transcript[-1]["content"] == "echo: and one more thing"
 
 
 async def test_operator_cancel_ends_task_as_cancelled_not_failed(tmp_path) -> None:

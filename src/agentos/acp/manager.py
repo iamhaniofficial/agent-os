@@ -7,6 +7,10 @@ friends, MIT, rewritten for asyncio; see ``THIRD_PARTY_NOTICES.md``):
   is bumped on close) so turns on one session never interleave;
 - a handle cache so a ``persistent`` session keeps its harness process
   across turns, and resumes from the session row ``origin`` when it does not;
+  a ``oneshot`` session closes its process after every turn but stays
+  resumable (``origin.idle``): a follow-up spawns the harness again with the
+  recorded ``acp_session_id``. Only an operator close (``acp.close``,
+  ``subagents kill``) refuses further turns;
 - admission: at most ``AcpConfig.max_concurrent`` live harness processes;
   when the cap is reached the least recently used *idle* session is closed
   (it stays resumable) and otherwise the turn waits for a slot;
@@ -23,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -30,7 +35,7 @@ from typing import Any
 
 import structlog
 
-from agentos.acp.registry import normalize_agent_id
+from agentos.acp.registry import get_harness, normalize_agent_id
 from agentos.acp.types import (
     AcpError,
     AcpEvent,
@@ -57,6 +62,28 @@ OPTION_ALIASES: dict[str, tuple[str, ...]] = {
 
 _CANCEL_GRACE_S = 5.0
 _CLOSE_GRACE_S = 10.0
+#: Idle (process-less) session states kept in memory for ``status`` / activity.
+_MAX_IDLE_STATES = 256
+
+#: Longest ``activity`` label (one line, ``$HOME`` shortened to ``~``).
+ACTIVITY_MAX_CHARS = 80
+#: ``activity_kind`` while the harness streams its answer.
+TEXT_ACTIVITY_KIND = "text"
+TEXT_ACTIVITY_LABEL = "Writing the answer"
+_TOOL_KINDS = frozenset(
+    {"read", "edit", "delete", "move", "search", "execute", "think", "fetch", "other"}
+)
+_KIND_LABELS: dict[str, str] = {
+    "read": "Reading files",
+    "edit": "Editing files",
+    "delete": "Deleting files",
+    "move": "Moving files",
+    "search": "Searching",
+    "execute": "Running a command",
+    "think": "Thinking",
+    "fetch": "Fetching",
+    "other": "Working",
+}
 
 
 class AcpUnavailableError(AcpError):
@@ -85,13 +112,80 @@ class _SessionState:
     last_stop_reason: str | None = None
     last_error: str | None = None
     closed: bool = False
+    #: A ``oneshot`` session between turns: no process, resumable.
+    idle: bool = False
     holds_slot: bool = False
     process_key: str = ""
+    #: ``run_turn`` calls holding or waiting for ``lock`` (never pruned while > 0).
+    in_use: int = 0
+    activity: str | None = None
+    activity_kind: str | None = None
+    #: This turn's harness tool calls: id -> (title, kind).
+    turn_tools: dict[str, tuple[str | None, str | None]] = field(default_factory=dict)
 
 
 def _cfg(config: Any, name: str, default: Any) -> Any:
     value = getattr(config, name, None) if config is not None else None
     return default if value is None else value
+
+
+def agent_display_name(agent_id: str | None) -> str:
+    """Registry display name (``claude`` -> ``Claude Code``); the id otherwise."""
+    aid = str(agent_id or "")
+    harness = get_harness(aid) if aid else None
+    return harness.name if harness is not None else aid
+
+
+def origin_is_closed(origin: Mapping[str, Any] | None, *, session_status: Any = None) -> bool:
+    """True when an operator closed the session (``acp.close`` / ``subagents kill``).
+
+    A ``oneshot`` session that merely finished its turn is idle, not closed.
+    Rows written before that distinction existed carry ``closed`` without a
+    ``closed_reason`` for both cases; for a ``oneshot`` row that was not
+    killed, that legacy flag means "finished" and the session stays resumable.
+    """
+    if not isinstance(origin, Mapping) or not origin.get("closed"):
+        return False
+    if origin.get("closed_reason"):
+        return True
+    if origin.get("mode") != "oneshot":
+        return True
+    return str(getattr(session_status, "value", session_status) or "") == "killed"
+
+
+def _shorten_home(text: str) -> str:
+    home = os.path.expanduser("~")
+    if not home or home in ("/", "~"):
+        return text
+    home = home.rstrip("/\\")
+    text = text.replace(home + "/", "~/").replace(home + "\\", "~\\")
+    if text == home or text.endswith(" " + home):
+        text = text[: -len(home)] + "~"
+    return text
+
+
+def activity_label(title: str | None, kind: str | None) -> str:
+    """A short single-line label for one harness step ("Read ~/app/x.py").
+
+    Claude Code titles a shell call with the bare command in backticks; that
+    becomes "Run <command>". Without a title the tool kind names the step.
+    """
+    text = " ".join(str(title or "").split())
+    bare_command = len(text) > 2 and text.startswith("`") and text.endswith("`")
+    text = _shorten_home(text.replace("`", "").strip())
+    if not text:
+        text = _KIND_LABELS.get(kind or "other", _KIND_LABELS["other"])
+    elif kind == "execute" and bare_command:
+        text = f"Run {text}"
+    if len(text) > ACTIVITY_MAX_CHARS:
+        text = text[: ACTIVITY_MAX_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def resume_notice(agent_id: str | None) -> str:
+    """Text a turn starts with when the harness could not resume its session."""
+    name = agent_display_name(agent_id) or "harness"
+    return f"Started a new {name} session; the previous context could not be resumed."
 
 
 def spec_from_origin(
@@ -323,13 +417,22 @@ class AcpSessionManager:
             raise AcpError(
                 f"Session {session_key} is not an ACP session", code="ACP_SESSION_INVALID"
             )
-        if origin.get("closed"):
+        if origin_is_closed(origin, session_status=getattr(row, "status", None)):
             raise AcpSessionClosedError(f"ACP session {session_key} was closed")
         return spec_from_origin(origin, self._config, session_key=session_key)
 
     # ---------------------------------------------------------------- turns
 
-    async def _ensure_handle(self, state: _SessionState, spec: AcpSessionSpec) -> AcpSessionHandle:
+    async def _ensure_handle(
+        self, state: _SessionState, spec: AcpSessionSpec
+    ) -> tuple[AcpSessionHandle, bool]:
+        """The live handle for ``spec`` and whether a requested resume was lost.
+
+        ``resume_lost`` is True when a new harness process was started for a
+        ``resume_session_id`` but came up with a different ACP session (the
+        harness cannot ``session/load``, the record no longer matches, or the
+        load failed): the runtime then falls back to a fresh session.
+        """
         runtime = self._require_runtime()
         handle = state.handle
         if (
@@ -338,7 +441,7 @@ class AcpSessionManager:
             and normalize_agent_id(handle.agent_id) == normalize_agent_id(spec.agent_id)
             and handle.cwd == spec.cwd
         ):
-            return handle
+            return handle, False
         if handle is not None:
             await self._close_handle(state, discard=False, reason="stale_handle")
         await self._acquire_slot(state)
@@ -350,21 +453,37 @@ class AcpSessionManager:
         state.handle = handle
         state.spec = spec
         state.process_key = f"{handle.record_id}:{handle.pid or ''}:{handle.acp_session_id or ''}"
+        resume_lost = bool(spec.resume_session_id) and (
+            handle.acp_session_id != spec.resume_session_id
+        )
         log.info(
             "acp.manager.session_ready",
             session_key=state.session_key,
             agent_id=handle.agent_id,
             record_id=handle.record_id,
-            resumed=bool(spec.resume_session_id),
+            resumed=bool(spec.resume_session_id) and not resume_lost,
         )
+        if resume_lost:
+            log.warning(
+                "acp.manager.resume_lost",
+                session_key=state.session_key,
+                agent_id=handle.agent_id,
+                requested=spec.resume_session_id,
+                started=handle.acp_session_id,
+            )
         # Persist the identity as soon as it exists so a gateway crash in the
-        # middle of the first turn still leaves a resumable session row.
-        await self.update_origin(
-            state.session_key,
-            record_id=handle.record_id,
-            acp_session_id=handle.acp_session_id,
-        )
-        return handle
+        # middle of the first turn still leaves a resumable session row. A
+        # oneshot session is no longer idle once its harness is back; a legacy
+        # ``closed`` flag from an earlier oneshot finish is cleared too (an
+        # operator-closed row never gets this far).
+        changes: dict[str, Any] = {
+            "record_id": handle.record_id,
+            "acp_session_id": handle.acp_session_id,
+        }
+        if spec.mode == "oneshot":
+            changes.update(idle=False, closed=False)
+        await self.update_origin(state.session_key, **changes)
+        return handle, resume_lost
 
     async def _cancel_turn(self, state: _SessionState, turn: AcpTurn, *, reason: str) -> None:
         log.info("acp.manager.cancel_turn", session_key=state.session_key, reason=reason)
@@ -382,14 +501,63 @@ class AcpSessionManager:
         attachments: list[dict[str, Any]] | None = None,
         on_event: EventCallback | None = None,
     ) -> AcpTurnResult:
+        state = self._state_for(session_key)
+        state.in_use += 1
         try:
             return await self._run_turn(
                 session_key, text, spec=spec, attachments=attachments, on_event=on_event
             )
         finally:
+            state.in_use -= 1
+            self._prune_idle_states()
             # The session just went idle (or away): a turn waiting for a
             # harness slot may now evict it.
             await self._notify_slot_waiters()
+
+    def _prune_idle_states(self) -> None:
+        """Bound the process-less states kept for ``status`` (oldest go first)."""
+        idle = [
+            s
+            for s in self._states.values()
+            if s.handle is None
+            and s.active_turn is None
+            and s.in_use == 0
+            and not s.lock.locked()
+            and not s.holds_slot
+        ]
+        overflow = len(idle) - _MAX_IDLE_STATES
+        if overflow <= 0:
+            return
+        for state in sorted(idle, key=lambda s: s.last_used)[:overflow]:
+            if self._states.get(state.session_key) is state:
+                del self._states[state.session_key]
+
+    @staticmethod
+    def _reset_activity(state: _SessionState) -> None:
+        state.activity = None
+        state.activity_kind = None
+        state.turn_tools = {}
+
+    @staticmethod
+    def _track_activity(state: _SessionState, event: AcpEvent) -> None:
+        """Keep ``activity`` / ``activity_kind`` / tool count current for status."""
+        kind = event.kind
+        if kind in ("tool_call", "tool_call_update"):
+            tool_id = event.tool_call_id or f"acp-tool-{len(state.turn_tools) + 1}"
+            title, tool_kind = state.turn_tools.get(tool_id, (None, None))
+            title = event.title or title
+            tool_kind = event.tool_kind or tool_kind
+            state.turn_tools[tool_id] = (title, tool_kind)
+            if event.title or event.tool_kind or kind == "tool_call":
+                normalized = tool_kind if tool_kind in _TOOL_KINDS else "other"
+                state.activity = activity_label(title, normalized)
+                state.activity_kind = normalized
+        elif kind == "text_delta" and event.text:
+            state.activity = TEXT_ACTIVITY_LABEL
+            state.activity_kind = TEXT_ACTIVITY_KIND
+        elif kind == "thought_delta" and event.text:
+            state.activity = _KIND_LABELS["think"]
+            state.activity_kind = "think"
 
     async def _notify_slot_waiters(self) -> None:
         if self._slot_cond is None:
@@ -422,15 +590,47 @@ class AcpSessionManager:
                 raise AcpSessionClosedError(f"ACP session {session_key} was closed")
             if spec is None:
                 spec = await self._spec_from_row(session_key)
-            handle = await self._ensure_handle(state, spec)
+            state.spec = spec
+            state.idle = False
+            self._reset_activity(state)
+            # The turn's clock (``turn_elapsed_s``) includes the harness start.
+            state.turn_started_at = time.monotonic()
+            state.last_used = state.turn_started_at
+            if state.handle is None:
+                state.activity = f"Starting {agent_display_name(spec.agent_id)}"
+            try:
+                handle, resume_lost = await self._ensure_handle(state, spec)
+            except BaseException:
+                state.turn_started_at = None
+                if spec.mode == "oneshot" and state.handle is None:
+                    # Still a resumable idle session; this turn never started.
+                    state.idle = True
+                raise
             timeout_s = float(spec.turn_timeout_s or 0) or float(
                 _cfg(self._config, "turn_timeout_s", 0) or 0
             )
-            state.turn_started_at = time.monotonic()
-            state.last_used = state.turn_started_at
-            turn = await runtime.start_turn(
-                handle, text=text, attachments=attachments, session_key=session_key
-            )
+            if resume_lost and on_event is not None:
+                # Part of this turn's text (live stream, transcript and the
+                # parent's completion): the harness starts without the context
+                # the caller expects it to have.
+                notice = AcpEvent(
+                    kind="text_delta",
+                    tag="agentos_notice",
+                    text=resume_notice(spec.agent_id) + "\n\n",
+                )
+                try:
+                    await _maybe_await(on_event(notice))
+                except Exception:  # noqa: BLE001 - a sink failure must not kill the turn
+                    log.warning("acp.manager.event_sink_failed", session_key=session_key)
+            try:
+                turn = await runtime.start_turn(
+                    handle, text=text, attachments=attachments, session_key=session_key
+                )
+            except BaseException:
+                state.turn_started_at = None
+                if spec.mode == "oneshot":
+                    await asyncio.shield(self._finish_oneshot(state))
+                raise
             state.active_turn = turn
             log.info(
                 "acp.manager.turn_start",
@@ -491,6 +691,7 @@ class AcpSessionManager:
     ) -> AcpTurnResult:
         async def _drain() -> AcpTurnResult:
             async for event in turn.events:
+                self._track_activity(state, event)
                 if on_event is None:
                     continue
                 try:
@@ -516,11 +717,14 @@ class AcpSessionManager:
             ) from exc
 
     async def _finish_oneshot(self, state: _SessionState) -> None:
-        state.closed = True
-        state.epoch += 1
+        """Close the harness process after a oneshot turn; the session stays
+        resumable (``origin.idle``) so a follow-up turn spawns it again with
+        the recorded ``acp_session_id``."""
         await self._close_handle(state, discard=False, reason="oneshot_done")
-        await self.update_origin(state.session_key, closed=True)
-        self._forget(state)
+        if state.closed:
+            return  # an operator close raced this turn; it owns the row now
+        state.idle = True
+        await self.update_origin(state.session_key, idle=True)
 
     def _forget(self, state: _SessionState) -> None:
         """Drop a closed session's in-memory state; the row origin remembers
@@ -582,9 +786,14 @@ class AcpSessionManager:
     async def close(
         self, session_key: str, *, discard: bool = False, reason: str = "operator_close"
     ) -> bool:
-        """Cancel any turn, close the harness and mark the session closed."""
+        """Cancel any turn, close the harness and mark the session closed.
+
+        Unlike a finished ``oneshot`` turn (idle, resumable), a closed session
+        refuses every later turn; ``closed_reason`` records who closed it.
+        """
         state = self._state_for(session_key)
         state.closed = True
+        state.idle = False
         state.epoch += 1
         had_handle = state.handle is not None
         turn = state.active_turn
@@ -597,7 +806,9 @@ class AcpSessionManager:
         except TimeoutError:
             log.warning("acp.manager.close_lock_timeout", session_key=session_key)
             await self._close_handle(state, discard=discard, reason=reason)
-        await self.update_origin(session_key, closed=True)
+        await self.update_origin(
+            session_key, closed=True, closed_reason=reason or "operator_close", idle=False
+        )
         self._forget(state)
         self._forget_permissions(session_key)
         return had_handle
@@ -610,7 +821,8 @@ class AcpSessionManager:
             raise AcpSessionClosedError(f"ACP session {session_key} was closed")
         async with state.lock:
             spec = await self._spec_from_row(session_key)
-            return await self._ensure_handle(state, spec)
+            handle, _resume_lost = await self._ensure_handle(state, spec)
+            return handle
 
     async def set_mode(self, session_key: str, mode_id: str) -> dict[str, Any]:
         runtime = self._require_runtime()
@@ -676,16 +888,27 @@ class AcpSessionManager:
             "active_turn": state.active_turn is not None,
             "turns": state.turns,
             "closed": state.closed,
+            "idle": bool(state.idle and handle is None and state.active_turn is None),
             "epoch": state.epoch,
             "last_stop_reason": state.last_stop_reason,
             "last_error": state.last_error,
             "idle_s": round(now - state.last_used, 1),
+            "activity": state.activity,
+            "activity_kind": state.activity_kind,
+            "turn_tool_calls": len(state.turn_tools),
         }
         if state.turn_started_at is not None:
             info["turn_elapsed_s"] = round(now - state.turn_started_at, 1)
         spec = state.spec
         if spec is not None:
-            info.update({"agent_id": spec.agent_id, "cwd": spec.cwd, "mode": spec.mode})
+            info.update(
+                {
+                    "agent_id": spec.agent_id,
+                    "cwd": spec.cwd,
+                    "mode": spec.mode,
+                    "harness_mode": spec.harness_mode,
+                }
+            )
         if handle is not None:
             info.update(
                 {
@@ -704,9 +927,24 @@ class AcpSessionManager:
                     ],
                 }
             )
+        info["agent_name"] = agent_display_name(info.get("agent_id")) or None
         return info
 
-    async def status(self, session_key: str) -> dict[str, Any]:
+    async def status(self, session_key: str, *, require_acp: bool = False) -> dict[str, Any]:
+        """Everything known about one ACP session: live state, plus the row
+        ``origin`` for sessions without a process (idle oneshot, closed,
+        not yet resumed after a restart).
+
+        ``require_acp`` raises ``ACP_SESSION_INVALID`` when the key is not an
+        ACP session row (the ``acp.status`` RPC contract).
+        """
+        row = await self._get_session_row(session_key)
+        origin = getattr(row, "origin", None) if row is not None else None
+        is_acp = isinstance(origin, Mapping) and origin.get("kind") == "acp"
+        if require_acp and not is_acp:
+            raise AcpError(
+                f"Session {session_key} is not an ACP session", code="ACP_SESSION_INVALID"
+            )
         state = self._states.get(session_key)
         if state is not None and state.handle is not None and self._runtime is not None:
             try:
@@ -716,26 +954,69 @@ class AcpSessionManager:
         if state is not None:
             info = self._describe(state)
         else:
-            info = {"session_key": session_key, "live": False, "active_turn": False}
-        row = await self._get_session_row(session_key)
-        origin = getattr(row, "origin", None) if row is not None else None
-        if isinstance(origin, Mapping) and origin.get("kind") == "acp":
+            info = {
+                "session_key": session_key,
+                "live": False,
+                "active_turn": False,
+                "closed": False,
+                "idle": False,
+                "activity": None,
+                "activity_kind": None,
+                "turn_tool_calls": 0,
+            }
+        if is_acp:
+            assert isinstance(origin, Mapping)
             for key in ("agent_id", "cwd", "mode", "record_id", "acp_session_id"):
-                info.setdefault(key, origin.get(key))
-            info["closed"] = bool(info.get("closed") or origin.get("closed"))
-            if origin.get("last_turn"):
-                info["last_turn"] = origin.get("last_turn")
+                if info.get(key) is None:
+                    info[key] = origin.get(key)
+            if info.get("harness_mode") is None:
+                info["harness_mode"] = origin.get("harness_mode")
+            session_status = getattr(row, "status", None)
+            closed = bool(info.get("closed")) or origin_is_closed(
+                origin, session_status=session_status
+            )
+            info["closed"] = closed
+            busy = bool(info.get("live") or info.get("active_turn") or "turn_elapsed_s" in info)
+            if state is not None:
+                idle = bool(info.get("idle"))
+            else:
+                # After a restart only the row knows; a legacy finished oneshot
+                # row says ``closed`` without a reason (see origin_is_closed).
+                idle = bool(origin.get("idle")) or (
+                    origin.get("mode") == "oneshot" and bool(origin.get("closed"))
+                )
+            info["idle"] = idle and not closed and not busy
+            last_turn = origin.get("last_turn")
+            info["last_turn"] = last_turn if isinstance(last_turn, Mapping) else None
+            if (
+                state is None
+                and isinstance(last_turn, Mapping)
+                and isinstance(last_turn.get("tool_calls"), int)
+            ):
+                # The in-memory tally is gone (restart, pruned): the last turn's
+                # count is the best answer for "how many tool calls".
+                info["turn_tool_calls"] = last_turn["tool_calls"]
             if origin.get("worktree"):
                 info["worktree"] = origin.get("worktree")
-            info["session_status"] = getattr(row, "status", None)
+            info["session_status"] = getattr(session_status, "value", session_status)
+        # UIs key off these: always present, even when unknown.
+        info["session_key"] = session_key
+        info.setdefault("agent_id", None)
+        for key in ("cwd", "mode", "harness_mode", "last_turn"):
+            info.setdefault(key, None)
+        info["agent_name"] = agent_display_name(info.get("agent_id")) or None
         info["available"] = self.available
         return info
 
     def list_sessions(self) -> list[dict[str, Any]]:
+        """Sessions with a harness process or a turn in progress (including a
+        harness that is still starting)."""
         return [
             self._describe(state)
             for state in self._states.values()
-            if state.handle is not None or state.active_turn is not None
+            if state.handle is not None
+            or state.active_turn is not None
+            or state.turn_started_at is not None
         ]
 
     @property

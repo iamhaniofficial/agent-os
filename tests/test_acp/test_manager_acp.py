@@ -77,17 +77,179 @@ async def test_persistent_session_reuses_handle(sessions) -> None:
     assert runtime.closed == []
 
 
-async def test_oneshot_closes_after_first_turn(sessions) -> None:
+async def test_oneshot_closes_process_but_stays_resumable(sessions) -> None:
     key = "agent:main:acp:aaaa0003"
     await _acp_row(sessions, key, mode="oneshot")
     runtime = FakeRuntime()
     manager = _manager(runtime, sessions)
     await manager.run_turn(key, "one")
     assert runtime.closed == [("rec-1", False)]
-    assert (await sessions.get_session(key)).origin["closed"] is True
+    origin = (await sessions.get_session(key)).origin
+    assert origin["idle"] is True and not origin.get("closed")
+    assert manager.live_count == 0
+    status = await manager.status(key)
+    assert status["idle"] is True and status["closed"] is False and status["live"] is False
+
+    # A follow-up resumes the recorded harness session in a new process.
+    await manager.run_turn(key, "two")
+    ensures = [c[1] for c in runtime.calls if c[0] == "ensure_session"]
+    assert [s.resume_session_id for s in ensures] == [None, "sess-1"]
+    assert ensures[1].extra["record_id"] == "rec-1"
+    assert len(runtime.closed) == 2 and manager.live_count == 0
+    assert (await sessions.get_session(key)).origin["idle"] is True
+
+
+async def test_turn_clears_idle_while_it_runs(sessions) -> None:
+    key = "agent:main:acp:aaaa0013"
+    await _acp_row(sessions, key, mode="oneshot", idle=True, acp_session_id="sess-old")
+    runtime = FakeRuntime([Script(block=True)])
+    manager = _manager(runtime, sessions)
+    task = asyncio.create_task(manager.run_turn(key, "go"))
+    await asyncio.wait_for(runtime.turn_started.wait(), timeout=2)
+    assert (await sessions.get_session(key)).origin["idle"] is False
+    status = await manager.status(key)
+    assert status["idle"] is False and status["active_turn"] is True
+    runtime.release.set()
+    await task
+    assert (await sessions.get_session(key)).origin["idle"] is True
+
+
+async def test_operator_close_of_an_idle_oneshot_refuses_turns(sessions) -> None:
+    key = "agent:main:acp:aaaa0014"
+    await _acp_row(sessions, key, mode="oneshot")
+    runtime = FakeRuntime()
+    manager = _manager(runtime, sessions)
+    await manager.run_turn(key, "one")
+    assert await manager.close(key) is False  # no process to close
+    origin = (await sessions.get_session(key)).origin
+    assert origin["closed"] is True and origin["closed_reason"] == "operator_close"
+    assert origin["idle"] is False
     with pytest.raises(AcpSessionClosedError):
         await manager.run_turn(key, "two")
-    assert manager.live_count == 0
+    status = await manager.status(key)
+    assert status["closed"] is True and status["idle"] is False
+
+
+@pytest.mark.parametrize(
+    ("origin", "status", "closed"),
+    [
+        ({}, None, False),
+        ({"closed": True, "closed_reason": "operator_close", "mode": "oneshot"}, None, True),
+        ({"closed": True, "mode": "persistent"}, "done", True),
+        # Rows written before idle existed: a finished oneshot carried closed.
+        ({"closed": True, "mode": "oneshot"}, "done", False),
+        ({"closed": True, "mode": "oneshot"}, "killed", True),
+        ({"idle": True, "mode": "oneshot"}, "done", False),
+    ],
+)
+def test_origin_is_closed(origin, status, closed) -> None:
+    from agentos.acp.manager import origin_is_closed
+
+    assert origin_is_closed({"kind": "acp", **origin}, session_status=status) is closed
+
+
+async def test_legacy_closed_oneshot_row_resumes(sessions) -> None:
+    key = "agent:main:acp:aaaa0015"
+    await _acp_row(
+        sessions,
+        key,
+        mode="oneshot",
+        closed=True,
+        record_id="rec-old",
+        acp_session_id="sess-old",
+    )
+    runtime = FakeRuntime()
+    manager = _manager(runtime, sessions)
+    await manager.run_turn(key, "continue")
+    spec = runtime.calls[0][1]
+    assert spec.resume_session_id == "sess-old"
+    origin = (await sessions.get_session(key)).origin
+    assert origin["closed"] is False and origin["idle"] is True
+
+
+async def test_resume_lost_emits_a_notice_first(sessions) -> None:
+    key = "agent:main:acp:aaaa0016"
+    await _acp_row(sessions, key, mode="oneshot", record_id="rec-old", acp_session_id="sess-old")
+    runtime = FakeRuntime([text_script("fresh answer")])
+    runtime.resume_supported = False
+    manager = _manager(runtime, sessions)
+    seen: list[AcpEvent] = []
+    await manager.run_turn(key, "continue", on_event=seen.append)
+    assert [e.kind for e in seen] == ["text_delta", "text_delta"]
+    assert seen[0].text == (
+        "Started a new Claude Code session; the previous context could not be resumed.\n\n"
+    )
+    assert seen[1].text == "fresh answer"
+    assert (await sessions.get_session(key)).origin["acp_session_id"] == "sess-1"
+
+
+async def test_activity_tracks_the_current_harness_step(sessions, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", "/home/u")
+    key = "agent:main:acp:aaaa0017"
+    await _acp_row(sessions, key)
+    runtime = FakeRuntime(
+        [
+            Script(
+                events=[
+                    AcpEvent(kind="thought_delta", text="hmm"),
+                    AcpEvent(
+                        kind="tool_call",
+                        tool_call_id="t1",
+                        tool_kind="read",
+                        title="Read /home/u/app/src/app.py",
+                    ),
+                    AcpEvent(kind="tool_call_update", tool_call_id="t1", status="completed"),
+                    AcpEvent(
+                        kind="tool_call",
+                        tool_call_id="t2",
+                        tool_kind="execute",
+                        title="`pytest -q`",
+                    ),
+                ],
+                block=True,
+            )
+        ]
+    )
+    manager = _manager(runtime, sessions)
+    task = asyncio.create_task(manager.run_turn(key, "go"))
+    await asyncio.wait_for(runtime.turn_started.wait(), timeout=2)
+    for _ in range(50):
+        rows = manager.list_sessions()
+        if rows and rows[0]["turn_tool_calls"] == 2:
+            break
+        await asyncio.sleep(0.01)
+    row = manager.list_sessions()[0]
+    assert row["activity"] == "Run pytest -q" and row["activity_kind"] == "execute"
+    assert row["turn_tool_calls"] == 2
+    assert row["agent_name"] == "Claude Code"
+    assert "turn_elapsed_s" in row
+    runtime.release.set()
+    await task
+    status = await manager.status(key)
+    assert status["activity"] == "Run pytest -q"  # the last step stays visible
+    assert status["turn_tool_calls"] == 2
+
+
+def test_activity_label_is_short_single_line_and_home_relative(monkeypatch) -> None:
+    from agentos.acp.manager import ACTIVITY_MAX_CHARS, activity_label
+
+    monkeypatch.setenv("HOME", "/Users/x")
+    assert activity_label("Read /Users/x/app/a.py", "read") == "Read ~/app/a.py"
+    assert activity_label("`ls\n  -la`", "execute") == "Run ls -la"
+    assert activity_label(None, "search") == "Searching"
+    assert activity_label("", None) == "Working"
+    long = activity_label("Edit " + "/Users/x/" + "a" * 200, "edit")
+    assert len(long) == ACTIVITY_MAX_CHARS and long.endswith("…") and "/Users/x" not in long
+
+
+async def test_status_requires_an_acp_row_when_asked(sessions) -> None:
+    await sessions.create("agent:main:main", agent_id="main")
+    manager = _manager(FakeRuntime(), sessions)
+    with pytest.raises(AcpError) as info:
+        await manager.status("agent:main:main", require_acp=True)
+    assert info.value.code == "ACP_SESSION_INVALID"
+    with pytest.raises(AcpError):
+        await manager.status("agent:main:acp:00000000", require_acp=True)
 
 
 async def test_resume_uses_recorded_session_id(sessions) -> None:
@@ -285,3 +447,32 @@ def test_spec_from_origin_defaults() -> None:
     assert spec.agent_id == "claude" and spec.mode == "persistent"
     with pytest.raises(AcpError):
         spec_from_origin({"agent_id": "claude"}, session_key="k")
+
+
+async def test_starting_harness_is_listed_and_not_idle(sessions) -> None:
+    key = "agent:main:acp:aaaa0018"
+    await _acp_row(sessions, key, mode="oneshot", idle=True, acp_session_id="sess-old")
+    runtime = FakeRuntime()
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    original = runtime.ensure_session
+
+    async def _slow(spec, *, session_key):
+        entered.set()
+        await gate.wait()
+        return await original(spec, session_key=session_key)
+
+    runtime.ensure_session = _slow  # type: ignore[method-assign]
+    manager = _manager(runtime, sessions)
+    task = asyncio.create_task(manager.run_turn(key, "go"))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    rows = manager.list_sessions()
+    assert [r["session_key"] for r in rows] == [key]
+    assert rows[0]["activity"] == "Starting Claude Code" and rows[0]["activity_kind"] is None
+    assert "turn_elapsed_s" in rows[0]
+    status = await manager.status(key)
+    assert status["idle"] is False and status["live"] is False
+    gate.set()
+    await task
+    assert manager.list_sessions() == []
+    assert (await manager.status(key))["idle"] is True

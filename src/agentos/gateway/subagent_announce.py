@@ -126,9 +126,12 @@ async def announce_subagent_completion(
             event.child_session_key,
             session_manager=session_manager,
         )
-        stats = await _read_child_stats(event.child_session_key, session_manager=session_manager)
+        child_row = await _read_child_row(event.child_session_key, session_manager=session_manager)
+        stats = _stats_for_row(child_row) if child_row is not None else None
         if stats:
             payload["stats"] = stats
+        if child_row is not None:
+            payload.update(_child_runtime_fields(child_row))
         get_session = getattr(session_manager, "get_session", None)
         if callable(get_session):
             parent = await get_session(event.parent_session_key)
@@ -328,20 +331,61 @@ async def _read_parent_task_id(
     return value if isinstance(value, str) and value else None
 
 
-async def _read_child_stats(
+async def _read_child_row(
     child_session_key: str,
     *,
     session_manager: Any,
-) -> str | None:
-    """``Stats:`` text for ACP children (runtime, tokens, cost); else ``None``."""
+) -> Any | None:
     get_session = getattr(session_manager, "get_session", None)
     if not callable(get_session):
         return None
     try:
-        child = await get_session(child_session_key)
+        return await get_session(child_session_key)
     except Exception:
         return None
-    return _stats_for_row(child)
+
+
+_USAGE_KEYS = ("duration_ms", "input_tokens", "output_tokens", "total_tokens", "cost_usd")
+
+
+def _child_runtime_fields(row: Any) -> dict[str, Any]:
+    """Which runtime ran the child, and for an ACP harness its identity and the
+    last turn's structured usage (completion payload contract B).
+
+    Every ``usage`` key is present; a value is ``None`` when the harness did
+    not report it (Codex reports no cost).
+    """
+    origin = _origin_from_session(row)
+    if origin.get("kind") != "acp":
+        return {"runtime": "subagent"}
+    agent_id = str(origin.get("agent_id") or "")
+    try:
+        from agentos.acp.manager import agent_display_name
+
+        agent_name = agent_display_name(agent_id)
+    except Exception:  # pragma: no cover - acp package always ships with the engine
+        agent_name = agent_id
+    last_turn = origin.get("last_turn")
+    turn = last_turn if isinstance(last_turn, dict) else {}
+    usage: dict[str, Any] = {}
+    for key in _USAGE_KEYS:
+        value = turn.get(key)
+        usage[key] = (
+            value if isinstance(value, int | float) and not isinstance(value, bool) else None
+        )
+    tool_calls = turn.get("tool_calls")
+    usage["tool_calls"] = (
+        tool_calls if isinstance(tool_calls, int) and not isinstance(tool_calls, bool) else None
+    )
+    return {
+        "runtime": "acp",
+        "acp_agent": agent_id or None,
+        "acp_agent_name": agent_name or None,
+        "cwd": origin.get("cwd"),
+        "mode": origin.get("mode"),
+        "harness_mode": origin.get("harness_mode"),
+        "usage": usage,
+    }
 
 
 def _stats_for_row(row: Any) -> str | None:

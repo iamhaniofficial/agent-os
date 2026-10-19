@@ -1121,7 +1121,7 @@ max_concurrent = 8
 # state_dir = "~/.agentos/state/acp"
 isolate_codex_home = true
 install_missing_adapters = true
-stream_delivery = "final_only"
+stream_delivery = "live"
 allowed_cwds = []
 
 [acp.agents.cursor]
@@ -1143,10 +1143,10 @@ env = {}
 | `state_dir` | unset | Overrides `<state>/acp` (session records, leases, logs, Codex home, worktrees). |
 | `isolate_codex_home` | `true` | Give Codex its own `CODEX_HOME` with your login copied in and the session directory trusted. |
 | `install_missing_adapters` | `true` | Allow the `npx -y` / `uvx` adapter download on first use. |
-| `stream_delivery` | `"final_only"` | `final_only` sends the harness's answer once at the end; `live` streams text as it arrives. |
+| `stream_delivery` | `"live"` | `live` streams the harness's text into the child session as it arrives; `final_only` sends the answer once at the end. |
 | `agents.<id>.command` / `args` | unset | Replace the built-in launch command for that harness, or add a new harness id. |
 | `agents.<id>.env` | `{}` | Extra environment for that harness only. |
-| `allowed_cwds` | `[]` | Extra directories a harness may use as `cwd`; otherwise `cwd` must be inside the agent workspace or a managed worktree. |
+| `allowed_cwds` | `[]` | Extra directories a harness may use as `cwd`; otherwise `cwd` must be inside the agent workspace or a managed worktree. The workspace suits read-only work in a read-only `harness_mode`; list a project here for a harness that writes (`agentos config set acp.allowed_cwds '["~/Code/my-app"]'`, which replaces the whole list). |
 
 ```sh
 agentos config set acp.permission_mode approve-reads

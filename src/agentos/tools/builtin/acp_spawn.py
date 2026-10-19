@@ -144,11 +144,38 @@ def resolve_spawn_cwd(
         workspace_dir=workspace_dir, acp_config=acp_config, state_dir=state_dir
     )
     if not any(_within(resolved, root) for root in roots):
-        raise ToolError(
-            f"cwd {resolved} is outside the agent workspace and [acp] allowed_cwds; "
-            "add the project directory to [acp] allowed_cwds to let harnesses work there"
-        )
+        raise ToolError(cwd_refusal_message(resolved, acp_config))
     return resolved
+
+
+def _home_relative(path: Path) -> str:
+    text = str(path)
+    home = os.path.expanduser("~")
+    if home and home not in ("/", "~") and text.startswith(home.rstrip("/") + "/"):
+        return "~" + text[len(home.rstrip("/")) :]
+    return text
+
+
+def cwd_refusal_message(resolved: Path, acp_config: Any) -> str:
+    """Why ``cwd`` was refused and the exact command that allows it.
+
+    ``config set`` replaces the whole list, so the suggested value keeps the
+    directories already allowed.
+    """
+    existing = [
+        str(raw).strip()
+        for raw in getattr(acp_config, "allowed_cwds", None) or []
+        if raw and str(raw).strip()
+    ]
+    wanted = _home_relative(resolved)
+    value = json.dumps([*existing, wanted], ensure_ascii=False)
+    return (
+        f"ACP_CWD_NOT_ALLOWED: cwd {resolved} is outside the agent workspace, the managed "
+        "worktrees and [acp] allowed_cwds. Do not pick another directory or fall back to the "
+        "workspace on your own: tell the user the harness needs access to this project and "
+        f"ask them to allow it with `agentos config set acp.allowed_cwds '{value}'` "
+        "(restart the gateway if it says a restart is required), then spawn again."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -243,7 +270,7 @@ async def spawn_acp_session(
     worktree_base_ref: str | None = None,
     model: str | None = None,
 ) -> str:
-    from agentos.acp.manager import get_acp_manager
+    from agentos.acp.manager import agent_display_name, get_acp_manager
     from agentos.gateway.routing import build_subagent_route_envelope
     from agentos.tools.builtin import sessions as sessions_tool
 
@@ -410,8 +437,10 @@ async def spawn_acp_session(
         "session_key": session_key,
         "runtime": "acp",
         "acp_agent": harness,
+        "acp_agent_name": agent_display_name(harness),
         "cwd": str(resolved_cwd),
         "mode": session_mode,
+        "harness_mode": harness_mode or None,
         "task_id": handle.task_id,
         "status": "queued",
         "spawn_depth": spawn_depth,
@@ -427,8 +456,7 @@ async def spawn_acp_session(
             "branch": worktree_info["branch"],
             "base_ref": worktree_info["base_ref"],
         }
-    if session_mode == "persistent":
-        payload["followup"] = "sessions_send(session_key, message, mode='followup'|'steer')"
+    payload["followup"] = "sessions_send(session_key, message, mode='followup'|'steer')"
     return json.dumps(payload)
 
 
@@ -447,10 +475,12 @@ async def send_to_acp_session(
     """Queue ``message`` as the next turn of an ACP session.
 
     ``steer`` cancels the running turn first (its completion is not
-    announced: the replacement turn's is). A finished ``persistent`` session
-    is reopened; a ``oneshot`` or closed one is refused.
+    announced: the replacement turn's is). A finished session -- ``persistent``
+    or ``oneshot`` -- is reopened: a oneshot resumes its harness session in a
+    new process and closes it again after the turn. Only a session an
+    operator closed (``acp.close``, ``subagents kill``) is refused.
     """
-    from agentos.acp.manager import get_acp_manager
+    from agentos.acp.manager import get_acp_manager, origin_is_closed
     from agentos.gateway.routing import build_subagent_route_envelope
     from agentos.tools.builtin import sessions as sessions_tool
 
@@ -465,16 +495,12 @@ async def send_to_acp_session(
     if origin.get("kind") != "acp":
         raise SafeToolError(f"Session '{session_key}' is not an ACP session")
     status = str(_field(session, "status") or "running")
-    if origin.get("closed"):
+    if status == "killed":
+        raise SafeToolError(f"ACP session '{session_key}' was killed; spawn a new one")
+    if origin_is_closed(origin, session_status=status):
         raise SafeToolError(
             f"ACP session '{session_key}' is closed; spawn a new one (resume_session_id"
             " can continue the harness conversation)"
-        )
-    if status == "killed":
-        raise SafeToolError(f"ACP session '{session_key}' was killed")
-    if origin.get("mode") == "oneshot" and status in ("done", "failed", "timeout"):
-        raise SafeToolError(
-            f"ACP session '{session_key}' was a oneshot and has finished; spawn a new one"
         )
     manager = get_acp_manager()
     if manager is None or not manager.available:
@@ -549,17 +575,26 @@ def row_is_acp(row: Any) -> bool:
 
 
 def annotate_acp_rows(rows: list[Any]) -> list[Any]:
-    """Tag ACP children in a ``subagents(list)`` result with ``runtime: "acp"``."""
+    """Tag ACP children in a ``subagents(list)`` result with ``runtime: "acp"``.
+
+    ``acp_closed`` is an operator close (no more turns); a finished oneshot is
+    ``acp_idle`` and still takes ``sessions_send`` follow-ups.
+    """
+    from agentos.acp.manager import origin_is_closed
+
     out: list[Any] = []
     for row in rows:
         if isinstance(row, dict) and row_is_acp(row):
             origin = _origin(row)
+            closed = origin_is_closed(origin, session_status=row.get("status"))
             row = {
                 **row,
                 "runtime": "acp",
                 "acp_agent": origin.get("agent_id"),
                 "acp_mode": origin.get("mode"),
                 "cwd": origin.get("cwd"),
+                "acp_closed": closed,
+                "acp_idle": bool(origin.get("idle")) and not closed,
             }
         out.append(row)
     return out
@@ -594,7 +629,7 @@ async def acp_subagent_action(
     if manager is not None:
         await manager.close(session_key, reason="agent_tool_kill")
     else:
-        origin["closed"] = True
+        origin.update(closed=True, closed_reason="agent_tool_kill", idle=False)
         await mgr.update(session_key, origin=origin)
     if status != "killed":
         await mgr.kill_session(session_key)
