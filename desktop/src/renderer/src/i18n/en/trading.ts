@@ -106,6 +106,7 @@ export const trading = {
   'trading.holdings.chart': 'Chart',
   'trading.holdings.markets': 'Markets',
   'trading.holdings.unverified': 'Unverified token',
+  'trading.holdings.copyAddress': 'Copy token address',
   'trading.holdings.noPrice': 'No price',
 
   // Tabs

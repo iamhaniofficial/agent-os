@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- Desktop Trade tab: each token in the holdings table has a copy icon next to
+  its ticker that puts the token's contract address on the clipboard (native
+  ETH, which has no contract, gets none).
+
 ### Changed
 - The Bankr mark now sits on Bankr's purple tile (the square app icon) wherever
   it appears: the Skills page's Bankr tab and catalog cards, the desktop Skills

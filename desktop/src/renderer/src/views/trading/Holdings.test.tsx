@@ -1,7 +1,7 @@
-import { fireEvent, screen } from '@testing-library/react'
+import { fireEvent, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { Holdings } from './Holdings'
-import { holding, renderDesk } from './test-utils'
+import { ETH, holding, renderDesk, USDC } from './test-utils'
 
 vi.mock('@/app/providers', () => ({
   useRpc: () => ({ call: vi.fn(), waitForConnection: async () => {}, on: () => () => {} }),
@@ -189,5 +189,29 @@ describe('Holdings · junk tokens', () => {
     )
     expect(screen.getByTestId('hidden-bar').textContent).toContain('Hidden')
     expect(screen.getByTestId('junk-toggle').textContent).toBe('2junk')
+  })
+})
+
+describe('Holdings · copy token address', () => {
+  it('copies the contract address without selecting the row, and skips native ETH', async () => {
+    const writeText = vi.fn(async () => {})
+    Object.assign(navigator, { clipboard: { writeText } })
+    const onSelect = vi.fn()
+    renderDesk(
+      <Holdings
+        holdings={[holding(), holding({ token: ETH, amount: '0.5', valueUsd: 1250 })]}
+        loading={false}
+        selected={null}
+        onSelect={onSelect}
+        onSwap={noop}
+        showChain
+      />,
+    )
+    // One button: USDC has a contract, ETH is the chain's own coin.
+    const copy = screen.getByTestId('asset-copy')
+    expect(copy.getAttribute('aria-label')).toBe('Copy token address USDC')
+    fireEvent.click(copy)
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(USDC.address))
+    expect(onSelect).not.toHaveBeenCalled()
   })
 })
