@@ -498,7 +498,10 @@ agentos config set compaction.history_tool_result_max_chars 20000
 
 Coding harnesses (`sessions_spawn(runtime="acp")`) run in the agent workspace
 unless the spawn passes a `cwd`; that `cwd` must sit inside the workspace or
-under one of `acp.allowed_cwds` (managed worktrees are always allowed):
+under one of `acp.allowed_cwds` (managed worktrees are always allowed). The
+workspace suits read-only work; list the project a harness should write in
+(the value replaces the whole list, and a refused spawn prints this command
+with the directory filled in):
 
 ```sh
 agentos config set acp.allowed_cwds '["~/Code/my-app"]'
@@ -923,9 +926,12 @@ seconds (default `[acp] turn_timeout_s`), `--permissions approve-reads`
 (default: reads allowed, everything else rejected) `| approve-all |
 deny-all`, `--verbose`, `--json` (one result object, no live text). Harness
 questions are declined. `sessions` falls back to `<state>/acp/sessions/`
-when the gateway is down; `cancel` and `close` need the gateway (`--discard`
-also deletes the resume record). Every command takes `--config <path>`
-except `cancel`/`close`.
+when the gateway is down; `cancel` and `close` need the gateway. `cancel`
+stops the running turn and drops queued ones; the session stays usable.
+`close` ends the session for good (later turns are refused with
+`ACP_SESSION_CLOSED`; a finished `oneshot` session, by contrast, stays
+resumable), and `--discard` also deletes the resume record. Every command
+takes `--config <path>` except `cancel`/`close`.
 
 Read: [`acp-agents.md`](acp-agents.md)
 
