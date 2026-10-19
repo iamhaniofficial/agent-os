@@ -53,6 +53,7 @@ def _home(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
         ("Edit /tmp/b.py", "edit", {"file_path": "/tmp/b.py"}, None, "Edit /tmp/b.py"),
         ("Preparing file…", "edit", None, None, "Editing a file"),
+        ("Read File", "read", None, None, "Reading a file"),
         # search / fetch
         ('grep -n "TODO" src', "search", {"pattern": "TODO", "path": "src"}, None, "Search TODO"),
         (

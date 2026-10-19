@@ -37,6 +37,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (`ACP_CWD_NOT_ALLOWED`) first asks the agent to check its guess (folders
   named in a task usually live in the workspace), then names the exact
   `agentos config set` command.
+- Deferred tool loading. `subagents` (list, stop or steer your children) is
+  no longer hidden from the main agent: it joins the deferred set, so 25 rarely
+  used builtins are deferred and a stock request goes from 64 to 40 tool
+  schemas. `sessions_spawn(runtime="acp")` loads it into the session, so a
+  parent asked to stop a harness has it at hand; it had fallen back to
+  `agentos acp close` through `exec_command`.
+- `acp.cancel` / `acp.close` reject a key that is not an existing ACP
+  session (`NOT_FOUND` / `ACP_SESSION_INVALID`; `agentos acp close` exits
+  non-zero) instead of reporting success for a made-up key.
+- A completion for an ACP run the user stopped says so to the parent
+  (`stopped_by: "user"`, and the wake text): "The user stopped this Claude
+  Code run after N tool calls (m:ss). Do not restart it; ...". A parent's
+  steer is not reported as a stop.
 - Tool rows in an ACP child transcript are named with a short label built
   from the tool call ("Run git status", "Read ~/app/x.py", "Looking up
   tools"); the ACP kind moves to `input.acp_kind`. `acp.status` activity

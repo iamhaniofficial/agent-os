@@ -123,8 +123,16 @@ finished, failed, or needs an answer).
   the earlier context, so include what it needs in the message.
 - The user may type into a child session directly. Those turns are theirs:
   they are not announced back to you.
-- List children: `subagents` (ACP children carry `runtime: "acp"`).
-- Stop one: `subagents` with `action="kill"` (cancel + close).
+- List children: `subagents(action="list")` (ACP children carry
+  `runtime: "acp"`).
+- To stop a harness when the user asks: `subagents(action="kill",
+  session_key="agent:<you>:acp:<id>")` with the full child key. Never run the
+  `agentos acp` CLI (or any shell command) to stop or close a harness. If
+  `subagents` is not in your tools, load it with `tool_search`.
+- When a completion says `stopped_by=user` ("The user stopped this ... run
+  ... Do not restart it"), the user stopped it on purpose: do not spawn the
+  same job again. Tell the user what it did before it stopped and ask how to
+  continue. A run you replaced with `steer` is not a stop.
 - Harness permission prompts reach the user through the normal approvals
   surface. If a child is waiting on one, say so; do not try to answer it.
 

@@ -926,7 +926,8 @@ seconds (default `[acp] turn_timeout_s`), `--permissions approve-reads`
 (default: reads allowed, everything else rejected) `| approve-all |
 deny-all`, `--verbose`, `--json` (one result object, no live text). Harness
 questions are declined. `sessions` falls back to `<state>/acp/sessions/`
-when the gateway is down; `cancel` and `close` need the gateway. `cancel`
+when the gateway is down; `cancel` and `close` need the gateway and the full
+session key (an unknown or non-ACP key is an error and exits non-zero). `cancel`
 stops the running turn and drops queued ones; the session stays usable.
 `close` ends the session for good (later turns are refused with
 `ACP_SESSION_CLOSED`; a finished `oneshot` session, by contrast, stays

@@ -560,7 +560,9 @@ agentos projects delete <project-id> -y --json
 # has the routing table. The CLI is for checks and manual runs:
 agentos acp doctor claude --probe            # CLI on PATH, adapter, ACP initialize
 agentos acp run codex "List the failing tests" --cwd ~/code/app --json
-agentos acp sessions                         # then: agentos acp cancel|close <key>
+agentos acp sessions                         # then: agentos acp cancel|close <full key>
+# An agent stops its own harness with subagents(action="kill", session_key=...),
+# never with this CLI.
 agentos config set acp.permission_mode approve-reads   # reads auto-allowed, rest asks
 agentos agents add research --name Research --model gpt-5.4-mini --description "research agent"
 agentos agents delete research -f

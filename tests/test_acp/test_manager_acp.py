@@ -518,3 +518,38 @@ async def test_prepare_turn_leaves_a_running_turn_alone(sessions) -> None:
     assert manager.list_sessions()[0]["activity"] == "R"
     runtime.release.set()
     await task
+
+
+async def test_status_does_not_wait_for_a_busy_row_read(sessions) -> None:
+    """acp.status took 2.9 s right after a turn ended while the end-of-turn
+    writes held the database; it answers from the last row it saw instead."""
+    key = "agent:main:acp:aaaa0021"
+    await _acp_row(sessions, key, mode="oneshot")
+    manager = _manager(FakeRuntime(), sessions)
+    await manager.run_turn(key, "one")
+
+    gate = asyncio.Event()
+    original = sessions.get_session
+
+    async def _slow(session_key):
+        await gate.wait()
+        return await original(session_key)
+
+    sessions.get_session = _slow  # type: ignore[method-assign]
+    try:
+        status = await asyncio.wait_for(manager.status(key), timeout=1.0)
+    finally:
+        gate.set()
+        sessions.get_session = original  # type: ignore[method-assign]
+    assert status["idle"] is True and status["active_turn"] is False
+    assert status["agent_id"] == "claude" and status["last_turn"] is None
+
+
+async def test_status_reflects_a_close_without_a_new_read(sessions) -> None:
+    key = "agent:main:acp:aaaa0022"
+    await _acp_row(sessions, key, mode="oneshot")
+    manager = _manager(FakeRuntime(), sessions)
+    await manager.run_turn(key, "one")
+    await manager.status(key)  # warms the row cache
+    await manager.close(key)
+    assert (await manager.status(key))["closed"] is True

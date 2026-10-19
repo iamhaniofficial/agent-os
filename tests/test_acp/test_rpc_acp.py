@@ -333,3 +333,21 @@ async def test_status_always_carries_session_key_and_agent_id(real_sessions) -> 
         "last_turn",
     ):
         assert field in status, field
+
+
+@pytest.mark.parametrize("method", ["acp.close", "acp.cancel"])
+async def test_close_and_cancel_reject_keys_that_are_not_acp_sessions(
+    real_sessions, method: str
+) -> None:
+    """A parent closed the made-up key "894dd12b" and the RPC said it worked."""
+    await real_sessions.create("agent:main:main", agent_id="main")
+    manager = _real_manager(real_sessions)
+    rpc_acp.set_acp_manager(manager)
+    ctx = RpcContext(conn_id="t", config=GatewayConfig(), session_manager=real_sessions)
+
+    missing = await get_dispatcher().dispatch("1", method, {"session_key": "894dd12b"}, ctx)
+    other = await get_dispatcher().dispatch("2", method, {"session_key": "agent:main:main"}, ctx)
+
+    assert missing.error is not None and missing.error.code == "NOT_FOUND"
+    assert other.error is not None and other.error.code == "ACP_SESSION_INVALID"
+    assert manager.list_sessions() == []

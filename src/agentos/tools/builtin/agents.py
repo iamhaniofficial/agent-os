@@ -126,15 +126,21 @@ async def agents_list() -> str:
 
 @tool(
     name="subagents",
-    description="List, kill, or steer spawned subagent sessions.",
+    description=(
+        "List, stop (kill) or steer the sessions you spawned, including coding harnesses "
+        "(Claude Code, Codex, ...). When the user asks to stop a harness: "
+        'subagents(action="kill", session_key=<the child key>), never a shell command.'
+    ),
     params={
         "action": {
             "type": "string",
-            "description": "Action: list, kill, steer",
+            "enum": ["list", "kill", "steer"],
+            "description": "list your children; kill = stop and close one; steer = redirect it",
         },
         "session_key": {
             "type": "string",
-            "description": "Target subagent session key (required for kill and steer)",
+            "description": "Full child session key, e.g. agent:main:acp:1a2b3c4d "
+            "(required for kill and steer)",
         },
         "message": {
             "type": "string",
@@ -142,7 +148,10 @@ async def agents_list() -> str:
         },
     },
     required=["action"],
-    exposed_by_default=False,
+    # One tool_search away, and loaded by sessions_spawn(runtime="acp"):
+    # before this the tool was hidden altogether, and a parent asked to stop
+    # a harness ran `agentos acp close` through exec_command instead.
+    defer_loading=True,
 )
 async def subagents(
     action: str,

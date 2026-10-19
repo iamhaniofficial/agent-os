@@ -576,6 +576,25 @@ def _format_duration(ms: int) -> str:
     return f"{secs}s"
 
 
+def format_clock(ms: int | float) -> str:
+    """``m:ss`` (``h:mm:ss`` past an hour) for a duration in milliseconds."""
+    seconds = max(0, int(round(float(ms) / 1000)))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def tool_calls_phrase(tool_calls: int, clock: str) -> str:
+    """``after 3 tool calls (0:18)`` / ``after 1 tool call`` / ``before any tool call``."""
+    if tool_calls <= 0:
+        return f"before any tool call ({clock})"
+    if tool_calls == 1:
+        return f"after 1 tool call ({clock})"
+    return f"after {tool_calls} tool calls ({clock})"
+
+
 def format_stats(last_turn: Mapping[str, Any] | None) -> str | None:
     """``runtime 5m12s • tokens N (in X / out Y) • cost $Z`` (cost when known)."""
     if not isinstance(last_turn, Mapping):

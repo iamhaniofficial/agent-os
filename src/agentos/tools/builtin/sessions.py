@@ -696,6 +696,11 @@ async def sessions_history(session_key: str, limit: int = 20) -> str:
         if session is None:
             raise ToolError(f"Session not found: {session_key}")
         messages = await mgr.read_recent_transcript(session_key, limit)
+        from agentos.tools.builtin.acp_spawn import compact_acp_history, row_is_acp
+
+        if row_is_acp(session):
+            # Tool bodies clipped so the harness's own text survives truncation.
+            messages = compact_acp_history(list(messages or []))
         return json.dumps(
             {
                 "session_key": session_key,

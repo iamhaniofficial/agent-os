@@ -193,6 +193,28 @@ async def _handle_acp_status(params: dict | None, ctx: RpcContext) -> dict[str, 
     return plain
 
 
+async def _require_acp_session(ctx: RpcContext, manager: Any, key: str) -> None:
+    """Refuse a key that is not an existing ACP session.
+
+    ``acp.close`` on a made-up key used to "succeed" silently (an agent
+    closed ``894dd12b`` and believed it had stopped the harness). A missing
+    row is ``NOT_FOUND``; any other session is ``ACP_SESSION_INVALID``.
+    """
+    sessions = ctx.session_manager or getattr(manager, "session_manager", None)
+    get_session = getattr(sessions, "get_session", None)
+    if not callable(get_session):
+        return  # nothing to check against (bare test doubles)
+    try:
+        row = await _maybe_await(get_session(key))
+    except Exception as exc:  # noqa: BLE001 - a lookup failure is not a pass
+        raise RpcHandlerError(ACP_UNAVAILABLE, f"cannot look up session {key}: {exc}") from exc
+    if row is None:
+        raise KeyError(f"ACP session not found: {key} (use the full agent:<id>:acp:<hex> key)")
+    origin = row.get("origin") if isinstance(row, dict) else getattr(row, "origin", None)
+    if not isinstance(origin, dict) or origin.get("kind") != "acp":
+        raise RpcHandlerError("ACP_SESSION_INVALID", f"Session {key} is not an ACP session")
+
+
 async def _cancel_session_tasks(ctx: RpcContext, key: str, *, source: str) -> int:
     """Cancel the session's queued/running task-runtime turns (a harness that
     is still starting has no ACP turn to cancel yet)."""
@@ -212,6 +234,7 @@ async def _handle_acp_cancel(params: dict | None, ctx: RpcContext) -> dict[str, 
     p = _params(params)
     key = _session_key(p)
     manager = _require_manager(ctx)
+    await _require_acp_session(ctx, manager, key)
     reason = str(p.get("reason") or "operator")
     cancelled_tasks = await _cancel_session_tasks(ctx, key, source="acp_rpc_cancel")
     try:
@@ -233,6 +256,7 @@ async def _handle_acp_close(params: dict | None, ctx: RpcContext) -> dict[str, A
     key = _session_key(p)
     manager = _require_manager(ctx)
     discard = bool(p.get("discard", False))
+    await _require_acp_session(ctx, manager, key)
     await _cancel_session_tasks(ctx, key, source="acp_rpc_close")
     try:
         result = await _call_with_optional_kw(manager.close, key, discard=discard)

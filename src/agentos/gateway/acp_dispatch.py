@@ -39,7 +39,9 @@ from agentos.acp.projector import (
     AcpProjector,
     cost_delta,
     error_event,
+    format_clock,
     last_turn_record,
+    tool_calls_phrase,
     usage_update_fields,
 )
 from agentos.acp.projector import ErrorEvent as ProjectedError
@@ -161,23 +163,9 @@ def _closed_row_text(origin: Mapping[str, Any]) -> str:
     return f"This {name} session has ended. Start a new chat to continue."
 
 
-def _clock(duration_ms: int) -> str:
-    seconds = max(0, int(round(duration_ms / 1000)))
-    hours, rem = divmod(seconds, 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
-
-
 def cancel_note(tool_calls: int, duration_ms: int) -> str:
     """``Cancelled after 21 tool calls (3:05).`` -- the row a stopped turn leaves."""
-    clock = _clock(duration_ms)
-    if tool_calls <= 0:
-        return f"Cancelled before any tool call ({clock})."
-    if tool_calls == 1:
-        return f"Cancelled after 1 tool call ({clock})."
-    return f"Cancelled after {tool_calls} tool calls ({clock})."
+    return f"Cancelled {tool_calls_phrase(tool_calls, format_clock(duration_ms))}."
 
 
 def _cancelled_error() -> AcpTurnError:
@@ -209,6 +197,7 @@ async def _persist_turn(
         "error_row": error_row,
         "row_text": row_text,
         "note": note,
+        "remember": getattr(manager, "remember_row", None),
     }
     guard = getattr(manager, "row_guard", None)
     if not callable(guard):
@@ -228,6 +217,7 @@ async def _write_turn(
     error_row: bool = True,
     row_text: str | None = None,
     note: str | None = None,
+    remember: Any = None,
 ) -> float | None:
     """Write transcript rows, usage totals and ``origin.last_turn``.
 
@@ -281,6 +271,9 @@ async def _write_turn(
         await session_manager.update(session_key, **fields)
     except Exception:  # noqa: BLE001
         log.warning("acp.dispatch.usage_update_failed", session_key=session_key, exc_info=True)
+    else:
+        if callable(remember):
+            remember(session_key, origin, getattr(row, "status", None))
 
     text = projector.text
     segments = projector.transcript_segments()
