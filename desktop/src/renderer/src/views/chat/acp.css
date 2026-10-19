@@ -74,6 +74,18 @@
 .acp-badge {
   --acp-tint: var(--primary);
 }
+/* Text in a harness's colour is never the raw tint: mixed toward the
+   foreground it reads at >= 4.5:1 on its own tinted chip in every palette
+   (Claude orange on light paper was 3.3:1). Declared where the tint is, so
+   it follows the element's own harness. */
+.acp-run,
+.acp-done,
+.acp-bar,
+.acp-badge,
+.acp-chip,
+.acp-bar__badge {
+  --acp-ink: color-mix(in srgb, var(--acp-tint) 62%, var(--foreground));
+}
 [data-acp-agent='claude'] {
   --acp-tint: #d97757;
 }
@@ -106,6 +118,7 @@
   color: var(--acp-tint);
 }
 .acp-badge__mono {
+  color: var(--acp-ink);
   font-family: var(--font-mono);
   font-size: 10.5px;
   font-weight: 700;
@@ -163,7 +176,7 @@
   color: var(--foreground);
 }
 .acp-chip[data-kind='harness-mode'] {
-  color: var(--acp-tint);
+  color: var(--acp-ink);
   background: color-mix(in srgb, var(--acp-tint) 10%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--acp-tint) 24%, transparent);
 }
@@ -248,7 +261,7 @@
 }
 .msg-body .acp-btn:disabled,
 .acp-bar .acp-btn:disabled {
-  color: var(--dim);
+  color: var(--muted-foreground);
   background: none;
 }
 .msg-body .acp-btn[hidden],
@@ -350,34 +363,54 @@
   gap: 10px;
   min-width: 0;
 }
+/* Narrow cards give way in order: the folder line ellipsizes (it adds no
+   width of its own: inline-size containment), the mode chips drop whole,
+   and the harness name — the title — is never cut. */
 .acp-run__titles,
 .acp-done__titles {
-  display: grid;
+  display: flex;
   flex: 1 1 auto;
+  flex-direction: column;
   gap: 1px;
-  min-width: 0;
 }
 .acp-run__name,
 .acp-done__title {
-  overflow: hidden;
   font-size: 13px;
   font-weight: 620;
   letter-spacing: -0.005em;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .acp-run__cwd,
 .acp-done__sub {
+  contain: inline-size;
   overflow: hidden;
   font-family: var(--font-mono);
   font-size: 10.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--dim);
+  color: var(--muted-foreground);
 }
-.acp-run__modes {
+/* A chip that no longer fits wraps onto a clipped second line: gone whole,
+   never cut mid-word. The more telling one (harness mode) comes first. */
+.acp-run__modes,
+.acp-bar__chips {
+  flex: 0 4 auto;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  height: 20px;
+  min-width: 0;
+  overflow: hidden;
+}
+.acp-chip {
   flex-shrink: 0;
-  flex-wrap: nowrap;
+}
+.acp-done__head > .acp-pill {
+  flex-shrink: 0;
+}
+/* Too narrow for title and pill on one line: the pill takes the next. */
+.acp-done__head {
+  flex-wrap: wrap;
+  row-gap: 6px;
 }
 .acp-run__task {
   margin: 0;
@@ -584,7 +617,7 @@
   }
 }
 .acp-run__status[data-activity-kind='text'] .acp-run__activity {
-  color: var(--acp-tint);
+  color: var(--acp-ink);
 }
 
 .acp-run__meta {
@@ -595,7 +628,7 @@
   font-family: var(--font-mono);
   font-size: 10.5px;
   font-variant-numeric: tabular-nums;
-  color: var(--dim);
+  color: var(--muted-foreground);
 }
 .acp-run__meta > [hidden] {
   display: none;
@@ -643,6 +676,28 @@
   font-size: 12.5px;
   white-space: pre-wrap;
   color: var(--foreground);
+}
+.acp-done__notice {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 22%, transparent);
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  color: var(--foreground);
+}
+/* A stopped turn in the transcript: the live row ("Task cancelled") and the
+   persisted one ("Cancelled after 6 tool calls (1:42).") read as notices. */
+.msg.error[data-tone='notice'],
+.msg.system .msg-body[data-tone='notice'] {
+  background: color-mix(in srgb, var(--warn) 7%, var(--surface));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 24%, transparent);
+  color: var(--foreground);
+}
+.msg.system .msg-body[data-tone='notice'] {
+  padding: 8px 12px;
+  border-radius: var(--radius);
 }
 .acp-done__note {
   margin: 0;
@@ -742,16 +797,21 @@
 
 /* ── Session bar (AcpSessionBar) ──────────────────────────────────────── */
 
-.acp-bar {
+/* The bar's size container: what the bar shows steps down by its width. */
+.acp-bar-host {
+  container: acp-bar / inline-size;
   position: relative;
   z-index: 1;
-  display: flex;
   flex: none;
+  width: var(--chat-col);
+  margin: 6px auto 4px;
+}
+.acp-bar {
+  position: relative;
+  display: flex;
   align-items: center;
   gap: 12px;
-  width: var(--chat-col);
   min-height: 48px;
-  margin: 6px auto 4px;
   padding: 8px 10px 8px 10px;
   border-radius: var(--radius-surface);
   background:
@@ -802,40 +862,44 @@ html[data-transparency='reduced'] .acp-bar {
   background: color-mix(in srgb, var(--acp-tint) 13%, var(--surface));
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--acp-tint) 28%, transparent);
 }
+/* A harness without a mark: its monogram is text, so it takes the ink. */
+.acp-bar__badge .prov-logo--mono {
+  color: var(--acp-ink);
+}
 .acp-bar__badge[data-acp-agent='gemini'] .prov-logo {
   /* Gemini's mark keeps its own colours. */
   color: inherit;
 }
+.acp-bar__badge {
+  display: inline-flex;
+  flex: none;
+}
+/* The name holds its width (it is the bar's subject); the folder under it
+   adds none of its own and ellipsizes within the name's. */
 .acp-bar__id {
-  display: grid;
+  display: flex;
   flex: 0 1 auto;
+  flex-direction: column;
   gap: 1px;
-  min-width: 0;
   max-width: 16rem;
 }
 .acp-bar__name {
-  overflow: hidden;
   font-size: 13px;
   font-weight: 620;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .acp-bar__cwd {
+  contain: inline-size;
   overflow: hidden;
   font-family: var(--font-mono);
   font-size: 10.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--dim);
-}
-.acp-bar__chips {
-  flex: 0 1 auto;
-  flex-wrap: nowrap;
-  overflow: hidden;
+  color: var(--muted-foreground);
 }
 .acp-bar__status {
   display: flex;
-  flex: 1 1 auto;
+  flex: 1 2 auto;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -870,25 +934,61 @@ html[data-transparency='reduced'] .acp-bar {
   font-weight: 600;
 }
 .acp-bar[data-state='working'] .acp-bar__state {
-  color: var(--acp-tint);
+  color: var(--acp-ink);
 }
 .acp-bar[data-state='closed'] .acp-bar__state {
   color: var(--muted-foreground);
 }
+/* One line, clipped below. A live step shortens with an ellipsis; a hint
+   (idle, closed, the last failure) never shrinks, so when it does not fit it
+   wraps onto the hidden line and leaves whole — the status row's tooltip
+   still carries it. */
 .acp-bar__detail {
   position: relative;
-  display: grid;
+  display: flex;
   flex: 1 1 auto;
+  flex-wrap: wrap;
+  height: 18px;
   min-width: 0;
+  overflow: hidden;
+  line-height: 18px;
   color: var(--muted-foreground);
 }
 .acp-bar__detail > span {
-  grid-area: 1 / 1;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   animation: acp-line-in 320ms var(--acp-ease) both;
+}
+.acp-bar__detail[data-kind='hint'] > span {
+  flex-shrink: 0;
+}
+/* Narrower still: the chips go, then the folder line and the step (both in
+   the tooltip), then the state word (the dot keeps its colour). The name
+   and the buttons stay. */
+@container acp-bar (width < 600px) {
+  .acp-bar__chips {
+    display: none;
+  }
+}
+@container acp-bar (width < 470px) {
+  .acp-bar__cwd,
+  .acp-bar__detail,
+  .acp-bar__elapsed {
+    display: none;
+  }
+}
+@container acp-bar (width < 380px) {
+  .acp-bar__state {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
 }
 .acp-bar__detail[data-tone='error'] {
   color: var(--danger);
@@ -935,12 +1035,14 @@ html[data-transparency='reduced'] .acp-bar {
   color: var(--danger);
 }
 
-/* The closed session's composer: still there, plainly off. */
-.composer[data-disabled='true'] {
-  opacity: 0.62;
-}
-.composer[data-disabled='true'] textarea {
-  cursor: not-allowed;
+/* A harness's tool row (`acp:read`, …) reads as its title: a path or a
+   command, so it shortens with an ellipsis rather than push the status out. */
+.chat-tools-collapse[data-tool-name^='acp:'] .chat-tools-name {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── Reduced motion: everything above stands still ────────────────────── */

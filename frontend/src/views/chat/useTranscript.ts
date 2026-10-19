@@ -619,12 +619,24 @@ export function useTranscript(opts: {
   // eslint-disable-next-line react-hooks/refs -- the factory stores the getter and reads .current only later, inside click handlers and renders outside React's render
   const [acpMounter] = useState<AcpMounter>(() =>
     createAcpMounter({
-      call: (method, params) => rpc.call(method, params),
+      // A card built while the socket is still coming up (an app reload)
+      // waits for it instead of failing its one status read.
+      call: async (method, params) => {
+        await rpc.waitForConnection()
+        return rpc.call(method, params)
+      },
       markdown: chatMarkdown,
       openSession: () => onOpenSessionRef.current,
     }),
   )
   useEffect(() => () => acpMounter.destroyAll(), [acpMounter])
+  useEffect(
+    () =>
+      rpc.on('_state', (state: unknown) => {
+        if (state === 'connected') acpMounter.reconnected()
+      }),
+    [rpc, acpMounter],
+  )
 
   // A parked LP write's button waits for its order to settle; a DCA or a
   // trigger card re-reads itself when one of its orders settles.
@@ -2202,9 +2214,13 @@ export function useTranscript(opts: {
                       ? payload.message
                       : t('chat.agentError')
           const errorRow = messageRendererRef.current?.addMessage('error', message)
-          // Survives the history resync below until the gateway persists a
-          // row of its own for this failure (history.ts liveErrorToKeep).
-          if (errorRow) errorRow.dataset.liveError = 'true'
+          if (errorRow) {
+            // Survives the history resync below until the gateway persists a
+            // row of its own for this failure (history.ts liveErrorToKeep).
+            errorRow.dataset.liveError = 'true'
+            // A stopped turn is a notice, not a failure.
+            if (code.includes('cancel')) errorRow.dataset.tone = 'notice'
+          }
           // chat.js:5146 — recover pending after a failed turn.
           pendingDelegatesRef.current.popAllPendingIntoComposer()
           applySessionRunState(

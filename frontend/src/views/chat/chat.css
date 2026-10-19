@@ -387,9 +387,15 @@
   white-space: pre-wrap;
 }
 
-/* A failed turn persisted as a `system` row ("Error: …"). */
+/* A failed turn persisted as a `system` row ("Error: …"); a stopped one
+   ("Cancelled …", or the live "Task cancelled") is a notice, not an error. */
 .msg.system .msg-body[data-tone='error'] {
   color: var(--danger);
+}
+.msg.system .msg-body[data-tone='notice'],
+.msg.error[data-tone='notice'] {
+  color: var(--foreground);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
 }
 
 /* ── Coding-harness cards (transcript/acp.ts) ────────────────────────────────
@@ -420,24 +426,46 @@
 }
 .acp-done__titles,
 .acp-run__titles {
+  display: flex;
   flex: 1 1 auto;
-  min-width: 0;
+  flex-direction: column;
 }
 .acp-done__title,
 .acp-run__name {
-  overflow: hidden;
   font-weight: 600;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
+.acp-done__head {
+  flex-wrap: wrap;
+}
+/* The folder line adds no width of its own and ellipsizes in the name's. */
 .acp-done__sub,
 .acp-run__cwd {
+  contain: inline-size;
   overflow: hidden;
   font-family: var(--font-mono);
   font-size: 0.7rem;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--dim);
+  color: var(--muted-foreground);
+}
+/* Mode chips that no longer fit drop whole (clipped second line). */
+.acp-run__modes {
+  flex: 0 4 auto;
+  flex-wrap: wrap;
+  height: 1.3rem;
+  min-width: 0;
+  overflow: hidden;
+}
+.acp-chip,
+.acp-pill {
+  flex-shrink: 0;
+}
+.chat-tools-collapse[data-tool-name^='acp:'] .chat-tools-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .acp-badge {
   --acp-tint: var(--primary);
@@ -448,7 +476,7 @@
   height: 26px;
   border-radius: var(--radius-control);
   background: color-mix(in srgb, var(--acp-tint) 14%, transparent);
-  color: var(--acp-tint);
+  color: color-mix(in srgb, var(--acp-tint) 62%, var(--foreground));
   font-family: var(--font-mono);
   font-size: 0.68rem;
   font-weight: 700;
@@ -473,11 +501,11 @@
   border-radius: var(--radius-pill);
   font-family: var(--font-mono);
   font-size: 0.68rem;
-  color: var(--dim);
+  color: var(--muted-foreground);
   white-space: nowrap;
 }
 .acp-pill {
-  --acp-tone: var(--dim);
+  --acp-tone: var(--muted-foreground);
   display: inline-flex;
   flex-shrink: 0;
   align-items: center;
@@ -537,11 +565,17 @@
   color: var(--danger);
   white-space: pre-wrap;
 }
+.acp-done__notice {
+  margin: 0;
+  padding: 6px 8px;
+  border-left: 2px solid var(--warn);
+  white-space: pre-wrap;
+}
 .acp-done__note,
 .acp-run__note {
   margin: 0;
   font-size: 0.72rem;
-  color: var(--dim);
+  color: var(--muted-foreground);
 }
 .acp-run__note[data-tone='error'] {
   color: var(--danger);
@@ -582,7 +616,7 @@
 }
 .acp-btn--quiet {
   border-color: transparent;
-  color: var(--dim);
+  color: var(--muted-foreground);
 }
 .acp-btn--danger {
   color: var(--danger);
@@ -608,7 +642,7 @@
   overflow: auto;
   border-radius: var(--radius-control);
   background: var(--background);
-  color: var(--dim);
+  color: var(--muted-foreground);
   font-family: var(--font-mono);
   font-size: 0.68rem;
   white-space: pre-wrap;
@@ -654,7 +688,7 @@
   gap: 8px;
   font-family: var(--font-mono);
   font-size: 0.7rem;
-  color: var(--dim);
+  color: var(--muted-foreground);
   font-variant-numeric: tabular-nums;
 }
 .acp-run__meta > [hidden] {

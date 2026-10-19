@@ -785,15 +785,18 @@ function ConnectedChat({
   const onDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault()
+      // An ended harness session takes nothing, a dropped file included.
+      if (acpClosedReason) return
       if (e.dataTransfer?.files?.length) attachments.addFiles(e.dataTransfer.files)
     },
-    [attachments],
+    [acpClosedReason, attachments],
   )
   const onDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
   }, [])
   const onPaste = useCallback(
     (e: React.ClipboardEvent) => {
+      if (acpClosedReason) return
       const items = e.clipboardData?.items
       if (!items) return
       const files: File[] = []
@@ -809,7 +812,7 @@ function ConnectedChat({
         e.preventDefault()
       }
     },
-    [attachments],
+    [acpClosedReason, attachments],
   )
 
   const onEnqueueCurrent = useCallback(() => {

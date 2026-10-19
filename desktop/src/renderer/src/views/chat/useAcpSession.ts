@@ -6,6 +6,10 @@ import { harnessDisplayName, isAcpSessionKey, type AcpLiveRow } from '@/views/ch
 export const ACP_STATUS_POLL_MS = 1500
 /** How long a Stop / End result note stays up. */
 const NOTE_MS = 4000
+/** Re-reads after a failure that is not an answer (no socket yet, a dropped frame). */
+const STATUS_RETRIES = 4
+/** Error codes that are an answer: retrying will not change them. */
+const FINAL_CODES = new Set(['ACP_SESSION_INVALID', 'ACP_UNAVAILABLE', 'METHOD_NOT_FOUND'])
 
 export type AcpBarState = 'working' | 'idle' | 'closed'
 
@@ -16,6 +20,13 @@ export interface AcpSessionView {
   agentId: string
   name: string
   state: AcpBarState
+  /**
+   * Working, but the harness has not been seen running this turn yet (the
+   * chat sent it; the harness is starting or queued).
+   */
+  starting: boolean
+  /** The harness's current step, this turn's only (never the last turn's). */
+  activity: string | null
   /** Wall-clock ms the running turn started (for the elapsed clock), when known. */
   startedAt: number | null
   stopState: 'idle' | 'pending' | 'sent'
@@ -37,6 +48,10 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+function activityOf(row: AcpLiveRow | null): string | null {
+  return typeof row?.activity === 'string' && row.activity.trim() ? row.activity.trim() : null
+}
+
 /**
  * The state of the harness behind the open chat, for the session bar and
  * the composer. A key of the form `agent:<agent>:acp:<id>` is only a hint:
@@ -44,10 +59,17 @@ function errorMessage(error: unknown): string {
  * `acp.status` falls back to the live row of `acp.sessions`, when there is
  * one.
  *
+ * Working and Stop follow the harness (`active_turn`), not the chat's run
+ * state: the chat keeps running for a few seconds after the harness is done
+ * (persisting, announcing), and the bar must not show a live step, a ticking
+ * clock and a Stop with nothing left to stop. The chat's run only starts the
+ * reads and marks the turn as starting until the harness is seen.
+ *
  * Polling discipline (the same as the transcript's run cards): `acp.status`
- * is re-read every 1.5 s only while a turn runs and the window is visible;
- * once more when the turn ends (idle, closed, the last turn's outcome); never
- * after unmount or a switch to another session.
+ * is re-read every 1.5 s only while the chat or the harness runs and the
+ * window is visible; once more when that ends; again whenever the connection
+ * comes (back) up; never after unmount or a switch to another session. A read
+ * that fails for want of a connection is retried a bounded number of times.
  */
 export function useAcpSession(sessionKey: string, turnRunning: boolean): AcpSessionView {
   const rpc = useRpc()
@@ -58,6 +80,10 @@ export function useAcpSession(sessionKey: string, turnRunning: boolean): AcpSess
   const [stopState, setStopState] = useState<AcpSessionView['stopState']>('idle')
   const [endState, setEndState] = useState<AcpSessionView['endState']>('idle')
   const [note, setNote] = useState<Note>(null)
+  // This chat run has seen the harness's turn active.
+  const [runSeenActive, setRunSeenActive] = useState(false)
+  // The step shown before this run began: hidden until a fresh one arrives.
+  const [stale, setStale] = useState<{ activity: string | null } | null>(null)
 
   // A switch to another chat starts over (adjusted during render, not in an
   // effect, so the old session's bar never paints over the new one).
@@ -70,6 +96,19 @@ export function useAcpSession(sessionKey: string, turnRunning: boolean): AcpSess
     setStopState('idle')
     setEndState('idle')
     setNote(null)
+    setRunSeenActive(false)
+    setStale(null)
+  }
+
+  // A new chat run: the harness has not been seen yet, and whatever step the
+  // bar knew belongs to the previous turn.
+  const [prevRunning, setPrevRunning] = useState(turnRunning)
+  if (prevRunning !== turnRunning) {
+    setPrevRunning(turnRunning)
+    if (turnRunning) {
+      setRunSeenActive(false)
+      setStale({ activity: activityOf(info) })
+    }
   }
 
   // The key an answer belongs to; a late answer for another chat is dropped.
@@ -84,40 +123,85 @@ export function useAcpSession(sessionKey: string, turnRunning: boolean): AcpSess
     if (typeof row.session_key !== 'string' && typeof row.agent_id !== 'string') return
     setInfo(row)
     setConfirmed(true)
+    const active = row.active_turn === true
+    if (active) setRunSeenActive(true)
+    setStale((prev) => (prev && activityOf(row) !== prev.activity ? null : prev))
     const elapsed = typeof row.turn_elapsed_s === 'number' ? row.turn_elapsed_s : null
-    if (row.active_turn === true && elapsed !== null) {
-      setStartedAt(Date.now() - elapsed * 1000)
-    } else if (row.active_turn !== true) {
-      setStartedAt(null)
-    }
+    if (active && elapsed !== null) setStartedAt(Date.now() - elapsed * 1000)
+    else if (!active) setStartedAt(null)
   }, [])
 
+  // Bounded re-reads after a failure that is not an answer.
+  const attemptsRef = useRef(0)
+  const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const clearRetry = useCallback(() => {
+    if (retryRef.current !== null) clearTimeout(retryRef.current)
+    retryRef.current = null
+  }, [])
+
+  // The retry timer calls the newest `refresh` through this ref.
+  const refreshRef = useRef<() => Promise<void>>(async () => {})
   const refresh = useCallback(async (): Promise<void> => {
     const key = sessionKey
     try {
+      // On an app reload the bar mounts before the socket is up.
+      await rpc.waitForConnection()
+      if (liveKeyRef.current !== key) return
       const row = (await rpc.call('acp.status', { session_key: key })) as AcpLiveRow | null
+      attemptsRef.current = 0
       if (row && typeof row === 'object') apply(key, row)
     } catch (error: unknown) {
       if (liveKeyRef.current !== key) return
-      if (errorCode(error) !== 'METHOD_NOT_FOUND') {
-        // ACP_SESSION_INVALID (not a harness after all), ACP_UNAVAILABLE, or
-        // the connection: no bar rather than a wrong one.
-        if (errorCode(error) === 'ACP_SESSION_INVALID') setConfirmed(false)
+      const code = errorCode(error)
+      if (code === 'METHOD_NOT_FOUND') {
+        try {
+          const live = (await rpc.call('acp.sessions', {})) as { sessions?: AcpLiveRow[] } | null
+          const row = live?.sessions?.find((r) => r?.session_key === key)
+          if (row) apply(key, row)
+        } catch {
+          /* no manager: nothing to show */
+        }
         return
       }
-      try {
-        const live = (await rpc.call('acp.sessions', {})) as { sessions?: AcpLiveRow[] } | null
-        const row = live?.sessions?.find((r) => r?.session_key === key)
-        if (row) apply(key, row)
-      } catch {
-        /* no manager: nothing to show */
-      }
+      if (code === 'ACP_SESSION_INVALID') setConfirmed(false)
+      if (FINAL_CODES.has(code) || attemptsRef.current >= STATUS_RETRIES) return
+      // Not an answer: the socket dropped or was not up yet. Try again soon.
+      const delay = 1000 * 2 ** attemptsRef.current
+      attemptsRef.current += 1
+      clearRetry()
+      retryRef.current = setTimeout(() => {
+        retryRef.current = null
+        if (liveKeyRef.current === key) void refreshRef.current()
+      }, delay)
     }
-  }, [apply, rpc, sessionKey])
+  }, [apply, clearRetry, rpc, sessionKey])
+  useEffect(() => {
+    refreshRef.current = refresh
+  }, [refresh])
 
-  const working = turnRunning || info?.active_turn === true
+  // No retry outlives its session or the view.
+  useEffect(() => {
+    attemptsRef.current = 0
+    return clearRetry
+  }, [sessionKey, clearRetry])
 
-  // Read on entry and on every turn edge; poll while the turn runs.
+  // The connection came (back) up: read again, whatever happened before.
+  useEffect(() => {
+    if (!hint) return
+    return rpc.on('_state', (state: unknown) => {
+      if (state !== 'connected') return
+      attemptsRef.current = 0
+      void refresh()
+    })
+  }, [hint, refresh, rpc])
+
+  const closed = info?.closed === true
+  const active = !closed && info?.active_turn === true
+  const starting = !closed && !active && turnRunning && !runSeenActive
+  const working = active || starting
+  const polling = turnRunning || active
+
+  // Read on entry and on every edge; poll while the chat or the harness runs.
   useEffect(() => {
     if (!hint) return
     let disposed = false
@@ -125,7 +209,7 @@ export function useAcpSession(sessionKey: string, turnRunning: boolean): AcpSess
       if (!disposed) void refresh()
     }
     read()
-    if (!working) {
+    if (!polling) {
       return () => {
         disposed = true
       }
@@ -154,7 +238,7 @@ export function useAcpSession(sessionKey: string, turnRunning: boolean): AcpSess
       disarm()
       document.removeEventListener('visibilitychange', onVisibility)
     }
-  }, [hint, working, refresh])
+  }, [hint, polling, refresh])
 
   // A Stop that went through waits for the turn to end; then it is done.
   const [wasWorking, setWasWorking] = useState(working)
@@ -212,14 +296,16 @@ export function useAcpSession(sessionKey: string, turnRunning: boolean): AcpSess
   }, [endState, refresh, rpc, sessionKey])
 
   const agentId = typeof info?.agent_id === 'string' ? info.agent_id : ''
-  const closed = info?.closed === true
+  const current = activityOf(info)
   return {
     confirmed: hint && confirmed,
     info,
     agentId,
     name: harnessDisplayName(agentId, info?.agent_name),
     state: closed ? 'closed' : working ? 'working' : 'idle',
-    startedAt,
+    starting,
+    activity: active && !(stale && current === stale.activity) ? current : null,
+    startedAt: active ? startedAt : null,
     stopState,
     endState,
     note,

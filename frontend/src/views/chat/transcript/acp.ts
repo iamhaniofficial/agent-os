@@ -202,6 +202,16 @@ export function completionUsage(payload: Record<string, unknown>): AcpUsage {
   return merged
 }
 
+/** `usage` with each unknown (null) figure taken from `fallback`, when it has one. */
+export function fillUsage(usage: AcpUsage, fallback: AcpUsage | null | undefined): AcpUsage {
+  if (!fallback) return usage
+  const filled = { ...usage }
+  ;(Object.keys(filled) as Array<keyof AcpUsage>).forEach((key) => {
+    if (filled[key] === null) filled[key] = fallback[key]
+  })
+  return filled
+}
+
 /** Task status (`succeeded|failed|timeout|cancelled|abandoned`) → card outcome. */
 export function completionOutcome(status: unknown, terminalReason?: unknown): AcpOutcome {
   const s = text(status).toLowerCase()
@@ -436,6 +446,11 @@ export interface CompletionCardOptions {
   raw?: string
   /** Fills a name the payload lacks (the mounter knows its spawn's harness). */
   knownAgent?: (childKey: string) => { agentId: string; agentName: string } | null
+  /**
+   * Figures to show where the payload has none (a cancelled turn reports no
+   * usage): the last live values the run card had for this child.
+   */
+  fallbackUsage?: AcpUsage | null
 }
 
 /** The title subject: the harness name for ACP, "Subagent <id>" otherwise. */
@@ -547,14 +562,17 @@ export function buildCompletionCard(
   head.appendChild(pill(outcome, statusLabel(status, outcome)))
   card.appendChild(head)
 
-  const chips = buildUsageChips(completionUsage(payload))
+  const chips = buildUsageChips(fillUsage(completionUsage(payload), options.fallbackUsage))
   if (chips) card.appendChild(chips)
 
   const foot = el('div', 'acp-done__foot')
   const { text: reply, truncated } = resultText(payload)
   const failureText = text(payload.terminal_message) || text(payload.error_message)
-  if (outcome !== 'done' && failureText) {
+  if (outcome === 'failed' && failureText) {
     card.appendChild(el('p', 'acp-done__error', failureText))
+  } else if (outcome === 'cancelled' && failureText && !reply) {
+    // Someone stopped it: a notice, never the error style.
+    card.appendChild(el('p', 'acp-done__notice', failureText))
   } else if (reply) {
     const region = el('div', 'acp-done__result')
     const clip = el('div', 'acp-done__result-clip')
@@ -631,6 +649,14 @@ interface ChildState {
   seenActive: boolean
   /** Polls in a row that did not see the turn active. */
   quietPolls: number
+  /**
+   * The harness turn is over (`active_turn` went false) but the outcome is
+   * not in yet: the clock stops, Stop goes, the card says it is wrapping up.
+   */
+  endedAt: number | null
+  /** The last `acp.status` failed for a reason a retry can fix (connection). */
+  transient: boolean
+  statusAttempts: number
   stop: 'idle' | 'pending' | 'sent'
   note: string
   noteTone: '' | 'error'
@@ -640,6 +666,10 @@ interface ChildState {
 const ENDED_GRACE_POLLS = 2
 const NEVER_SEEN_GRACE_POLLS = 12
 const MAX_BACKOFF_MS = 12_000
+/** `acp.status` retries for a failure that is not an answer (no connection yet). */
+const STATUS_RETRIES = 4
+/** Error codes that are an answer: retrying will not change them. */
+const FINAL_STATUS_CODES = new Set(['ACP_SESSION_INVALID', 'ACP_UNAVAILABLE', 'METHOD_NOT_FOUND'])
 /** How long a leaving activity line stays in the DOM for its exit animation. */
 const ACTIVITY_SWAP_MS = 320
 
@@ -689,6 +719,7 @@ export function createAcpMounter(deps: AcpMounterDeps) {
   const completions = new Map<string, Record<string, unknown>>()
   const statusInFlight = new Set<string>()
   const swapTimers = new Set<ReturnType<typeof setTimeout>>()
+  const retryTimers = new Set<ReturnType<typeof setTimeout>>()
   let pollTimer: ReturnType<typeof setTimeout> | null = null
   let clockTimer: ReturnType<typeof setInterval> | null = null
   let polling = false
@@ -713,6 +744,9 @@ export function createAcpMounter(deps: AcpMounterDeps) {
         usage: null,
         seenActive: false,
         quietPolls: 0,
+        endedAt: null,
+        transient: false,
+        statusAttempts: 0,
         stop: 'idle',
         note: '',
         noteTone: '',
@@ -769,6 +803,7 @@ export function createAcpMounter(deps: AcpMounterDeps) {
   function stateLabel(state: ChildState, name: string): string {
     switch (state.state) {
       case 'running':
+        if (state.endedAt !== null) return t('chat.acpRunWrapping')
         return state.activity || t('chat.acpActivityStarting', { name })
       case 'done': {
         const duration = formatAcpDuration(state.usage?.durationMs)
@@ -818,7 +853,7 @@ export function createAcpMounter(deps: AcpMounterDeps) {
 
     const stop = card.querySelector<HTMLButtonElement>('[data-action="stop"]')
     if (stop) {
-      stop.hidden = state.state !== 'running'
+      stop.hidden = state.state !== 'running' || state.endedAt !== null
       stop.disabled = state.stop !== 'idle'
       if (state.stop === 'pending') stop.dataset.pending = 'true'
       else delete stop.dataset.pending
@@ -837,7 +872,9 @@ export function createAcpMounter(deps: AcpMounterDeps) {
     const clock = card.querySelector<HTMLElement>('.acp-run__elapsed')
     if (!clock) return
     if (state.state === 'running' && state.startedAt !== null) {
-      clock.textContent = formatElapsedClock((now() - state.startedAt) / 1000)
+      // Wrapping up: the clock stops where the harness did.
+      const end = state.endedAt ?? now()
+      clock.textContent = formatElapsedClock((end - state.startedAt) / 1000)
       clock.hidden = false
     } else {
       clock.textContent = ''
@@ -851,10 +888,24 @@ export function createAcpMounter(deps: AcpMounterDeps) {
 
   /* ── state transitions ────────────────────────────────────────────── */
 
+  /** What the card saw live: the elapsed time and the tool calls of the turn. */
+  function liveUsage(state: ChildState): AcpUsage | null {
+    if (state.state !== 'running') return null
+    const end = state.endedAt ?? now()
+    return {
+      ...EMPTY_USAGE,
+      durationMs: state.startedAt !== null ? Math.max(0, end - state.startedAt) : null,
+      toolCalls: state.toolCalls,
+    }
+  }
+
   function settle(key: string, outcome: AcpOutcome, usage: AcpUsage | null, animate = true): void {
     const state = childState(key)
+    // A cancelled turn may report no usage: keep the numbers the card had.
+    const live = liveUsage(state)
+    state.usage = fillUsage(fillUsage(usage ?? { ...EMPTY_USAGE }, live), state.usage)
     state.state = outcome
-    state.usage = usage ?? state.usage
+    state.endedAt = null
     state.stop = 'idle'
     state.note = ''
     state.noteTone = ''
@@ -867,6 +918,8 @@ export function createAcpMounter(deps: AcpMounterDeps) {
     const state = childState(key)
     const wasRunning = state.state === 'running'
     state.state = 'running'
+    state.transient = false
+    if (row?.active_turn === true) state.endedAt = null
     if (row) {
       const name = state.spec?.agentName || harnessDisplayName(row.agent_id, row.agent_name)
       state.activity = activityLabel(row, name)
@@ -891,7 +944,10 @@ export function createAcpMounter(deps: AcpMounterDeps) {
       .then((result) => {
         if (gen !== generation) return
         const state = childState(key)
-        if (completions.has(key) || (state.state !== 'running' && state.state !== 'checking')) {
+        state.statusAttempts = 0
+        state.transient = false
+        if (completions.has(key)) return
+        if (state.state !== 'running' && state.state !== 'checking' && state.state !== 'unknown') {
           return
         }
         const row = (result ?? {}) as AcpLiveRow
@@ -916,6 +972,9 @@ export function createAcpMounter(deps: AcpMounterDeps) {
           settle(key, 'cancelled', null, state.state === 'running')
           return
         }
+        // A turn that just ended may not have written its record yet: one
+        // wrapping up waits for the next check rather than guess.
+        if (state.state === 'running' && state.endedAt !== null) return
         // Spawned but not picked up yet (the task runtime queues it): keep
         // waiting while the session row still says it runs.
         if (text(row.session_status) === 'running') {
@@ -928,14 +987,47 @@ export function createAcpMounter(deps: AcpMounterDeps) {
       })
       .catch((error: unknown) => {
         if (gen !== generation) return
-        diag('acp.status.error', { key, message: error instanceof Error ? error.message : '' })
+        const code = (error as { code?: unknown } | null)?.code
+        diag('acp.status.error', {
+          key,
+          code: typeof code === 'string' ? code : '',
+          message: error instanceof Error ? error.message : '',
+        })
         const state = childState(key)
+        const final = typeof code === 'string' && FINAL_STATUS_CODES.has(code)
+        if (!final && state.statusAttempts < STATUS_RETRIES) {
+          // Not an answer (the socket was not up yet, a dropped frame): try
+          // again shortly, a bounded number of times.
+          const delay = 1000 * 2 ** state.statusAttempts
+          state.statusAttempts += 1
+          const timer = setTimeout(() => {
+            retryTimers.delete(timer)
+            if (gen === generation) checkStatus(key)
+          }, delay)
+          retryTimers.add(timer)
+          return
+        }
+        state.statusAttempts = 0
+        state.transient = !final
         if (state.state === 'checking') {
           state.state = 'unknown'
           paintAll(key, false)
         }
       })
       .finally(() => statusInFlight.delete(key))
+  }
+
+  /**
+   * The connection is (back) up: a card whose status never came for want of
+   * one asks again.
+   */
+  function reconnected(): void {
+    children.forEach((state, key) => {
+      if (state.state === 'unknown' && state.transient && connectedCards(key).length) {
+        checkStatus(key)
+      }
+    })
+    reconcileTimers(true)
   }
 
   function applyRows(rows: AcpLiveRow[]): void {
@@ -951,6 +1043,15 @@ export function createAcpMounter(deps: AcpMounterDeps) {
         state.seenActive = true
         state.quietPolls = 0
         markRunning(key, row)
+        return
+      }
+      if (state.seenActive && state.endedAt === null) {
+        // The harness is done; the outcome is on its way. Stop the clock and
+        // the Stop button now rather than at the completion, and ask.
+        state.endedAt = now()
+        state.quietPolls = 0
+        paintAll(key, true)
+        checkStatus(key)
         return
       }
       state.quietPolls += 1
@@ -1232,14 +1333,14 @@ export function createAcpMounter(deps: AcpMounterDeps) {
     completions.set(key, payload)
     const state = children.get(key)
     if (!state) return
-    if (state.state === 'running' || state.state === 'checking' || state.state === 'unknown') {
-      settle(
-        key,
-        completionOutcome(payload.status, payload.terminal_reason),
-        completionUsage(payload),
-        state.state === 'running',
-      )
-    }
+    // The completion is the authority, also over an outcome read from
+    // `acp.status` a moment earlier; only a live card animates the settle.
+    settle(
+      key,
+      completionOutcome(payload.status, payload.terminal_reason),
+      completionUsage(payload),
+      state.state === 'running',
+    )
   }
 
   /** The completion card, registered so the spawn's harness card settles too. */
@@ -1247,9 +1348,11 @@ export function createAcpMounter(deps: AcpMounterDeps) {
     noteCompletion(payload)
     // Offered when a navigator exists now; the click reads the live one.
     const navigator = deps.openSession?.() ?? null
+    const childKey = text(payload.child_session_key) || text(payload.session_key)
     return buildCompletionCard(payload, {
       markdown: deps.markdown,
       openSession: navigator ? (key) => (deps.openSession?.() ?? navigator)(key) : null,
+      fallbackUsage: childKey ? (children.get(childKey)?.usage ?? null) : null,
       raw,
       knownAgent: (childKey) => {
         const spec = children.get(childKey)?.spec
@@ -1264,6 +1367,8 @@ export function createAcpMounter(deps: AcpMounterDeps) {
     unbindVisibility()
     swapTimers.forEach((timer) => clearTimeout(timer))
     swapTimers.clear()
+    retryTimers.forEach((timer) => clearTimeout(timer))
+    retryTimers.clear()
     cards.clear()
     fresh.clear()
   }
@@ -1272,6 +1377,7 @@ export function createAcpMounter(deps: AcpMounterDeps) {
     harnessCard,
     completionCard,
     noteCompletion,
+    reconnected,
     destroyAll,
     /** Test/diagnostic surface: is the poller armed right now. */
     isPolling: (): boolean => polling,

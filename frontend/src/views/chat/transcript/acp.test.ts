@@ -15,7 +15,7 @@ import {
   parseAcpStats,
   type AcpSpawnSpec,
 } from './acp'
-import { createToolRenderer } from './tools'
+import { createToolRenderer, toolDisplayName, toolIconName } from './tools'
 
 const markdown = {
   render: (text: string) => `<p>${text.replace(/</g, '&lt;')}</p>`,
@@ -570,6 +570,109 @@ describe('harness run card + poller', () => {
     expect(note).toHaveAttribute('data-tone', 'error')
     expect(stop).not.toBeDisabled()
   })
+
+  // Round 2 (live test): the harness is done but the chat still persists and
+  // announces; the card must not keep a ticking clock and a live Stop.
+  it('wraps up as soon as the harness turn ends: clock stops, Stop goes, status asked', async () => {
+    const m = mounter()
+    const card = m.harnessCard(SPEC, { live: true })
+    document.body.appendChild(card)
+    rows = [{ session_key: CHILD, active_turn: true, activity: 'Edit a.py', turn_elapsed_s: 40 }]
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(card.querySelector('.acp-run__elapsed')).toHaveTextContent('0:40')
+
+    // The harness finished; its record is not written yet.
+    rows = []
+    statusAnswer = { session_key: CHILD, active_turn: false }
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(callsOf('acp.status')).toBe(1)
+    expect(card).toHaveAttribute('data-state', 'running')
+    expect(card.querySelector('[data-action="stop"]')).toHaveAttribute('hidden')
+    await vi.advanceTimersByTimeAsync(400)
+    expect(card.querySelector('.acp-run__activity')).toHaveTextContent('Wrapping up…')
+    const frozen = card.querySelector('.acp-run__elapsed')!.textContent
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(card.querySelector('.acp-run__elapsed')!.textContent).toBe(frozen)
+    // Still wrapping, never back to the stale step.
+    expect(card.querySelector('.acp-run__activity')).toHaveTextContent('Wrapping up…')
+
+    m.completionCard(fullPayload(), '{}')
+    expect(card).toHaveAttribute('data-state', 'done')
+  })
+
+  it('keeps the live numbers when a cancelled turn reports no usage', async () => {
+    const m = mounter()
+    const card = m.harnessCard(SPEC, { live: true })
+    document.body.appendChild(card)
+    rows = [{ session_key: CHILD, active_turn: true, turn_tool_calls: 4, turn_elapsed_s: 100 }]
+    await vi.advanceTimersByTimeAsync(1500)
+    const cancelled = fullPayload({
+      status: 'cancelled',
+      terminal_reason: 'cancelled',
+      terminal_message: 'Stopped by the operator.',
+      usage: null,
+      stats: '',
+      result: { text: '' },
+    })
+    const completion = m.completionCard(cancelled, JSON.stringify(cancelled))
+    expect(card).toHaveAttribute('data-state', 'cancelled')
+    expect(card.querySelector('.acp-run__tools')).toHaveTextContent('4 tool calls')
+    expect(card.querySelector('.acp-run__activity')).toHaveTextContent('Cancelled')
+    // The completion card shows them too, and the stop as a notice, not an error.
+    expect(chipTexts(completion)).toEqual(['1m 40s', '4 tool calls'])
+    expect(completion.querySelector('.acp-done__notice')).toHaveTextContent(
+      'Stopped by the operator.',
+    )
+    expect(completion.querySelector('.acp-done__error')).toBeNull()
+  })
+
+  it('retries a status read that failed for want of a connection, a bounded number of times', async () => {
+    let failures = 2
+    call.mockImplementation(async (method: string) => {
+      if (method === 'acp.status') {
+        if (failures > 0) {
+          failures -= 1
+          throw new Error('Not connected')
+        }
+        return { session_key: CHILD, last_turn: { duration_ms: 3000, stop_reason: 'end_turn' } }
+      }
+      return {}
+    })
+    const m = mounter()
+    const card = m.harnessCard(SPEC, { live: false })
+    document.body.appendChild(card)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(card).toHaveAttribute('data-state', 'checking')
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(card).toHaveAttribute('data-state', 'checking')
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(callsOf('acp.status')).toBe(3)
+    expect(card).toHaveAttribute('data-state', 'done')
+  })
+
+  it('gives up after its retries, and asks again when the connection comes back', async () => {
+    let connected = false
+    call.mockImplementation(async (method: string) => {
+      if (method !== 'acp.status') return {}
+      if (!connected) throw new Error('Not connected')
+      return { session_key: CHILD, last_turn: { duration_ms: 2000 } }
+    })
+    const m = mounter()
+    const card = m.harnessCard(SPEC, { live: false })
+    document.body.appendChild(card)
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(1000 + 2000 + 4000 + 8000)
+    expect(callsOf('acp.status')).toBe(5)
+    expect(card).toHaveAttribute('data-state', 'unknown')
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(callsOf('acp.status')).toBe(5)
+
+    connected = true
+    m.reconnected()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(callsOf('acp.status')).toBe(6)
+    expect(card).toHaveAttribute('data-state', 'done')
+  })
 })
 
 describe('tool renderer: a harness spawn renders as its run card', () => {
@@ -678,5 +781,87 @@ describe('tool renderer: a harness spawn renders as its run card', () => {
     expect(body.querySelector('.acp-run')).toBeNull()
     expect(body.querySelector('.chat-tools-collapse--error')).not.toBeNull()
     m.destroyAll()
+  })
+})
+
+describe('tool renderer: a harness tool reads as its title', () => {
+  function harness() {
+    const bubble = document.createElement('div')
+    const body = document.createElement('div')
+    body.className = 'msg-body'
+    bubble.appendChild(body)
+    const renderer = createToolRenderer({
+      ensureStreamBubble: () => bubble,
+      markVisibleStreamEvent: () => {},
+      flushPendingTextSegment: () => {},
+      newTextSegment: () => document.createElement('div'),
+      scrollToBottom: () => {},
+      getAutoScroll: () => false,
+      pushSegment: () => {},
+      getSearchProvider: () => '',
+      setSearchProvider: () => {},
+      getSessionKey: () => CHILD,
+      addMessage: () => null,
+      pushMessage: () => {},
+    })
+    return { bubble, body, renderer }
+  }
+  const nameOf = (body: Element, id: string) =>
+    body.querySelector(`[data-tool-id="${id}"] .chat-tools-name`)
+
+  it('prefers the title over the raw acp:<kind> name, and picks the kind icon', () => {
+    expect(toolDisplayName('acp:read', { title: 'Read src/app.py', path: 'src/app.py' })).toBe(
+      'Read src/app.py',
+    )
+    expect(toolDisplayName('acp:execute', '{"title":"Run pytest -q"}')).toBe('Run pytest -q')
+    expect(toolDisplayName('acp:execute', {}, 'Run make')).toBe('Run make')
+    expect(toolDisplayName('acp:other', {})).toBe('acp:other')
+    // Only harness tools: an ordinary tool's `title` argument is not its name.
+    expect(toolDisplayName('write_file', { title: 'x' })).toBe('write_file')
+    expect(toolIconName('acp:read')).toBe('file-text')
+    expect(toolIconName('acp:execute')).toBe('terminal')
+    expect(toolIconName('acp:mystery')).toBe('zap')
+  })
+
+  it('relabels a live row when the title arrives with the result', () => {
+    const { body, renderer } = harness()
+    renderer.appendToolCall({ tool_name: 'acp:execute', tool_use_id: 't1' })
+    expect(nameOf(body, 't1')).toHaveTextContent('acp:execute')
+    renderer.appendToolResult({
+      tool_name: 'acp:execute',
+      tool_use_id: 't1',
+      result: 'ok',
+      arguments: { title: 'Run pytest -q', command: 'pytest -q' },
+    })
+    expect(nameOf(body, 't1')).toHaveTextContent('Run pytest -q')
+    expect(nameOf(body, 't1')).toHaveAttribute('title', 'acp:execute')
+    expect(body.querySelector('[data-tool-id="t1"] .chat-tools-icon')).toHaveAttribute(
+      'data-icon',
+      'terminal',
+    )
+    // An explicit title on the event wins too.
+    renderer.appendToolCall({ tool_name: 'acp:read', tool_use_id: 't2', title: 'Read a.py' })
+    expect(nameOf(body, 't2')).toHaveTextContent('Read a.py')
+  })
+
+  it('rebuilds titled rows from history, and a result without one keeps the title', () => {
+    const { bubble, body, renderer } = harness()
+    renderer.reconstructToolCalls(
+      bubble,
+      [
+        {
+          type: 'tool_use',
+          name: 'acp:read',
+          tool_use_id: 'r1',
+          input: { title: 'Read src/app.py', path: 'src/app.py' },
+        },
+        { type: 'tool_result', name: 'acp:read', tool_use_id: 'r1', result: 'contents' },
+        { type: 'tool_use', name: 'acp:edit', tool_use_id: 'r2', title: 'Edit b.py', input: {} },
+        { type: 'tool_result', name: 'acp:edit', tool_use_id: 'r2', result: 'ok' },
+      ],
+      { renderText: (text, into) => (into.textContent = text), stripText: (text) => text },
+    )
+    expect(nameOf(body, 'r1')).toHaveTextContent('Read src/app.py')
+    expect(nameOf(body, 'r2')).toHaveTextContent('Edit b.py')
   })
 })

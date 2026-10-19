@@ -768,6 +768,7 @@ export const chat = defineNamespace('chat', {
   acpRunFinishedIn: 'Finished in {duration}',
   acpRunFailed: 'Failed',
   acpRunCancelled: 'Cancelled',
+  acpRunWrapping: 'Wrapping up…',
   acpRunChecking: 'Checking status…',
   acpRunUnknown: 'No live status',
   acpStop: 'Stop',

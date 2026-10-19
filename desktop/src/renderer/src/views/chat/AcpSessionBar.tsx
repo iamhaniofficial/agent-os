@@ -21,20 +21,31 @@ function str(value: unknown): string {
 }
 
 /** The status line's second half: what the harness is doing, or what comes next. */
-function detailFor(view: AcpSessionView): { text: string; tone: '' | 'error' } {
+interface Detail {
+  text: string
+  tone: '' | 'error'
+  /** A live step may shorten with an ellipsis; a hint is dropped whole instead. */
+  kind: 'activity' | 'hint'
+}
+
+function detailFor(view: AcpSessionView): Detail {
   const { info, name, state } = view
-  if (state === 'closed') return { text: t('acp.bar.closedHint'), tone: '' }
+  if (state === 'closed') return { text: t('acp.bar.closedHint'), tone: '', kind: 'hint' }
   if (state === 'working') {
-    const activity = str(info?.activity)
-    if (activity) return { text: activity, tone: '' }
-    if (info?.active_turn === true)
-      return { text: t('acp.bar.busy').replace('{name}', name), tone: '' }
-    return { text: t('acp.bar.starting').replace('{name}', name), tone: '' }
+    // Until this turn reports a step of its own: never the last turn's.
+    if (view.activity) return { text: view.activity, tone: '', kind: 'activity' }
+    return { text: t('acp.bar.starting').replace('{name}', name), tone: '', kind: 'activity' }
   }
   const lastTurn = info?.last_turn
   const error = lastTurn && typeof lastTurn === 'object' ? str(lastTurn.error) : ''
-  if (error) return { text: t('acp.bar.lastFailed').replace('{message}', error), tone: 'error' }
-  return { text: t('acp.bar.idleHint').replace('{name}', name), tone: '' }
+  if (error) {
+    return {
+      text: t('acp.bar.lastFailed').replace('{message}', error),
+      tone: 'error',
+      kind: 'hint',
+    }
+  }
+  return { text: t('acp.bar.idleHint').replace('{name}', name), tone: '', kind: 'hint' }
 }
 
 /**
@@ -89,124 +100,135 @@ export function AcpSessionBar({ view }: { view: AcpSessionView }) {
         : ''
 
   return (
-    <section
-      className="acp-bar"
-      data-state={state}
-      data-acp-agent={agentId}
-      data-enter="true"
-      aria-label={t('acp.bar.label')}
-      data-testid="acp-bar"
-    >
-      <span className="acp-bar__badge" data-acp-agent={agentId}>
-        <ProviderLogo id={MARK_FOR[agentId] ?? agentId} label={name || agentId} size={28} />
-      </span>
-      <div className="acp-bar__id">
-        <div className="acp-bar__name">{name}</div>
-        {cwd ? (
-          <div className="acp-bar__cwd" title={cwd}>
-            {basename(cwd)}
-          </div>
-        ) : null}
-      </div>
-      {mode || harnessMode ? (
-        <div className="acp-chips acp-bar__chips">
-          {mode ? (
-            <span className="acp-chip" data-kind="mode" title={t('acp.bar.modeTitle')}>
-              {mode}
-            </span>
-          ) : null}
-          {harnessMode ? (
-            <span
-              className="acp-chip"
-              data-kind="harness-mode"
-              title={t('acp.bar.harnessModeTitle')}
-            >
-              {harnessMode}
-            </span>
+    // The host is the size container: the bar's contents step down by its
+    // width (acp.css), the harness name last.
+    <div className="acp-bar-host">
+      <section
+        className="acp-bar"
+        data-state={state}
+        data-acp-agent={agentId}
+        data-enter="true"
+        aria-label={t('acp.bar.label')}
+        data-testid="acp-bar"
+      >
+        <span className="acp-bar__badge" data-acp-agent={agentId}>
+          <ProviderLogo id={MARK_FOR[agentId] ?? agentId} label={name || agentId} size={28} />
+        </span>
+        <div className="acp-bar__id">
+          <div className="acp-bar__name">{name}</div>
+          {cwd ? (
+            <div className="acp-bar__cwd" title={cwd}>
+              {basename(cwd)}
+            </div>
           ) : null}
         </div>
-      ) : null}
-
-      {confirming && !closed ? (
-        <div className="acp-bar__confirm" role="group" aria-label={t('acp.bar.end')}>
-          <span className="acp-bar__confirm-text">
-            {t('acp.bar.confirm').replace('{name}', name)}
-          </span>
-          <button
-            ref={keepRef}
-            type="button"
-            className="acp-btn"
-            onClick={() => setConfirming(false)}
-          >
-            {t('acp.bar.confirmKeep')}
-          </button>
-          <button
-            type="button"
-            className="acp-btn acp-btn--solid-danger"
-            disabled={view.endState !== 'idle'}
-            data-pending={view.endState === 'pending' || undefined}
-            onClick={() => {
-              view.end()
-              setConfirming(false)
-            }}
-          >
-            {view.endState === 'pending' ? t('acp.bar.ending') : t('acp.bar.confirmEnd')}
-          </button>
-        </div>
-      ) : (
-        <>
-          <div className="acp-bar__status" role="status" aria-live="polite">
-            <span className="acp-bar__dot" aria-hidden="true" />
-            <span className="acp-bar__state">{label}</span>
-            <span
-              className="acp-bar__detail"
-              data-tone={detail.tone || undefined}
-              title={detail.text}
-            >
-              <span key={detail.text}>{detail.text}</span>
-            </span>
-            {elapsed ? (
-              <span className="acp-bar__elapsed" title={t('acp.bar.elapsedTitle')}>
-                {elapsed}
+        {mode || harnessMode ? (
+          // Highest priority first: a chip that no longer fits wraps onto a
+          // clipped second line and is gone whole, never cut mid-word.
+          <div className="acp-chips acp-bar__chips">
+            {harnessMode ? (
+              <span
+                className="acp-chip"
+                data-kind="harness-mode"
+                title={t('acp.bar.harnessModeTitle')}
+              >
+                {harnessMode}
+              </span>
+            ) : null}
+            {mode ? (
+              <span className="acp-chip" data-kind="mode" title={t('acp.bar.modeTitle')}>
+                {mode}
               </span>
             ) : null}
           </div>
-          {noteText ? (
-            <span
-              className="acp-bar__note"
-              data-tone={view.note?.kind === 'error' ? 'error' : undefined}
-              role="note"
-            >
-              {noteText}
+        ) : null}
+
+        {confirming && !closed ? (
+          <div className="acp-bar__confirm" role="group" aria-label={t('acp.bar.end')}>
+            <span className="acp-bar__confirm-text">
+              {t('acp.bar.confirm').replace('{name}', name)}
             </span>
-          ) : null}
-          {!closed ? (
-            <div className="acp-bar__actions">
-              {working ? (
+            <button
+              ref={keepRef}
+              type="button"
+              className="acp-btn"
+              onClick={() => setConfirming(false)}
+            >
+              {t('acp.bar.confirmKeep')}
+            </button>
+            <button
+              type="button"
+              className="acp-btn acp-btn--solid-danger"
+              disabled={view.endState !== 'idle'}
+              data-pending={view.endState === 'pending' || undefined}
+              onClick={() => {
+                view.end()
+                setConfirming(false)
+              }}
+            >
+              {view.endState === 'pending' ? t('acp.bar.ending') : t('acp.bar.confirmEnd')}
+            </button>
+          </div>
+        ) : (
+          <>
+            <div
+              className="acp-bar__status"
+              role="status"
+              aria-live="polite"
+              title={`${label} · ${detail.text}`}
+            >
+              <span className="acp-bar__dot" aria-hidden="true" />
+              <span className="acp-bar__state">{label}</span>
+              <span
+                className="acp-bar__detail"
+                data-tone={detail.tone || undefined}
+                data-kind={detail.kind}
+              >
+                <span key={detail.text}>{detail.text}</span>
+              </span>
+              {elapsed ? (
+                <span className="acp-bar__elapsed" title={t('acp.bar.elapsedTitle')}>
+                  {elapsed}
+                </span>
+              ) : null}
+            </div>
+            {noteText ? (
+              <span
+                className="acp-bar__note"
+                data-tone={view.note?.kind === 'error' ? 'error' : undefined}
+                role="note"
+              >
+                {noteText}
+              </span>
+            ) : null}
+            {!closed ? (
+              <div className="acp-bar__actions">
+                {working ? (
+                  <button
+                    type="button"
+                    className="acp-btn acp-btn--danger"
+                    disabled={view.stopState !== 'idle'}
+                    data-pending={view.stopState === 'pending' || undefined}
+                    title={t('acp.bar.stopTitle').replace('{name}', name)}
+                    onClick={view.stop}
+                  >
+                    {view.stopState === 'idle' ? t('acp.bar.stop') : t('acp.bar.stopping')}
+                  </button>
+                ) : null}
                 <button
                   type="button"
-                  className="acp-btn acp-btn--danger"
-                  disabled={view.stopState !== 'idle'}
-                  data-pending={view.stopState === 'pending' || undefined}
-                  title={t('acp.bar.stopTitle').replace('{name}', name)}
-                  onClick={view.stop}
+                  className="acp-btn acp-btn--quiet"
+                  disabled={view.endState !== 'idle'}
+                  title={t('acp.bar.endTitle').replace('{name}', name)}
+                  onClick={() => setConfirming(true)}
                 >
-                  {view.stopState === 'idle' ? t('acp.bar.stop') : t('acp.bar.stopping')}
+                  {t('acp.bar.end')}
                 </button>
-              ) : null}
-              <button
-                type="button"
-                className="acp-btn acp-btn--quiet"
-                disabled={view.endState !== 'idle'}
-                title={t('acp.bar.endTitle').replace('{name}', name)}
-                onClick={() => setConfirming(true)}
-              >
-                {t('acp.bar.end')}
-              </button>
-            </div>
-          ) : null}
-        </>
-      )}
-    </section>
+              </div>
+            ) : null}
+          </>
+        )}
+      </section>
+    </div>
   )
 }
