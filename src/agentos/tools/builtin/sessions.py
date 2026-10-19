@@ -380,14 +380,16 @@ async def sessions_send(session_key: str, message: str, mode: str | None = None)
         },
         "cwd": {
             "type": "string",
-            "description": "runtime=acp: working directory (default: the agent workspace). "
-            "Must be inside the workspace or [acp] allowed_cwds.",
+            "description": "runtime=acp: working directory (default: the agent workspace, "
+            "fine for read-only work in a read-only harness_mode). Writes belong in a project "
+            "dir under [acp] allowed_cwds or a worktree=true checkout.",
         },
         "mode": {
             "type": "string",
             "enum": ["oneshot", "persistent"],
-            "description": "runtime=acp: 'oneshot' (default) closes the harness after the "
-            "first turn; 'persistent' keeps it for sessions_send follow-ups.",
+            "description": "runtime=acp: 'oneshot' (default) stops the harness process after "
+            "each turn (a sessions_send follow-up resumes it); 'persistent' keeps the process "
+            "running between turns.",
         },
         "harness_mode": {
             "type": "string",

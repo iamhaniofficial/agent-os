@@ -487,9 +487,16 @@ def last_turn_record(
     turn_cost: float | None,
     error: str | None = None,
     error_code: str | None = None,
+    tool_calls: int | None = None,
 ) -> dict[str, Any]:
-    """The ``origin["last_turn"]`` entry the announce ``Stats:`` line reads."""
+    """The ``origin["last_turn"]`` entry the announce ``Stats:`` line reads.
+
+    ``tool_calls`` overrides the result's count (a failed turn has no result
+    but the projector still saw its tool calls).
+    """
     usage = result.usage if result is not None else AcpUsage()
+    if tool_calls is None:
+        tool_calls = result.tool_calls if result is not None else 0
     record: dict[str, Any] = {
         "duration_ms": int(duration_ms),
         "input_tokens": int(usage.input_tokens or 0),
@@ -497,7 +504,7 @@ def last_turn_record(
         "total_tokens": int(usage.total_tokens or 0)
         or int(usage.input_tokens or 0) + int(usage.output_tokens or 0),
         "stop_reason": result.stop_reason if result is not None else "error",
-        "tool_calls": result.tool_calls if result is not None else 0,
+        "tool_calls": int(tool_calls),
     }
     if turn_cost is not None:
         record["cost_usd"] = round(float(turn_cost), 6)

@@ -7,6 +7,11 @@ the exact path a model turn uses (``_emit_task_runtime_stream_events``):
 the desktop, web UI and channels see a running session, an ``error`` event
 fails the task, and the subagent terminal listener announces completion to
 the parent with a ``Stats:`` line.
+
+Every failed or refused turn also leaves a ``system`` row ``Error: ...`` in
+the child transcript (the shape the engine writes for a failed model turn):
+the UIs resync history right after the ``error`` event, so an error that only
+lived in the event stream disappeared from the screen.
 """
 
 from __future__ import annotations
@@ -21,7 +26,13 @@ from typing import Any
 import structlog
 
 from agentos.acp import projector as _projected
-from agentos.acp.manager import AcpSessionManager, get_acp_manager, spec_from_origin
+from agentos.acp.manager import (
+    AcpSessionManager,
+    agent_display_name,
+    get_acp_manager,
+    origin_is_closed,
+    spec_from_origin,
+)
 from agentos.acp.projector import (
     COST_READING_KEY,
     HARNESS_COST_SOURCE,
@@ -32,7 +43,7 @@ from agentos.acp.projector import (
     usage_update_fields,
 )
 from agentos.acp.projector import ErrorEvent as ProjectedError
-from agentos.acp.types import AcpError, AcpTurnError, AcpTurnResult
+from agentos.acp.types import AcpError, AcpSessionSpec, AcpTurnError, AcpTurnResult
 from agentos.engine import types as engine_types
 
 log = structlog.get_logger("agentos.gateway.acp_dispatch")
@@ -52,6 +63,11 @@ def to_engine_event(event: _projected.EngineEvent) -> Any:
 
 
 _END = object()
+
+#: Default ``[acp] stream_delivery`` (child sessions stream text as it arrives).
+DEFAULT_STREAM_DELIVERY = "live"
+#: Cap on the transcript ``Error:`` row (stderr tails can be long).
+_ERROR_ROW_MAX_CHARS = 4000
 
 
 def session_origin(session: Any) -> dict[str, Any]:
@@ -79,6 +95,48 @@ async def _append(session_manager: Any, session_key: str, **kwargs: Any) -> Any:
         return None
 
 
+async def _persist_error_row(session_manager: Any, session_key: str, message: str) -> None:
+    """``system`` transcript row the history renderer shows for a failed turn."""
+    text = (message or "ACP turn failed").strip()
+    if len(text) > _ERROR_ROW_MAX_CHARS:
+        text = text[:_ERROR_ROW_MAX_CHARS] + " [...]"
+    await _append(session_manager, session_key, role="system", content=f"Error: {text}")
+
+
+async def _refuse(
+    session_manager: Any,
+    session_key: str,
+    error: ProjectedError,
+) -> ProjectedError:
+    """Log and persist a turn refused before the harness ran; return its event.
+
+    The refusal becomes the session's ``last_turn`` too, so a completion
+    announced for it does not carry the previous turn's ``Stats:``.
+    """
+    log.info("acp.dispatch.turn_refused", session_key=session_key, code=error.code)
+    await _persist_turn(
+        session_manager=session_manager,
+        session_key=session_key,
+        projector=AcpProjector(),
+        result=None,
+        duration_ms=0,
+        process_key="",
+        error=AcpError(error.message, code=error.code),
+    )
+    return error
+
+
+def _closed_message(session_key: str, origin: Mapping[str, Any]) -> str:
+    name = agent_display_name(str(origin.get("agent_id") or "")) or "ACP"
+    message = (
+        f"This {name} session ({session_key}) was closed and takes no more turns; spawn a new one"
+    )
+    acp_session_id = origin.get("acp_session_id")
+    if acp_session_id:
+        message += f" (resume_session_id={acp_session_id} continues the harness conversation)"
+    return message + "."
+
+
 async def _persist_turn(
     *,
     session_manager: Any,
@@ -88,9 +146,12 @@ async def _persist_turn(
     duration_ms: int,
     process_key: str,
     error: AcpError | None = None,
+    error_row: bool = True,
 ) -> float | None:
     """Write transcript row, usage totals and ``origin.last_turn``.
 
+    With ``error`` (and ``error_row``) an ``Error:`` system row follows the
+    partial answer, so the failure stays visible after a history resync.
     Returns this turn's harness cost increment (``None`` when unknown).
     """
     if session_manager is None:
@@ -100,6 +161,8 @@ async def _persist_turn(
     except Exception:  # noqa: BLE001
         row = None
     if row is None:
+        if error is not None and error_row:
+            await _persist_error_row(session_manager, session_key, str(error))
         return None
     origin = session_origin(row)
     turn_cost: float | None = None
@@ -116,6 +179,7 @@ async def _persist_turn(
         turn_cost=turn_cost,
         error=str(error) if error is not None else None,
         error_code=getattr(error, "code", None) if error is not None else None,
+        tool_calls=projector.tool_calls if result is None else None,
     )
     fields: dict[str, Any] = {"origin": origin}
     if result is not None:
@@ -149,7 +213,41 @@ async def _persist_turn(
             tool_calls=segments or None,
             turn_usage=turn_usage,
         )
+    if error is not None and error_row:
+        await _persist_error_row(session_manager, session_key, str(error))
     return turn_cost
+
+
+def _admit_turn(
+    session: Any,
+    origin: Mapping[str, Any],
+    *,
+    session_key: str,
+    acp_config: Any,
+    manager: AcpSessionManager | None,
+) -> AcpSessionSpec | ProjectedError:
+    """The harness spec for this turn, or why the turn is refused."""
+    if acp_config is not None and getattr(acp_config, "enabled", True) is False:
+        return ProjectedError(
+            message="ACP is disabled ([acp] enabled = false)", code="ACP_DISABLED"
+        )
+    if manager is None or not manager.available:
+        reason = manager.unavailable_reason if manager is not None else "not configured"
+        return ProjectedError(message=f"ACP unavailable: {reason}", code="ACP_UNAVAILABLE")
+    try:
+        spec = spec_from_origin(origin, acp_config or manager.config, session_key=session_key)
+    except AcpError as exc:
+        return error_event(exc)
+    # Only an operator close (acp.close / subagents kill) refuses a turn; a
+    # finished oneshot is idle and resumes its harness session.
+    status = (
+        session.get("status") if isinstance(session, Mapping) else getattr(session, "status", None)
+    )
+    if origin_is_closed(origin, session_status=status):
+        return ProjectedError(
+            message=_closed_message(session_key, origin), code="ACP_SESSION_CLOSED"
+        )
+    return spec
 
 
 async def acp_turn_stream(
@@ -182,34 +280,29 @@ async def _projected_turn_stream(
     session_key = run.session_key
     acp_config = getattr(config, "acp", None)
     manager = manager or get_acp_manager()
-    if acp_config is not None and getattr(acp_config, "enabled", True) is False:
-        yield ProjectedError(message="ACP is disabled ([acp] enabled = false)", code="ACP_DISABLED")
-        return
-    if manager is None or not manager.available:
-        reason = manager.unavailable_reason if manager is not None else "not configured"
-        yield ProjectedError(message=f"ACP unavailable: {reason}", code="ACP_UNAVAILABLE")
-        return
-
     origin = session_origin(session)
-    try:
-        spec = spec_from_origin(origin, acp_config or manager.config, session_key=session_key)
-    except AcpError as exc:
-        yield error_event(exc)
-        return
-    if origin.get("closed"):
-        yield ProjectedError(
-            message=f"ACP session {session_key} was closed; spawn a new one",
-            code="ACP_SESSION_CLOSED",
-        )
-        return
 
     # A follow-up that did not come through sessions.send (which persists the
-    # user row itself) still belongs in the child transcript.
+    # user row itself) still belongs in the child transcript -- also when the
+    # turn is refused below, so the error row answers a visible message.
     if not getattr(run, "persisted_user_message_id", None):
         await _append(session_manager, session_key, role="user", content=run.message)
 
-    delivery = getattr(acp_config, "stream_delivery", "final_only") if acp_config else "final_only"
-    projector = AcpProjector(stream_delivery="live" if delivery == "live" else "final_only")
+    admitted = _admit_turn(
+        session, origin, session_key=session_key, acp_config=acp_config, manager=manager
+    )
+    if isinstance(admitted, ProjectedError):
+        yield await _refuse(session_manager, session_key, admitted)
+        return
+    spec = admitted
+    assert manager is not None  # _admit_turn refuses without a usable manager
+
+    delivery = (
+        getattr(acp_config, "stream_delivery", DEFAULT_STREAM_DELIVERY)
+        if acp_config
+        else DEFAULT_STREAM_DELIVERY
+    )
+    projector = AcpProjector(stream_delivery="final_only" if delivery == "final_only" else "live")
     queue: asyncio.Queue[Any] = asyncio.Queue()
 
     def _on_event(event: Any) -> None:
@@ -267,6 +360,7 @@ async def _projected_turn_stream(
             process_key=process_key,
             error=wrapped,
         )
+        log.info("acp.dispatch.turn_failed", session_key=session_key, code=wrapped.code)
         yield error_event(wrapped)
         return
 
@@ -283,6 +377,8 @@ async def _projected_turn_stream(
             duration_ms=duration_ms,
             process_key=process_key,
             error=cancelled,
+            # A stop the user (or parent) asked for is not a failure to report.
+            error_row=False,
         )
         yield error_event(cancelled)
         return

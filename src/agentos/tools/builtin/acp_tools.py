@@ -137,19 +137,24 @@ async def _sessions_payload() -> dict[str, Any]:
             rows = await _list_children(mgr, ctx.session_key)
         except ToolError:
             rows = []
+        from agentos.acp.manager import origin_is_closed
+
         for row in rows:
             if not row_is_acp(row):
                 continue
             key = row.get("session_key") if isinstance(row, Mapping) else None
             origin = _origin(row)
+            status = row.get("status") if isinstance(row, Mapping) else None
+            closed = origin_is_closed(origin, session_status=status)
             children.append(
                 {
                     "session_key": key,
-                    "status": row.get("status") if isinstance(row, Mapping) else None,
+                    "status": status,
                     "acp_agent": origin.get("agent_id"),
                     "mode": origin.get("mode"),
                     "cwd": origin.get("cwd"),
-                    "closed": bool(origin.get("closed")),
+                    "closed": closed,
+                    "idle": bool(origin.get("idle")) and not closed and key not in live_keys,
                     "live": key in live_keys,
                 }
             )
