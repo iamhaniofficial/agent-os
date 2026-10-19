@@ -335,7 +335,7 @@ describe('harness run card + poller', () => {
     expect(card).toHaveAttribute('data-tool-id', 'tool-1')
     expect(card.querySelector('.acp-run__name')).toHaveTextContent('Claude Code')
     expect(card.querySelector('.acp-run__cwd')).toHaveTextContent('workspace')
-    expect(chipTexts(card)).toEqual(['oneshot', 'plan'])
+    expect(chipTexts(card)).toEqual(['plan', 'oneshot'])
     expect(card.querySelector('.acp-run__activity')).toHaveTextContent('Starting Claude Code…')
     expect(card.querySelector('[data-action="stop"]')).not.toHaveAttribute('hidden')
     expect(m.isPolling()).toBe(true)

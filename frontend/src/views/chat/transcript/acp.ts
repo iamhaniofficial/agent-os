@@ -1219,11 +1219,12 @@ export function createAcpMounter(deps: AcpMounterDeps) {
       titles.appendChild(cwd)
     }
     head.appendChild(titles)
+    // Highest priority first: on a narrow card the last chip leaves first.
     const modes = el('div', 'acp-chips acp-run__modes')
-    if (spec.mode) modes.appendChild(chip('mode', spec.mode, t('chat.acpChipMode')))
     if (spec.harnessMode) {
       modes.appendChild(chip('harness-mode', spec.harnessMode, t('chat.acpChipHarnessMode')))
     }
+    if (spec.mode) modes.appendChild(chip('mode', spec.mode, t('chat.acpChipMode')))
     if (modes.childElementCount) head.appendChild(modes)
     card.appendChild(head)
 

@@ -3,6 +3,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import {
   useCallback,
   useEffect,
+  useId,
   useImperativeHandle,
   useRef,
   useState,
@@ -112,6 +113,7 @@ export function Composer({
   disabledReason = null,
 }: ComposerProps) {
   const disabled = Boolean(disabledReason)
+  const disabledNoteId = useId()
   const [value, setValue] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -376,7 +378,7 @@ export function Composer({
       {seats}
       {slashMenu}
       {disabledReason ? (
-        <p className="composer-disabled-note" role="note">
+        <p id={disabledNoteId} className="composer-disabled-note" role="note">
           {disabledReason}
         </p>
       ) : null}
@@ -476,10 +478,13 @@ export function Composer({
             onBlur={() => onFocusChange?.(false)}
             disabled={disabled}
             title={disabledReason ?? undefined}
+            // The reason is said once, on its own line above; the field
+            // points at it rather than repeat it as a placeholder.
+            aria-describedby={disabledReason ? disabledNoteId : undefined}
             placeholder={
-              disabledReason ||
-              (showSuggestion && suggestion) ||
-              (placeholder ?? t('composer.placeholder'))
+              disabledReason
+                ? ''
+                : (showSuggestion && suggestion) || (placeholder ?? t('composer.placeholder'))
             }
             aria-label={t('composer.placeholder')}
             aria-keyshortcuts={showSuggestion ? 'Tab' : undefined}
