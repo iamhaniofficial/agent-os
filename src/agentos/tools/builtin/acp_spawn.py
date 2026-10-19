@@ -144,7 +144,7 @@ def resolve_spawn_cwd(
         workspace_dir=workspace_dir, acp_config=acp_config, state_dir=state_dir
     )
     if not any(_within(resolved, root) for root in roots):
-        raise ToolError(cwd_refusal_message(resolved, acp_config))
+        raise ToolError(cwd_refusal_message(resolved, acp_config, workspace_dir=workspace_dir))
     return resolved
 
 
@@ -156,9 +156,15 @@ def _home_relative(path: Path) -> str:
     return text
 
 
-def cwd_refusal_message(resolved: Path, acp_config: Any) -> str:
-    """Why ``cwd`` was refused and the exact command that allows it.
+def cwd_refusal_message(
+    resolved: Path, acp_config: Any, *, workspace_dir: Path | None = None
+) -> str:
+    """Why ``cwd`` was refused, what to check first, and the exact command
+    that allows the directory if the task really needs it.
 
+    A refused cwd is often a wrong guess (a folder named in the task, such as
+    ``agents/trading``, usually lives in the agent workspace), so the agent
+    is told to check that before asking the user to widen access.
     ``config set`` replaces the whole list, so the suggested value keeps the
     directories already allowed.
     """
@@ -169,10 +175,13 @@ def cwd_refusal_message(resolved: Path, acp_config: Any) -> str:
     ]
     wanted = _home_relative(resolved)
     value = json.dumps([*existing, wanted], ensure_ascii=False)
+    workspace = f" ({_home_relative(_real(workspace_dir))})" if workspace_dir is not None else ""
     return (
         f"ACP_CWD_NOT_ALLOWED: cwd {resolved} is outside the agent workspace, the managed "
-        "worktrees and [acp] allowed_cwds. Do not pick another directory or fall back to the "
-        "workspace on your own: tell the user the harness needs access to this project and "
+        "worktrees and [acp] allowed_cwds. First check that this is the right directory: a "
+        "relative path or a folder named in the task (for example agents/...) usually lives "
+        f"in the agent workspace{workspace}, so pass it relative to the workspace (or omit cwd) "
+        "and spawn again. Only if the task really targets this directory: tell the user and "
         f"ask them to allow it with `agentos config set acp.allowed_cwds '{value}'` "
         "(restart the gateway if it says a restart is required), then spawn again."
     )
@@ -495,8 +504,8 @@ async def send_to_acp_session(
     if origin.get("kind") != "acp":
         raise SafeToolError(f"Session '{session_key}' is not an ACP session")
     status = str(_field(session, "status") or "running")
-    if status == "killed":
-        raise SafeToolError(f"ACP session '{session_key}' was killed; spawn a new one")
+    # A stopped turn leaves the row "killed" (the task-status mapping) but the
+    # session open; only an operator close (origin.closed) ends it.
     if origin_is_closed(origin, session_status=status):
         raise SafeToolError(
             f"ACP session '{session_key}' is closed; spawn a new one (resume_session_id"
@@ -538,7 +547,7 @@ async def send_to_acp_session(
             await manager.cancel(session_key, reason="acp_steer")
 
     changes["origin"] = origin
-    if status in ("done", "failed", "timeout"):
+    if status in ("done", "failed", "timeout", "killed"):
         changes.update({"status": "running", "ended_at": None})
     await mgr.update(session_key, **changes)
 

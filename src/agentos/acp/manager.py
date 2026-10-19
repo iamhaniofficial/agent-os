@@ -27,14 +27,20 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import os
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
 
+from agentos.acp.labels import (
+    KIND_LABELS,
+    MAX_LABEL_CHARS,
+    TOOL_KINDS,
+    harness_tool_name,
+    tool_label,
+)
 from agentos.acp.registry import get_harness, normalize_agent_id
 from agentos.acp.types import (
     AcpError,
@@ -66,24 +72,10 @@ _CLOSE_GRACE_S = 10.0
 _MAX_IDLE_STATES = 256
 
 #: Longest ``activity`` label (one line, ``$HOME`` shortened to ``~``).
-ACTIVITY_MAX_CHARS = 80
+ACTIVITY_MAX_CHARS = MAX_LABEL_CHARS
 #: ``activity_kind`` while the harness streams its answer.
 TEXT_ACTIVITY_KIND = "text"
 TEXT_ACTIVITY_LABEL = "Writing the answer"
-_TOOL_KINDS = frozenset(
-    {"read", "edit", "delete", "move", "search", "execute", "think", "fetch", "other"}
-)
-_KIND_LABELS: dict[str, str] = {
-    "read": "Reading files",
-    "edit": "Editing files",
-    "delete": "Deleting files",
-    "move": "Moving files",
-    "search": "Searching",
-    "execute": "Running a command",
-    "think": "Thinking",
-    "fetch": "Fetching",
-    "other": "Working",
-}
 
 
 class AcpUnavailableError(AcpError):
@@ -120,8 +112,10 @@ class _SessionState:
     in_use: int = 0
     activity: str | None = None
     activity_kind: str | None = None
-    #: This turn's harness tool calls: id -> (title, kind).
-    turn_tools: dict[str, tuple[str | None, str | None]] = field(default_factory=dict)
+    #: This turn's harness tool calls: id -> (title, kind, raw_input, tool name).
+    turn_tools: dict[str, tuple[str | None, str | None, dict[str, Any] | None, str | None]] = field(
+        default_factory=dict
+    )
 
 
 def _cfg(config: Any, name: str, default: Any) -> Any:
@@ -153,33 +147,9 @@ def origin_is_closed(origin: Mapping[str, Any] | None, *, session_status: Any = 
     return str(getattr(session_status, "value", session_status) or "") == "killed"
 
 
-def _shorten_home(text: str) -> str:
-    home = os.path.expanduser("~")
-    if not home or home in ("/", "~"):
-        return text
-    home = home.rstrip("/\\")
-    text = text.replace(home + "/", "~/").replace(home + "\\", "~\\")
-    if text == home or text.endswith(" " + home):
-        text = text[: -len(home)] + "~"
-    return text
-
-
-def activity_label(title: str | None, kind: str | None) -> str:
-    """A short single-line label for one harness step ("Read ~/app/x.py").
-
-    Claude Code titles a shell call with the bare command in backticks; that
-    becomes "Run <command>". Without a title the tool kind names the step.
-    """
-    text = " ".join(str(title or "").split())
-    bare_command = len(text) > 2 and text.startswith("`") and text.endswith("`")
-    text = _shorten_home(text.replace("`", "").strip())
-    if not text:
-        text = _KIND_LABELS.get(kind or "other", _KIND_LABELS["other"])
-    elif kind == "execute" and bare_command:
-        text = f"Run {text}"
-    if len(text) > ACTIVITY_MAX_CHARS:
-        text = text[: ACTIVITY_MAX_CHARS - 1].rstrip() + "…"
-    return text
+def starting_label(agent_id: str | None) -> str:
+    """``activity`` while the harness process starts ("Starting Claude Code…")."""
+    return f"Starting {agent_display_name(agent_id) or 'the harness'}…"
 
 
 def resume_notice(agent_id: str | None) -> str:
@@ -252,6 +222,8 @@ class AcpSessionManager:
         self._live = 0
         self._slot_cond: asyncio.Condition | None = None
         self._shutting_down = False
+        #: session key -> [lock, holders]: serializes writes to one session row.
+        self._row_locks: dict[str, list[Any]] = {}
         #: Set by the gateway wiring; ``None`` when the bridges are not built.
         self.permission_bridge: Any = None
         self.elicitation_bridge: Any = None
@@ -393,21 +365,47 @@ class AcpSessionManager:
             log.debug("acp.manager.session_lookup_failed", session_key=session_key, exc_info=True)
             return None
 
+    @contextlib.asynccontextmanager
+    async def row_guard(self, session_key: str) -> AsyncIterator[None]:
+        """Hold while reading and rewriting this session's row.
+
+        ``SessionManager.update`` / ``append_message`` rewrite the whole row,
+        so two writers that interleave lose one write: a turn's bookkeeping
+        racing ``close`` dropped ``closed``. Every ACP writer of the row (this
+        manager's origin updates, the dispatcher's end-of-turn writes) goes
+        through this guard. Not reentrant.
+        """
+        entry = self._row_locks.get(session_key)
+        if entry is None:
+            entry = [asyncio.Lock(), 0]
+            self._row_locks[session_key] = entry
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0 and self._row_locks.get(session_key) is entry:
+                del self._row_locks[session_key]
+
     async def update_origin(self, session_key: str, **changes: Any) -> dict[str, Any] | None:
         """Merge ``changes`` into the session row ``origin`` (best effort)."""
         sm = self._session_manager
         if sm is None:
             return None
-        row = await self._get_session_row(session_key)
-        if row is None:
-            return None
-        origin = dict(getattr(row, "origin", None) or {})
-        origin.update(changes)
-        try:
-            await sm.update(session_key, origin=origin)
-        except Exception:  # noqa: BLE001 - never fail a turn on bookkeeping
-            log.warning("acp.manager.origin_update_failed", session_key=session_key, exc_info=True)
-            return None
+        async with self.row_guard(session_key):
+            row = await self._get_session_row(session_key)
+            if row is None:
+                return None
+            origin = dict(getattr(row, "origin", None) or {})
+            origin.update(changes)
+            try:
+                await sm.update(session_key, origin=origin)
+            except Exception:  # noqa: BLE001 - never fail a turn on bookkeeping
+                log.warning(
+                    "acp.manager.origin_update_failed", session_key=session_key, exc_info=True
+                )
+                return None
         return origin
 
     async def _spec_from_row(self, session_key: str) -> AcpSessionSpec:
@@ -532,6 +530,23 @@ class AcpSessionManager:
             if self._states.get(state.session_key) is state:
                 del self._states[state.session_key]
 
+    def prepare_turn(self, session_key: str, agent_id: str | None = None) -> None:
+        """A turn for this session was admitted: drop the previous turn's step
+        at once, so ``status`` never shows it while the new turn gets going.
+
+        Synchronous on purpose (the dispatcher calls it before its first
+        await). A turn that is still running keeps its activity.
+        """
+        state = self._state_for(session_key)
+        if state.active_turn is not None or state.lock.locked():
+            return
+        self._reset_activity(state)
+        state.idle = False
+        if state.handle is None:
+            state.activity = starting_label(
+                agent_id or (state.spec.agent_id if state.spec is not None else None)
+            )
+
     @staticmethod
     def _reset_activity(state: _SessionState) -> None:
         state.activity = None
@@ -544,19 +559,24 @@ class AcpSessionManager:
         kind = event.kind
         if kind in ("tool_call", "tool_call_update"):
             tool_id = event.tool_call_id or f"acp-tool-{len(state.turn_tools) + 1}"
-            title, tool_kind = state.turn_tools.get(tool_id, (None, None))
+            title, tool_kind, raw_input, tool_name = state.turn_tools.get(
+                tool_id, (None, None, None, None)
+            )
             title = event.title or title
             tool_kind = event.tool_kind or tool_kind
-            state.turn_tools[tool_id] = (title, tool_kind)
-            if event.title or event.tool_kind or kind == "tool_call":
-                normalized = tool_kind if tool_kind in _TOOL_KINDS else "other"
-                state.activity = activity_label(title, normalized)
+            if isinstance(event.raw_input, dict) and event.raw_input:
+                raw_input = dict(event.raw_input)
+            tool_name = tool_name or harness_tool_name(event.raw) or None
+            state.turn_tools[tool_id] = (title, tool_kind, raw_input, tool_name)
+            if event.title or event.tool_kind or event.raw_input or kind == "tool_call":
+                normalized = tool_kind if tool_kind in TOOL_KINDS else "other"
+                state.activity = tool_label(title, normalized, raw_input, tool_name=tool_name)
                 state.activity_kind = normalized
         elif kind == "text_delta" and event.text:
             state.activity = TEXT_ACTIVITY_LABEL
             state.activity_kind = TEXT_ACTIVITY_KIND
         elif kind == "thought_delta" and event.text:
-            state.activity = _KIND_LABELS["think"]
+            state.activity = KIND_LABELS["think"]
             state.activity_kind = "think"
 
     async def _notify_slot_waiters(self) -> None:
@@ -597,7 +617,7 @@ class AcpSessionManager:
             state.turn_started_at = time.monotonic()
             state.last_used = state.turn_started_at
             if state.handle is None:
-                state.activity = f"Starting {agent_display_name(spec.agent_id)}"
+                state.activity = starting_label(spec.agent_id)
             try:
                 handle, resume_lost = await self._ensure_handle(state, spec)
             except BaseException:

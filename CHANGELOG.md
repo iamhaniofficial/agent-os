@@ -34,9 +34,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The `sub-agent` skill and the spawn `cwd` refusal agree with the cwd
   policy: the workspace is for read-only work, writes need an
   `[acp] allowed_cwds` project or a worktree, and a refusal
-  (`ACP_CWD_NOT_ALLOWED`) names the exact `agentos config set` command.
+  (`ACP_CWD_NOT_ALLOWED`) first asks the agent to check its guess (folders
+  named in a task usually live in the workspace), then names the exact
+  `agentos config set` command.
+- Tool rows in an ACP child transcript are named with a short label built
+  from the tool call ("Run git status", "Read ~/app/x.py", "Looking up
+  tools"); the ACP kind moves to `input.acp_kind`. `acp.status` activity
+  uses the same labels.
+- An ACP completion's `result.text` is the harness's final answer (the text
+  after its last tool call); narration split by tool calls is kept as
+  separate paragraphs in the child transcript.
 
 ### Fixed
+- A resumed ACP turn was charged the whole session's cost: Claude Code's
+  reading is cumulative per ACP session and can carry over a resume, so the
+  cost baseline is now keyed by ACP session id instead of process.
+- A stopped ACP turn left nothing in the child transcript: its tool calls
+  and text are kept with a "Cancelled after N tool calls (m:ss)." row, and
+  its duration, tool calls and cost reach `last_turn` and the completion.
+  A stopped child still takes follow-ups.
 - A turn sent into a closed ACP session (or refused for any other reason
   before the harness ran) was invisible in the desktop: the error event was
   wiped by the history resync that follows it. Refusals and failed harness

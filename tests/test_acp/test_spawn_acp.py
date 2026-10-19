@@ -287,7 +287,9 @@ async def test_cwd_refusal_names_the_exact_config_command(tmp_path, monkeypatch)
     assert message.startswith("ACP_CWD_NOT_ALLOWED:")
     # config set replaces the list, so the suggestion keeps what is allowed.
     assert 'agentos config set acp.allowed_cwds \'["~/Code/other", "~/Code/my-app"]\'' in message
-    assert "Do not pick another directory" in message
+    # Check the guess first: names in a task usually live in the workspace.
+    assert "First check that this is the right directory" in message
+    assert "agent workspace (" in message and "Only if the task really targets" in message
 
 
 async def test_finished_oneshot_child_lists_as_idle_and_can_be_killed(tmp_path) -> None:
@@ -312,5 +314,5 @@ async def test_finished_oneshot_child_lists_as_idle_and_can_be_killed(tmp_path) 
         assert killed["status"] == "killed"
         row = await rig.sessions.get_session(key)
         assert row.origin["closed"] is True and row.origin["closed_reason"] == "agent_tool_kill"
-        with pytest.raises(Exception, match="killed"):
+        with pytest.raises(Exception, match="is closed"):
             await sessions_tool.sessions_send(key, "more")
