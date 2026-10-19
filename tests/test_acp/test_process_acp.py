@@ -93,7 +93,8 @@ def test_lease_roundtrip(tmp_path: Path) -> None:
     )
     path = proc_mod.write_lease(tmp_path, lease)
     assert path == tmp_path / "leases" / "abc.json"
-    assert oct(path.stat().st_mode & 0o777) == oct(0o600)
+    if os.name != "nt":  # Windows has no POSIX modes to check
+        assert oct(path.stat().st_mode & 0o777) == oct(0o600)
     got = proc_mod.read_lease(tmp_path, "abc")
     assert got is not None and got.to_dict() == lease.to_dict()
     assert [x.lease_id for x in proc_mod.list_leases(tmp_path)] == ["abc"]
@@ -374,7 +375,8 @@ def test_prepare_codex_home_inherits_only_safe_keys_and_trusts_cwd(tmp_path: Pat
     assert home == state / "codex-home"
     auth = home / "auth.json"
     assert auth.read_text() == '{"token": "t"}'
-    assert oct(auth.stat().st_mode & 0o777) == oct(0o600)
+    if os.name != "nt":  # Windows has no POSIX modes to check
+        assert oct(auth.stat().st_mode & 0o777) == oct(0o600)
     cfg = tomllib.loads((home / "config.toml").read_text())
     assert cfg["model"] == "gpt-5-codex"
     assert cfg["model_provider"] == "corp"
@@ -384,8 +386,9 @@ def test_prepare_codex_home_inherits_only_safe_keys_and_trusts_cwd(tmp_path: Pat
     assert cfg["model_providers"] == {"corp": {"name": "Corp", "base_url": "https://llm.corp/v1"}}
     projects = cfg["projects"]
     assert projects[str(tmp_path / "repo")] == {"trust_level": "trusted"}
-    assert projects["/already/trusted"] == {"trust_level": "trusted"}
-    assert "/untrusted" not in projects
+    # Trusted paths are normalized with abspath, which adds a drive on Windows.
+    assert projects[os.path.abspath("/already/trusted")] == {"trust_level": "trusted"}
+    assert os.path.abspath("/untrusted") not in projects
 
     # a second session in another cwd keeps the first one trusted
     proc_mod.prepare_codex_home(state, str(tmp_path / "repo2"), user_codex_home=user)
@@ -397,7 +400,7 @@ def test_prepare_codex_home_without_user_config(tmp_path: Path) -> None:
     home = proc_mod.prepare_codex_home(tmp_path / "s", "/w", user_codex_home=tmp_path / "missing")
     assert not (home / "auth.json").exists()
     cfg = tomllib.loads((home / "config.toml").read_text())
-    assert cfg == {"projects": {"/w": {"trust_level": "trusted"}}}
+    assert cfg == {"projects": {os.path.abspath("/w"): {"trust_level": "trusted"}}}
 
 
 def test_prepare_codex_home_rejects_invalid_toml(tmp_path: Path) -> None:

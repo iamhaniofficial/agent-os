@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+from acp_runtime_helpers import wait_until
 from acp_s_fakes import FakeRuntime, Script
 from acp_s_harness import PARENT_KEY, acp_rig
 
@@ -106,11 +107,7 @@ async def test_parent_wake_message_carries_stats_line(tmp_path) -> None:
         # Close the spawn group like sessions_yield does, then let the child finish.
         await sessions_tool.sessions_yield()
         await rig.task_runtime.wait(out["task_id"], timeout=5)
-        for _ in range(20):
-            if sent:
-                break
-            await asyncio.sleep(0.01)
-        assert sent, "parent was not woken"
+        assert await wait_until(lambda: bool(sent)), "parent was not woken"
         assert "Stats: runtime" in sent[-1]
         assert "Fixed the bug." in sent[-1]
 

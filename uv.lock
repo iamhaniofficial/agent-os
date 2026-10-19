@@ -4227,7 +4227,7 @@ pilot-train = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agent-client-protocol", specifier = ">=0.12.1,<1.0" },
+    { name = "agent-client-protocol", specifier = ">=0.12.1,<0.13" },
     { name = "aiosqlite", specifier = ">=0.20,<0.23" },
     { name = "anyio", specifier = ">=4.0,<5.0" },
     { name = "apscheduler", specifier = ">=3.10,<4.0" },

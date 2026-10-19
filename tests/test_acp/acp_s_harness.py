@@ -73,8 +73,17 @@ async def acp_rig(tmp: Path, runtime: FakeRuntime | None = None, **acp: Any):
         _make_task_session_lifecycle_listener,
         dispatch_task_runtime_turn,
     )
-    from agentos.gateway.subagent_announce import announce_subagent_completion
+    from agentos.gateway.subagent_announce import (
+        _tracker,
+        announce_subagent_completion,
+        set_background_completion_manager,
+    )
     from agentos.gateway.task_runtime import TaskRuntime
+
+    # Spawn-group close/wake state and the completion manager are module
+    # globals: start clean so an earlier test's group cannot swallow a wake.
+    _tracker.evict(PARENT_KEY)
+    set_background_completion_manager(None)
 
     rig = Rig(tmp, runtime or FakeRuntime(), **acp)
     store = SessionStorage(":memory:")
@@ -127,6 +136,7 @@ async def acp_rig(tmp: Path, runtime: FakeRuntime | None = None, **acp: Any):
             pass
         await rig.manager.shutdown()
         set_acp_manager(None)
+        _tracker.evict(PARENT_KEY)
         sessions_tool.set_session_manager(None)
         sessions_tool.set_task_runtime(None)
         sessions_tool.set_gateway_config(None)

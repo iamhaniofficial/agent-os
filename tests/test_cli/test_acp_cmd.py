@@ -54,7 +54,8 @@ def config_file(tmp_path: Path) -> Path:
     path = tmp_path / "agentos.toml"
     path.write_text(
         "[acp]\n"
-        f'state_dir = "{state}"\n'
+        # as_posix: a Windows path's backslashes are escapes in a TOML string.
+        f'state_dir = "{state.as_posix()}"\n'
         'allowed_agents = ["claude", "codex", "mine"]\n'
         "[acp.agents.mine]\n"
         'command = "my-agent"\n'
