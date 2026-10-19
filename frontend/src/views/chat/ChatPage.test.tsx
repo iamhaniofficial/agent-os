@@ -271,6 +271,82 @@ describe('ChatPage', () => {
   // none of the session-switch teardown fires — without an explicit clear the
   // reset conversation stays on screen. The epoch bump is the only reset signal
   // the client gets.
+  // ACP follow-up into a closed harness session (defect 1): the gateway refused
+  // the turn before writing anything, so the error event was the only sign —
+  // and the history resync it triggers used to sweep that row away again.
+  it('keeps a turn error that arrives before any delta through the history resync', async () => {
+    mockRpc = makeRpc()
+    let historyReads = 0
+    let persisted = false
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'commands.list_for_surface') {
+        return Promise.resolve({ surface: 'web_chat', commands: SLASH_CATALOG })
+      }
+      if (args[0] === 'chat.history') {
+        historyReads += 1
+        if (historyReads === 1) return Promise.resolve({ messages: [], history_scope: 'complete' })
+        const messages: Array<Record<string, unknown>> = [
+          { role: 'user', text: 'one more question', timestamp: 100 },
+        ]
+        if (persisted) {
+          messages.push({ role: 'system', text: 'Error: the session was closed', timestamp: 200 })
+        }
+        return Promise.resolve({ messages, history_scope: 'complete' })
+      }
+      return Promise.resolve({})
+    })
+    renderPage()
+    const thread = document.querySelector('.chat-thread') as HTMLElement
+    await waitFor(() => expect(thread.querySelector('.chat-empty')).not.toBeNull())
+
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'one more question' } })
+    fireEvent.click(screen.getByRole('button', { name: /send/i }))
+    await waitFor(() =>
+      expect(mockRpc.call.mock.calls.some((call) => call[0] === 'chat.send')).toBe(true),
+    )
+    const readsBefore = historyReads
+
+    // No delta, no thinking text: the error is the first frame of the turn.
+    act(() => {
+      mockRpc.emit(
+        'session.event.error',
+        {
+          code: 'ACP_SESSION_CLOSED',
+          message: 'The coding agent session was closed.',
+          terminal_message: 'The coding agent session was closed.',
+        },
+        {},
+      )
+    })
+    expect(thread.querySelector('.msg.error')).toHaveTextContent(
+      'The coding agent session was closed.',
+    )
+
+    // The resync lands with only the user's row persisted: the error stays,
+    // after it.
+    await waitFor(() => expect(historyReads).toBeGreaterThan(readsBefore))
+    await waitFor(() =>
+      expect(thread.querySelector('.msg.user')).toHaveAttribute('data-history-role', 'user'),
+    )
+    const rows = Array.from(thread.querySelectorAll('.msg')).map((row) => row.className)
+    expect(rows).toEqual(['msg user', 'msg error'])
+
+    // Once the gateway persists its own row, that row takes over.
+    persisted = true
+    const readsAfter = historyReads
+    act(() => {
+      mockRpc.emit('sessions.changed', {
+        key: 'agent:main:webchat:default',
+        reason: 'task_terminal',
+        run_status: 'failed',
+      })
+    })
+    await waitFor(() => expect(historyReads).toBeGreaterThan(readsAfter))
+    await waitFor(() => expect(thread.querySelector('.msg.error')).toBeNull())
+    expect(thread.querySelector('.msg.system .msg-body')).toHaveAttribute('data-tone', 'error')
+    expect(thread.querySelector('.msg.system')).toHaveTextContent('Error: the session was closed')
+  })
+
   it('clears the thread when a reset bumps the session epoch', async () => {
     mockRpc = makeRpc()
     let historyReads = 0

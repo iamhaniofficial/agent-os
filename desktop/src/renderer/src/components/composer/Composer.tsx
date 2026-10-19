@@ -70,6 +70,11 @@ export interface ComposerProps {
    */
   suggestion?: string | null
   onFocusChange?: (focused: boolean) => void
+  /**
+   * The chat takes no messages (a coding harness's session that was ended):
+   * the composer stays in place, switched off, and says why in one line.
+   */
+  disabledReason?: string | null
 }
 
 const MIN_TEXTAREA_HEIGHT = 26
@@ -104,7 +109,9 @@ export function Composer({
   placeholder,
   suggestion = null,
   onFocusChange,
+  disabledReason = null,
 }: ComposerProps) {
+  const disabled = Boolean(disabledReason)
   const [value, setValue] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -233,6 +240,7 @@ export function Composer({
   )
 
   const doSend = useCallback(() => {
+    if (disabled) return
     const text = value.trim()
     if (hasPendingWork) {
       toast.warning('Wait for file attachment processing to finish')
@@ -243,7 +251,7 @@ export function Composer({
     setProgrammatic('')
     historyIdxRef.current = null
     historyDraftRef.current = ''
-  }, [value, hasPendingAttachments, hasPendingWork, onSend, setProgrammatic])
+  }, [disabled, value, hasPendingAttachments, hasPendingWork, onSend, setProgrammatic])
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -352,7 +360,7 @@ export function Composer({
     [autoResize, onValueChange],
   )
 
-  const showSuggestion = Boolean(suggestion) && !value
+  const showSuggestion = Boolean(suggestion) && !value && !disabled
 
   const { disabled: sendDisabled, label: sendLabel } = sendButtonState(
     value,
@@ -370,6 +378,7 @@ export function Composer({
       <form
         className="composer"
         data-busy={busy}
+        data-disabled={disabled || undefined}
         onSubmit={(e) => {
           e.preventDefault()
           doSend()
@@ -457,7 +466,13 @@ export function Composer({
           onKeyDown={onKeyDown}
           onFocus={() => onFocusChange?.(true)}
           onBlur={() => onFocusChange?.(false)}
-          placeholder={(showSuggestion && suggestion) || (placeholder ?? t('composer.placeholder'))}
+          disabled={disabled}
+          title={disabledReason ?? undefined}
+          placeholder={
+            disabledReason ||
+            (showSuggestion && suggestion) ||
+            (placeholder ?? t('composer.placeholder'))
+          }
           aria-label={t('composer.placeholder')}
           aria-keyshortcuts={showSuggestion ? 'Tab' : undefined}
           aria-autocomplete={slashListboxId ? 'list' : undefined}
@@ -491,7 +506,7 @@ export function Composer({
           <button
             type="submit"
             className="composer-send"
-            disabled={sendDisabled}
+            disabled={sendDisabled || disabled}
             aria-label={t('composer.send')}
             title={sendLabel}
           >

@@ -21,6 +21,7 @@ import { t } from '@/i18n'
 import '@/i18n/en/chat'
 
 import type { StreamEventPayload } from '../types'
+import { parseAcpSpawn, type AcpSpawnSpec } from './acp'
 import { buildAskCardDOM, parseAskQuestions } from './ask'
 import { buildPlanCardDOM, parsePlanFromToolResult } from './plan'
 
@@ -425,8 +426,23 @@ export interface ToolRendererDeps {
    * approval did not go out yet. Absent → the card renders read-only.
    */
   approvePlan?: () => boolean
+  /**
+   * sessions_spawn(runtime="acp") → the harness run card (transcript/acp.ts)
+   * that replaces the generic tool row. `live`: the result just arrived on
+   * the stream; otherwise it is a history reconstruction. Absent, or null
+   * returned → the generic row stays.
+   */
+  harnessCard?: (
+    spec: AcpSpawnSpec,
+    options: { live: boolean; toolId: string },
+  ) => HTMLElement | null
   /** chat.js `_chatDiag` — the diagnostics ring. Default: no-op. */
   diag?: (event: string, detail: Record<string, unknown>) => void
+}
+
+/** A harness run card stands where its tool row was, keyed by the same id. */
+function isHarnessCard(el: Element | null): boolean {
+  return Boolean(el && el.classList.contains('acp-run'))
 }
 
 /* ── Factory ────────────────────────────────────────────────────────────── */
@@ -570,6 +586,7 @@ export function createToolRenderer(deps: ToolRendererDeps) {
     const body = bubble && bubble.querySelector('.msg-body')
     const details = findToolDetailsById(body, toolId)
     if (!details) return null
+    if (isHarnessCard(details)) return details
     let toolName =
       (payload as { name?: string; tool_name?: string }).name ||
       (payload as { tool_name?: string }).tool_name ||
@@ -672,6 +689,34 @@ export function createToolRenderer(deps: ToolRendererDeps) {
     let resultTarget: Element | null = body // default: append to msg-body
     if (toolId) {
       const details = findToolDetailsById(body, toolId)
+      if (isHarnessCard(details)) {
+        // A replayed/duplicate result for a spawn already drawn as its card.
+        diag('tool_result.append.skip_harness_duplicate', { toolId })
+        if (deps.getAutoScroll()) deps.scrollToBottom()
+        return
+      }
+      const resolvedName = toolName || (details ? details.getAttribute('data-tool-name') || '' : '')
+      if (resolvedName === 'sessions_spawn' && !isError && deps.harnessCard) {
+        const spec = parseAcpSpawn(
+          (payload as { arguments?: unknown; input?: unknown }).arguments ||
+            (payload as { input?: unknown }).input ||
+            (details as unknown as { _agentosToolInput?: unknown } | null)?._agentosToolInput,
+          content,
+        )
+        const card = spec ? deps.harnessCard(spec, { live: true, toolId }) : null
+        if (card) {
+          if (details) {
+            details.replaceWith(card)
+          } else if (body) {
+            deps.flushPendingTextSegment()
+            body.appendChild(card)
+            deps.newTextSegment()
+          }
+          if (deps.getAutoScroll()) deps.scrollToBottom()
+          diag('tool_result.harness_card', { toolId, child: spec?.childKey || '' })
+          return
+        }
+      }
       if (details) {
         if (toolName) {
           retitleToolCallDOM(
@@ -812,6 +857,15 @@ export function createToolRenderer(deps: ToolRendererDeps) {
 
           if (toolId) {
             const details = findToolDetailsById(body, toolId)
+            if (isHarnessCard(details)) continue
+            if (details && resultToolName === 'sessions_spawn' && !isError && deps.harnessCard) {
+              const spec = parseAcpSpawn(seg.input || toolInputById[toolId], content)
+              const card = spec ? deps.harnessCard(spec, { live: false, toolId }) : null
+              if (card) {
+                details.replaceWith(card)
+                continue
+              }
+            }
             if (details) {
               retitleToolCallDOM(details, resultToolName, seg.input || '')
               const withInput = details as unknown as { _agentosToolInput?: unknown }

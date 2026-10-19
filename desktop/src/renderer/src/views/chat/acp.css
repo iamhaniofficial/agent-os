@@ -1,0 +1,971 @@
+/* Coding-harness (ACP) skin.
+
+   Three surfaces share one vocabulary here:
+   - the completion card a subagent leaves in its parent's transcript
+     (`.acp-done`, built by frontend transcript/acp.ts),
+   - the run card a sessions_spawn(runtime="acp") renders as (`.acp-run`,
+     same module), with its live status row,
+   - the session bar over a harness's own chat (`.acp-bar`, AcpSessionBar).
+   The transcript DOM is the console's; nothing of the console's stylesheet
+   is loaded. Each harness gets its tint from `data-acp-agent`: Claude warm
+   orange, Codex neutral, Gemini blue, the rest the palette's signal.
+
+   Motion: cards enter on a spring (fade, 6 px rise, 0.98 → 1); panels open
+   with `grid-template-rows: 0fr → 1fr`; the activity line crossfades and
+   slides; the running status carries a slow shimmer and a breathing dot;
+   the check / cross pops in when a run ends. Only transform and opacity
+   animate, and `prefers-reduced-motion` turns all of it off. */
+
+.chat-desktop {
+  /* Spring curves sampled from a damped spring (stiffness/damping): the
+     enter one overshoots ~4.6 %, the pop ~10 %. */
+  --acp-spring: linear(
+    0,
+    0.097,
+    0.284,
+    0.497,
+    0.689,
+    0.833,
+    0.938,
+    1.002,
+    1.034,
+    1.046,
+    1.045,
+    1.038,
+    1.028,
+    1.018,
+    1.011,
+    1.005,
+    1.001,
+    0.999,
+    0.998,
+    0.998,
+    0.999,
+    1
+  );
+  --acp-pop: linear(
+    0,
+    0.157,
+    0.451,
+    0.738,
+    0.946,
+    1.062,
+    1.103,
+    1.097,
+    1.069,
+    1.038,
+    1.012,
+    0.997,
+    0.99,
+    0.989,
+    0.992,
+    0.995,
+    0.998,
+    1
+  );
+  --acp-ease: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* ── Harness tint + badge ─────────────────────────────────────────────── */
+
+.acp-run,
+.acp-done,
+.acp-bar,
+.acp-badge {
+  --acp-tint: var(--primary);
+}
+[data-acp-agent='claude'] {
+  --acp-tint: #d97757;
+}
+[data-acp-agent='codex'] {
+  --acp-tint: var(--foreground);
+}
+[data-acp-agent='gemini'] {
+  --acp-tint: #3186ff;
+}
+:root[data-theme='light'] [data-acp-agent='claude'] {
+  --acp-tint: #c15f3c;
+}
+:root[data-theme='light'] [data-acp-agent='gemini'] {
+  --acp-tint: #1f6feb;
+}
+
+/* A rounded plate in the harness's tint; the brand mark replaces the
+   monogram for the harnesses we carry a mark for (Lobe Icons, MIT — see
+   assets/providers/LICENSE.txt). */
+.acp-badge {
+  position: relative;
+  display: inline-grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--acp-tint) 13%, var(--surface));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--acp-tint) 28%, transparent);
+  color: var(--acp-tint);
+}
+.acp-badge__mono {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.acp-badge[data-acp-agent='claude'] {
+  --acp-mark: url('data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20d%3D%22M13.827%203.52h3.603L24%2020h-3.603l-6.57-16.48zm-7.258%200h3.767L16.906%2020h-3.674l-1.343-3.461H5.017l-1.344%203.46H0L6.57%203.522zm4.132%209.959L8.453%207.687%206.205%2013.48H10.7z%22%2F%3E%3C%2Fsvg%3E');
+}
+.acp-badge[data-acp-agent='codex'] {
+  --acp-mark: url('data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill-rule%3D%22evenodd%22%20d%3D%22M9.205%208.658v-2.26c0-.19.072-.333.238-.428l4.543-2.616c.619-.357%201.356-.523%202.117-.523%202.854%200%204.662%202.212%204.662%204.566%200%20.167%200%20.357-.024.547l-4.71-2.759a.797.797%200%2000-.856%200l-5.97%203.473zm10.609%208.8V12.06c0-.333-.143-.57-.429-.737l-5.97-3.473%201.95-1.118a.433.433%200%2001.476%200l4.543%202.617c1.309.76%202.189%202.378%202.189%203.948%200%201.808-1.07%203.473-2.76%204.163zM7.802%2012.703l-1.95-1.142c-.167-.095-.239-.238-.239-.428V5.899c0-2.545%201.95-4.472%204.591-4.472%201%200%201.927.333%202.712.928L8.23%205.067c-.285.166-.428.404-.428.737v6.898zM12%2015.128l-2.795-1.57v-3.33L12%208.658l2.795%201.57v3.33L12%2015.128zm1.796%207.23c-1%200-1.927-.332-2.712-.927l4.686-2.712c.285-.166.428-.404.428-.737v-6.898l1.974%201.142c.167.095.238.238.238.428v5.233c0%202.545-1.974%204.472-4.614%204.472zm-5.637-5.303l-4.544-2.617c-1.308-.761-2.188-2.378-2.188-3.948A4.482%204.482%200%20014.21%206.327v5.423c0%20.333.143.571.428.738l5.947%203.449-1.95%201.118a.432.432%200%2001-.476%200zm-.262%203.9c-2.688%200-4.662-2.021-4.662-4.519%200-.19.024-.38.047-.57l4.686%202.71c.286.167.571.167.856%200l5.97-3.448v2.26c0%20.19-.07.333-.237.428l-4.543%202.616c-.619.357-1.356.523-2.117.523zm5.899%202.83a5.947%205.947%200%20005.827-4.756C22.287%2018.339%2024%2015.84%2024%2013.296c0-1.665-.713-3.282-1.998-4.448.119-.5.19-.999.19-1.498%200-3.401-2.759-5.947-5.946-5.947-.642%200-1.26.095-1.88.31A5.962%205.962%200%200010.205%200a5.947%205.947%200%2000-5.827%204.757C1.713%205.447%200%207.945%200%2010.49c0%201.666.713%203.283%201.998%204.448-.119.5-.19%201-.19%201.499%200%203.401%202.759%205.946%205.946%205.946.642%200%201.26-.095%201.88-.309a5.96%205.96%200%20004.162%201.713z%22%2F%3E%3C%2Fsvg%3E');
+}
+.acp-badge[data-acp-agent='gemini'] {
+  --acp-mark: url('data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20d%3D%22M20.616%2010.835a14.147%2014.147%200%2001-4.45-3.001%2014.111%2014.111%200%2001-3.678-6.452.503.503%200%2000-.975%200%2014.134%2014.134%200%2001-3.679%206.452%2014.155%2014.155%200%2001-4.45%203.001c-.65.28-1.318.505-2.002.678a.502.502%200%20000%20.975c.684.172%201.35.397%202.002.677a14.147%2014.147%200%20014.45%203.001%2014.112%2014.112%200%20013.679%206.453.502.502%200%2000.975%200c.172-.685.397-1.351.677-2.003a14.145%2014.145%200%20013.001-4.45%2014.113%2014.113%200%20016.453-3.678.503.503%200%20000-.975%2013.245%2013.245%200%2001-2.003-.678z%22%2F%3E%3C%2Fsvg%3E');
+}
+.acp-badge:is([data-acp-agent='claude'], [data-acp-agent='codex'], [data-acp-agent='gemini'])
+  .acp-badge__mono {
+  display: none;
+}
+.acp-badge:is(
+    [data-acp-agent='claude'],
+    [data-acp-agent='codex'],
+    [data-acp-agent='gemini']
+  )::before {
+  content: '';
+  width: 15px;
+  height: 15px;
+  background: currentColor;
+  -webkit-mask: var(--acp-mark) center / contain no-repeat;
+  mask: var(--acp-mark) center / contain no-repeat;
+}
+
+/* ── Chips, pill, buttons ─────────────────────────────────────────────── */
+
+.acp-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+.acp-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--muted-foreground);
+}
+.acp-chip[data-kind='cost'] {
+  color: var(--foreground);
+}
+.acp-chip[data-kind='harness-mode'] {
+  color: var(--acp-tint);
+  background: color-mix(in srgb, var(--acp-tint) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--acp-tint) 24%, transparent);
+}
+
+.acp-pill {
+  --acp-tone: var(--muted-foreground);
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px 0 6px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--acp-tone) 13%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--acp-tone);
+}
+.acp-pill[data-status='done'] {
+  --acp-tone: var(--ok);
+}
+.acp-pill[data-status='failed'] {
+  --acp-tone: var(--danger);
+}
+.acp-pill[data-status='cancelled'] {
+  --acp-tone: var(--warn);
+}
+.acp-pill__icon {
+  width: 10px;
+  height: 10px;
+  background: currentColor;
+  -webkit-mask: var(--acp-glyph, none) center / contain no-repeat;
+  mask: var(--acp-glyph, none) center / contain no-repeat;
+}
+.acp-pill[data-status='done'] .acp-pill__icon {
+  --acp-glyph: url('data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%223.2%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M20%206%209%2017l-5-5%22%2F%3E%3C%2Fsvg%3E');
+}
+.acp-pill[data-status='failed'] .acp-pill__icon {
+  --acp-glyph: url('data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%223.2%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M18%206%206%2018M6%206l12%2012%22%2F%3E%3C%2Fsvg%3E');
+}
+.acp-pill[data-status='cancelled'] .acp-pill__icon {
+  --acp-glyph: url('data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%223.2%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M6%2012h12%22%2F%3E%3C%2Fsvg%3E');
+}
+
+.msg-body .acp-btn,
+.acp-bar .acp-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--foreground) 4%, transparent);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+  font: inherit;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  font-weight: 550;
+  white-space: nowrap;
+  color: var(--foreground);
+  cursor: default;
+  transition:
+    background-color 140ms var(--acp-ease),
+    box-shadow 140ms var(--acp-ease),
+    color 140ms var(--acp-ease),
+    transform 140ms var(--acp-ease);
+}
+.msg-body .acp-btn:hover:not(:disabled),
+.acp-bar .acp-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--foreground) 9%, transparent);
+}
+.msg-body .acp-btn:active:not(:disabled),
+.acp-bar .acp-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+.msg-body .acp-btn:focus-visible,
+.acp-bar .acp-btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+.msg-body .acp-btn:disabled,
+.acp-bar .acp-btn:disabled {
+  color: var(--dim);
+  background: none;
+}
+.msg-body .acp-btn[hidden],
+.acp-bar .acp-btn[hidden] {
+  display: none;
+}
+.msg-body .acp-btn--quiet,
+.acp-bar .acp-btn--quiet {
+  background: none;
+  box-shadow: none;
+  color: var(--muted-foreground);
+}
+.msg-body .acp-btn--danger,
+.acp-bar .acp-btn--danger {
+  color: var(--danger);
+}
+.msg-body .acp-btn--danger:hover:not(:disabled),
+.acp-bar .acp-btn--danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 40%, transparent);
+}
+.acp-bar .acp-btn--solid-danger {
+  color: #fff;
+  background: var(--danger);
+  box-shadow: none;
+}
+.acp-bar .acp-btn--solid-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 86%, var(--foreground));
+}
+/* The call in flight breathes. */
+.msg-body .acp-btn[data-pending],
+.acp-bar .acp-btn[data-pending] {
+  animation: acp-breathe 1.2s ease-in-out infinite;
+}
+
+/* ── Cards: shared plate + enter ──────────────────────────────────────── */
+
+.acp-run,
+.acp-done {
+  position: relative;
+  display: grid;
+  gap: 10px;
+  max-width: 36rem;
+  min-width: 0;
+  margin: 6px 0;
+  padding: 12px 14px;
+  border-radius: var(--radius-surface);
+  background:
+    linear-gradient(140deg, color-mix(in srgb, var(--acp-tint) 7%, transparent), transparent 52%),
+    color-mix(in srgb, var(--elevated) 94%, transparent);
+  box-shadow:
+    inset 0 0 0 1px var(--hairline),
+    0 1px 2px color-mix(in srgb, #000 10%, transparent);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: normal;
+  color: var(--foreground);
+  isolation: isolate;
+}
+/* The settle glow lives on its own layer so it animates opacity only. */
+.acp-run::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--acp-settle, var(--ok)) 55%, transparent),
+    0 0 18px color-mix(in srgb, var(--acp-settle, var(--ok)) 22%, transparent);
+  opacity: 0;
+  pointer-events: none;
+}
+@keyframes acp-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.acp-run[data-enter='live'] {
+  transform-origin: 50% 100%;
+  animation: acp-card-in 640ms var(--acp-spring) both;
+}
+/* A completion arrives as its own row: it takes the spring instead of the
+   plain row rise (chat.css), under the same bulk-insert gate. */
+.chat-thread[data-history-ready='true'] > .msg.subagent:not([data-enter='none']) {
+  transform-origin: 0 100%;
+  animation: acp-card-in 640ms var(--acp-spring) both;
+}
+
+.acp-run__head,
+.acp-done__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.acp-run__titles,
+.acp-done__titles {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 1px;
+  min-width: 0;
+}
+.acp-run__name,
+.acp-done__title {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 620;
+  letter-spacing: -0.005em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acp-run__cwd,
+.acp-done__sub {
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+}
+.acp-run__modes {
+  flex-shrink: 0;
+  flex-wrap: nowrap;
+}
+.acp-run__task {
+  margin: 0;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted-foreground);
+}
+
+/* ── Run card: the live status row ────────────────────────────────────── */
+
+.acp-run__status {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  overflow: hidden;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--foreground) 4%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hairline) 70%, transparent);
+}
+/* While the harness works a band of light sweeps the row, slowly. */
+.acp-run__status::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 25%,
+    color-mix(in srgb, var(--acp-tint) 14%, transparent) 50%,
+    transparent 75%
+  );
+  opacity: 0;
+  transform: translateX(-100%);
+  pointer-events: none;
+}
+.acp-run[data-state='running'] .acp-run__status::before {
+  opacity: 1;
+  animation: acp-shimmer 2.4s var(--acp-ease) infinite;
+}
+@keyframes acp-shimmer {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
+.acp-run__indicator {
+  position: relative;
+  display: inline-grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+}
+/* The dot (running, checking) or the glyph plate (settled). */
+.acp-run__indicator::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--dim);
+}
+.acp-run[data-state='running'] .acp-run__indicator::before {
+  background: var(--acp-tint);
+  animation: acp-breathe 1.8s ease-in-out infinite;
+}
+/* A soft ring leaves the live dot and fades. */
+.acp-run[data-state='running'] .acp-run__indicator::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--acp-tint);
+  animation: acp-ring 1.8s cubic-bezier(0.2, 0.6, 0.3, 1) infinite;
+}
+@keyframes acp-ring {
+  from {
+    opacity: 0.5;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(2.6);
+  }
+}
+@keyframes acp-breathe {
+  50% {
+    opacity: 0.55;
+  }
+}
+.acp-run:is([data-state='done'], [data-state='failed'], [data-state='cancelled'])
+  .acp-run__indicator::before {
+  width: 16px;
+  height: 16px;
+  background: color-mix(in srgb, var(--acp-settle) 18%, transparent);
+}
+.acp-run:is([data-state='done'], [data-state='failed'], [data-state='cancelled'])
+  .acp-run__indicator::after {
+  content: '';
+  position: absolute;
+  inset: 3px;
+  background: var(--acp-settle);
+  -webkit-mask: var(--acp-glyph) center / contain no-repeat;
+  mask: var(--acp-glyph) center / contain no-repeat;
+}
+.acp-run[data-state='done'] {
+  --acp-settle: var(--ok);
+  --acp-glyph: url('data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%223.2%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M20%206%209%2017l-5-5%22%2F%3E%3C%2Fsvg%3E');
+}
+.acp-run[data-state='failed'] {
+  --acp-settle: var(--danger);
+  --acp-glyph: url('data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%223.2%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M18%206%206%2018M6%206l12%2012%22%2F%3E%3C%2Fsvg%3E');
+}
+.acp-run[data-state='cancelled'] {
+  --acp-settle: var(--warn);
+  --acp-glyph: url('data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%223.2%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M6%2012h12%22%2F%3E%3C%2Fsvg%3E');
+}
+/* The run just ended in front of you: the glyph pops, the ring glows once. */
+@keyframes acp-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes acp-glow {
+  0% {
+    opacity: 0;
+  }
+  30% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+.acp-run[data-settled='true'] .acp-run__indicator::before,
+.acp-run[data-settled='true'] .acp-run__indicator::after {
+  animation: acp-pop 640ms var(--acp-pop) both;
+}
+.acp-run[data-settled='true']::after {
+  animation: acp-glow 1100ms ease-out both;
+}
+
+/* The activity line: every new step slides up into place over the old. */
+.acp-run__activity {
+  position: relative;
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--foreground);
+}
+.acp-run:not([data-state='running']) .acp-run__activity {
+  color: var(--muted-foreground);
+}
+.acp-run[data-state='failed'] .acp-run__activity {
+  color: var(--danger);
+}
+.acp-run__activity-text {
+  grid-area: 1 / 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acp-run__activity-text[data-entering] {
+  animation: acp-line-in 320ms var(--acp-ease) both;
+}
+.acp-run__activity-text[data-leaving] {
+  animation: acp-line-out 260ms var(--acp-ease) both;
+}
+@keyframes acp-line-in {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes acp-line-out {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-7px);
+  }
+}
+.acp-run__status[data-activity-kind='text'] .acp-run__activity {
+  color: var(--acp-tint);
+}
+
+.acp-run__meta {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--dim);
+}
+.acp-run__meta > [hidden] {
+  display: none;
+}
+.acp-run__elapsed {
+  min-width: 3.4ch;
+  text-align: right;
+  color: var(--muted-foreground);
+}
+
+.acp-run__note {
+  margin: -2px 0 0;
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+.acp-run__note[hidden] {
+  display: none;
+}
+.acp-run__note[data-tone='error'] {
+  color: var(--danger);
+}
+.acp-run__actions,
+.acp-done__foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+/* Details sits at the far end, the quiet one. */
+.acp-done__foot > [data-action='toggle-details'] {
+  margin-left: auto;
+}
+
+/* ── Completion card ──────────────────────────────────────────────────── */
+
+.acp-done[data-outcome='failed'] {
+  --acp-tint: var(--danger);
+}
+.acp-done__error {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 24%, transparent);
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  color: var(--foreground);
+}
+.acp-done__note {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+
+/* The reply, clamped to ~4 lines with a fade until "Show more". The grid
+   row runs 0fr → 1fr; the clip's min-height is the clamped height. */
+.acp-done__result {
+  position: relative;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.acp-done__result[data-clamp='true'] {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 420ms var(--acp-ease);
+}
+.acp-done__result[data-clamp='true'][data-expanded='true'] {
+  grid-template-rows: 1fr;
+}
+.acp-done__result[data-clamp='true'] > .acp-done__result-clip {
+  min-height: 6.2em;
+  overflow: hidden;
+}
+.acp-done__result[data-clamp='true']::after {
+  content: '';
+  position: absolute;
+  inset: auto 0 0;
+  height: 2.6em;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    color-mix(in srgb, var(--elevated) 94%, transparent)
+  );
+  pointer-events: none;
+  transition: opacity 260ms var(--acp-ease);
+}
+.acp-done__result[data-clamp='true'][data-expanded='true']::after {
+  opacity: 0;
+}
+.acp-done__result-text > :first-child {
+  margin-top: 0;
+}
+.acp-done__result-text > :last-child {
+  margin-bottom: 0;
+}
+
+/* Raw payload, for debugging: closed by default, opens on the same grid. */
+.acp-details {
+  display: grid;
+  grid-template-rows: 0fr;
+  margin-top: -4px;
+  transition: grid-template-rows 360ms var(--acp-ease);
+}
+.acp-details[data-open='true'] {
+  grid-template-rows: 1fr;
+}
+.acp-details__clip {
+  min-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 220ms var(--acp-ease);
+}
+.acp-details[data-open='true'] > .acp-details__clip {
+  opacity: 1;
+}
+.acp-details__json {
+  max-height: 18rem;
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border-radius: var(--radius);
+  background: var(--background);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  color: var(--muted-foreground);
+  user-select: text;
+}
+
+/* The subagent row carries the card, not a bubble. */
+.msg.subagent {
+  max-width: min(78%, 38rem);
+}
+
+/* A failed turn persisted as a `system` row ("Error: …"). */
+.msg.system .msg-body[data-tone='error'] {
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--danger) 30%, transparent);
+  color: var(--foreground);
+}
+
+/* ── Session bar (AcpSessionBar) ──────────────────────────────────────── */
+
+.acp-bar {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
+  width: var(--chat-col);
+  min-height: 48px;
+  margin: 6px auto 4px;
+  padding: 8px 10px 8px 10px;
+  border-radius: var(--radius-surface);
+  background:
+    linear-gradient(100deg, color-mix(in srgb, var(--acp-tint) 8%, transparent), transparent 46%),
+    color-mix(in srgb, var(--elevated) 88%, transparent);
+  box-shadow:
+    inset 0 0 0 1px var(--hairline),
+    0 6px 18px -10px color-mix(in srgb, #000 40%, transparent);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  backdrop-filter: blur(14px) saturate(1.2);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  overflow: hidden;
+  isolation: isolate;
+}
+/* Settings > Appearance > Reduce transparency: the bar goes opaque. */
+html[data-transparency='reduced'] .acp-bar {
+  background: var(--elevated);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.acp-bar[data-enter='true'] {
+  animation: acp-card-in 640ms var(--acp-spring) both;
+}
+/* While a turn runs the same light sweeps the whole bar, slower. */
+.acp-bar::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(
+    100deg,
+    transparent 30%,
+    color-mix(in srgb, var(--acp-tint) 10%, transparent) 50%,
+    transparent 70%
+  );
+  opacity: 0;
+  transform: translateX(-100%);
+  pointer-events: none;
+}
+.acp-bar[data-state='working']::before {
+  opacity: 1;
+  animation: acp-shimmer 3.2s var(--acp-ease) infinite;
+}
+.acp-bar__badge .prov-logo {
+  border-radius: 8px;
+  color: var(--acp-tint);
+  background: color-mix(in srgb, var(--acp-tint) 13%, var(--surface));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--acp-tint) 28%, transparent);
+}
+.acp-bar__badge[data-acp-agent='gemini'] .prov-logo {
+  /* Gemini's mark keeps its own colours. */
+  color: inherit;
+}
+.acp-bar__id {
+  display: grid;
+  flex: 0 1 auto;
+  gap: 1px;
+  min-width: 0;
+  max-width: 16rem;
+}
+.acp-bar__name {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.acp-bar__cwd {
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+}
+.acp-bar__chips {
+  flex: 0 1 auto;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+.acp-bar__status {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding-left: 12px;
+  border-left: 1px solid var(--hairline);
+}
+.acp-bar__dot {
+  position: relative;
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--dim);
+}
+.acp-bar[data-state='working'] .acp-bar__dot {
+  background: var(--acp-tint);
+  animation: acp-breathe 1.8s ease-in-out infinite;
+}
+.acp-bar[data-state='working'] .acp-bar__dot::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--acp-tint);
+  animation: acp-ring 1.8s cubic-bezier(0.2, 0.6, 0.3, 1) infinite;
+}
+.acp-bar[data-state='idle'] .acp-bar__dot {
+  background: var(--ok);
+}
+.acp-bar__state {
+  flex-shrink: 0;
+  font-weight: 600;
+}
+.acp-bar[data-state='working'] .acp-bar__state {
+  color: var(--acp-tint);
+}
+.acp-bar[data-state='closed'] .acp-bar__state {
+  color: var(--muted-foreground);
+}
+.acp-bar__detail {
+  position: relative;
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--muted-foreground);
+}
+.acp-bar__detail > span {
+  grid-area: 1 / 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  animation: acp-line-in 320ms var(--acp-ease) both;
+}
+.acp-bar__detail[data-tone='error'] {
+  color: var(--danger);
+}
+.acp-bar__elapsed {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted-foreground);
+}
+.acp-bar__actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
+}
+.acp-bar__confirm {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  animation: acp-line-in 260ms var(--acp-ease) both;
+}
+.acp-bar__confirm-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--foreground);
+}
+.acp-bar__note {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted-foreground);
+}
+.acp-bar__note[data-tone='error'] {
+  color: var(--danger);
+}
+
+/* The closed session's composer: still there, plainly off. */
+.composer[data-disabled='true'] {
+  opacity: 0.62;
+}
+.composer[data-disabled='true'] textarea {
+  cursor: not-allowed;
+}
+
+/* ── Reduced motion: everything above stands still ────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  .acp-run,
+  .acp-run *,
+  .acp-run::before,
+  .acp-run::after,
+  .acp-run *::before,
+  .acp-run *::after,
+  .acp-done,
+  .acp-done *,
+  .acp-done *::before,
+  .acp-done *::after,
+  .acp-bar,
+  .acp-bar *,
+  .acp-bar::before,
+  .acp-bar *::before,
+  .acp-bar *::after,
+  .chat-thread > .msg.subagent {
+    animation: none !important;
+    transition: none !important;
+  }
+  .acp-run__activity-text[data-leaving] {
+    visibility: hidden;
+  }
+}

@@ -9,6 +9,7 @@ import { apiOrigin } from '@/lib/api-origin'
 import { useApprovals } from '@/services/approval-monitor'
 import { useTheme } from '@/stores/theme'
 import { chatMarkdown } from './markdown'
+import { createAcpMounter, type AcpMounter, type AcpOpenSession } from './transcript/acp'
 import { createCardsMounter, type CardsMounter } from './transcript/cards'
 import { createChartMounter, type ChartMounter } from './transcript/chart'
 import { createDcaMounter, type DcaActions, type DcaMounter } from './transcript/dca'
@@ -277,6 +278,13 @@ export function useTranscript(opts: {
    * carry no `.mk-swap`. Read live.
    */
   onMarketsSwap?: MarketsSwapHandler | null
+  /**
+   * Navigate to another session: the "Open session" action on a coding
+   * harness's run card and completion card (transcript/acp.ts). The web
+   * console switches its session; the desktop routes to `/sessions/:key`.
+   * Absent: the cards carry no such action. Read live.
+   */
+  onOpenSession?: AcpOpenSession | null
 }): {
   containerRef: React.RefObject<HTMLDivElement | null>
   routerFxDockRef: React.RefObject<HTMLDivElement | null>
@@ -600,6 +608,24 @@ export function useTranscript(opts: {
       actions: () => triggerActionsRef.current,
     }),
   )
+  // Coding-harness cards (acp.ts): the completion card of a subagent and the
+  // run card of a `sessions_spawn(runtime="acp")`. Owns the one `acp.sessions`
+  // poller of this transcript, armed only while a connected run card is
+  // running and the window is visible, and the run cards' Stop (`acp.cancel`).
+  const onOpenSessionRef = useRef<AcpOpenSession | null>(opts.onOpenSession ?? null)
+  useEffect(() => {
+    onOpenSessionRef.current = opts.onOpenSession ?? null
+  }, [opts.onOpenSession])
+  // eslint-disable-next-line react-hooks/refs -- the factory stores the getter and reads .current only later, inside click handlers and renders outside React's render
+  const [acpMounter] = useState<AcpMounter>(() =>
+    createAcpMounter({
+      call: (method, params) => rpc.call(method, params),
+      markdown: chatMarkdown,
+      openSession: () => onOpenSessionRef.current,
+    }),
+  )
+  useEffect(() => () => acpMounter.destroyAll(), [acpMounter])
+
   // A parked LP write's button waits for its order to settle; a DCA or a
   // trigger card re-reads itself when one of its orders settles.
   useEffect(
@@ -695,6 +721,7 @@ export function useTranscript(opts: {
       openModal: (title, html, buttons) => openModalRef.current?.(title, html, buttons),
       sendUserAnswer: (text) => sendUserAnswerRef.current?.(text) ?? false,
       approvePlan: () => approvePlanRef.current?.() ?? false,
+      harnessCard: (spec, options) => acpMounter.harnessCard(spec, options),
       // Artifact preview/download URLs + download Authorization header
       // (chat.js:7575/7657 `App.getAuthToken()`).
       getAuthToken,
@@ -800,6 +827,7 @@ export function useTranscript(opts: {
       },
       onEdit: (text) => messageActionsRef.current.onEdit?.(text),
       onRegenerate: (text) => messageActionsRef.current.onRegenerate?.(text),
+      subagentCard: (payload, raw) => acpMounter.completionCard(payload, raw),
     }),
   )
 
@@ -1263,7 +1291,11 @@ export function useTranscript(opts: {
           seamsRef.current.diag?.('send.rpc.error', { message })
           // chat.js:6202-6203 — end streaming + surface the failure inline.
           if (controller.isStreaming()) controller.endStreaming()
-          messageRendererRef.current?.addMessage('error', t('chat.sendFailed', { message }))
+          const errorRow = messageRendererRef.current?.addMessage(
+            'error',
+            t('chat.sendFailed', { message }),
+          )
+          if (errorRow) errorRow.dataset.liveError = 'true'
         })
     },
     [rpc, controller, routerConfigGate],
@@ -2169,7 +2201,10 @@ export function useTranscript(opts: {
                     : typeof payload.message === 'string' && payload.message
                       ? payload.message
                       : t('chat.agentError')
-          messageRendererRef.current?.addMessage('error', message)
+          const errorRow = messageRendererRef.current?.addMessage('error', message)
+          // Survives the history resync below until the gateway persists a
+          // row of its own for this failure (history.ts liveErrorToKeep).
+          if (errorRow) errorRow.dataset.liveError = 'true'
           // chat.js:5146 — recover pending after a failed turn.
           pendingDelegatesRef.current.popAllPendingIntoComposer()
           applySessionRunState(
