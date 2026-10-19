@@ -122,11 +122,12 @@ async def announce_subagent_completion(
             )
             if parent_task_id:
                 payload["parent_task_id"] = parent_task_id
+        child_row = await _read_child_row(event.child_session_key, session_manager=session_manager)
         payload["result"] = await _read_child_result(
             event.child_session_key,
             session_manager=session_manager,
+            final_answer=_origin_from_session(child_row).get("kind") == "acp",
         )
-        child_row = await _read_child_row(event.child_session_key, session_manager=session_manager)
         stats = _stats_for_row(child_row) if child_row is not None else None
         if stats:
             payload["stats"] = stats
@@ -402,7 +403,16 @@ async def _read_child_result(
     child_session_key: str,
     *,
     session_manager: Any,
+    final_answer: bool = False,
 ) -> dict[str, Any]:
+    """The child's latest assistant answer.
+
+    ``final_answer`` (ACP harness children): only the latest turn counts --
+    a turn that produced no text yields ``""`` rather than an older answer --
+    and the result is the harness's final answer, the text after its last
+    tool call, not the narration in between (the child transcript keeps all
+    of it).
+    """
     # read_recent_transcript windows from the newest end; read_transcript
     # windows from the oldest end and is kept here only as a fallback for a
     # session_manager stand-in that predates read_recent_transcript -- a
@@ -421,12 +431,54 @@ async def _read_child_result(
         return _result_payload("")
     for row in reversed(list(rows or [])):
         role = _row_value(row, "role")
+        if final_answer and role == "user":
+            break
         if role != "assistant":
             continue
         text = _content_to_text(_row_value(row, "content"))
+        if text and final_answer:
+            text = _final_answer_text(row, text)
         if text:
             return _result_payload(text, source_role="assistant")
     return _result_payload("")
+
+
+#: A tail shorter than this ("Done.") is not an answer on its own.
+_MIN_FINAL_ANSWER_CHARS = 40
+_RESUME_NOTICE_PREFIX = "Started a new "
+_RESUME_NOTICE_SUFFIX = "the previous context could not be resumed."
+
+
+def _final_answer_text(row: Any, full_text: str) -> str:
+    """Text after the harness's last tool call, else the full text.
+
+    A resume notice at the top of the turn stays: the parent must know the
+    harness lost its earlier context.
+    """
+    segments = _row_value(row, "tool_calls")
+    if not isinstance(segments, list):
+        return full_text
+    last_tool = -1
+    for index, segment in enumerate(segments):
+        if isinstance(segment, dict) and segment.get("type") in ("tool_use", "tool_result"):
+            last_tool = index
+    if last_tool < 0:
+        return full_text
+    tail = "".join(
+        str(segment.get("text") or "")
+        for segment in segments[last_tool + 1 :]
+        if isinstance(segment, dict) and segment.get("type") == "text"
+    ).strip()
+    if len(tail) < _MIN_FINAL_ANSWER_CHARS:
+        return full_text
+    first = full_text.lstrip().split("\n\n", 1)[0].strip()
+    if (
+        first.startswith(_RESUME_NOTICE_PREFIX)
+        and first.endswith(_RESUME_NOTICE_SUFFIX)
+        and not tail.startswith(first)
+    ):
+        return f"{first}\n\n{tail}"
+    return tail
 
 
 def _result_payload(text: str, *, source_role: str | None = None) -> dict[str, Any]:

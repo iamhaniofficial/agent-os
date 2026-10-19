@@ -231,14 +231,15 @@ async def test_activity_tracks_the_current_harness_step(sessions, monkeypatch) -
 
 
 def test_activity_label_is_short_single_line_and_home_relative(monkeypatch) -> None:
-    from agentos.acp.manager import ACTIVITY_MAX_CHARS, activity_label
+    from agentos.acp.labels import tool_label
+    from agentos.acp.manager import ACTIVITY_MAX_CHARS
 
     monkeypatch.setenv("HOME", "/Users/x")
-    assert activity_label("Read /Users/x/app/a.py", "read") == "Read ~/app/a.py"
-    assert activity_label("`ls\n  -la`", "execute") == "Run ls -la"
-    assert activity_label(None, "search") == "Searching"
-    assert activity_label("", None) == "Working"
-    long = activity_label("Edit " + "/Users/x/" + "a" * 200, "edit")
+    assert tool_label("Read /Users/x/app/a.py", "read") == "Read ~/app/a.py"
+    assert tool_label("`ls\n  -la`", "execute") == "Run ls"  # first line only
+    assert tool_label(None, "search") == "Searching"
+    assert tool_label("", None) == "Working"
+    long = tool_label("x", "edit", {"file_path": "/Users/x/" + "a" * 200})
     assert len(long) == ACTIVITY_MAX_CHARS and long.endswith("…") and "/Users/x" not in long
 
 
@@ -468,7 +469,7 @@ async def test_starting_harness_is_listed_and_not_idle(sessions) -> None:
     await asyncio.wait_for(entered.wait(), timeout=2)
     rows = manager.list_sessions()
     assert [r["session_key"] for r in rows] == [key]
-    assert rows[0]["activity"] == "Starting Claude Code" and rows[0]["activity_kind"] is None
+    assert rows[0]["activity"] == "Starting Claude Code…" and rows[0]["activity_kind"] is None
     assert "turn_elapsed_s" in rows[0]
     status = await manager.status(key)
     assert status["idle"] is False and status["live"] is False
@@ -476,3 +477,44 @@ async def test_starting_harness_is_listed_and_not_idle(sessions) -> None:
     await task
     assert manager.list_sessions() == []
     assert (await manager.status(key))["idle"] is True
+
+
+async def test_prepare_turn_drops_the_previous_step_at_once(sessions) -> None:
+    key = "agent:main:acp:aaaa0019"
+    await _acp_row(sessions, key, mode="oneshot")
+    runtime = FakeRuntime(
+        [
+            Script(
+                events=[AcpEvent(kind="tool_call", tool_call_id="t", tool_kind="read", title="R")],
+                result=AcpTurnResult(stop_reason="end_turn"),
+            )
+        ]
+    )
+    manager = _manager(runtime, sessions)
+    await manager.run_turn(key, "one")
+    assert (await manager.status(key))["activity"] == "R"
+    manager.prepare_turn(key, "claude")
+    status = await manager.status(key)
+    assert status["activity"] == "Starting Claude Code…" and status["turn_tool_calls"] == 0
+    assert status["idle"] is False
+
+
+async def test_prepare_turn_leaves_a_running_turn_alone(sessions) -> None:
+    key = "agent:main:acp:aaaa0020"
+    await _acp_row(sessions, key)
+    runtime = FakeRuntime(
+        [
+            Script(
+                events=[AcpEvent(kind="tool_call", tool_call_id="t", tool_kind="read", title="R")],
+                block=True,
+            )
+        ]
+    )
+    manager = _manager(runtime, sessions)
+    task = asyncio.create_task(manager.run_turn(key, "go"))
+    await asyncio.wait_for(runtime.turn_started.wait(), timeout=2)
+    await asyncio.sleep(0.01)
+    manager.prepare_turn(key, "claude")
+    assert manager.list_sessions()[0]["activity"] == "R"
+    runtime.release.set()
+    await task

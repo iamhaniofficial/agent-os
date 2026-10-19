@@ -149,7 +149,11 @@ parent's system message) also carries `runtime: "acp"`, `acp_agent`,
 `acp_agent_name`, `cwd`, `mode`, `harness_mode` and a structured `usage`
 object (`duration_ms`, `input_tokens`, `output_tokens`, `total_tokens`,
 `cost_usd`, `tool_calls`; `null` when the harness did not report a value).
-Other subagent completions carry `runtime: "subagent"`.
+Other subagent completions carry `runtime: "subagent"`. The completion's
+`result.text` is the harness's final answer: the text after its last tool
+call (the whole text when that part is only a line or two); the narration in
+between stays in the child transcript, where text runs separated by a tool
+call are separate paragraphs.
 
 To continue a child, `sessions_send` to its key: `followup` queues the text
 as the next turn, `steer` cancels the running turn and sends the new text.
@@ -162,7 +166,10 @@ type into the child session directly; those turns are not announced to the
 parent. Only a session closed by an operator (`acp.close`, `agentos acp
 close`, `subagents kill`) refuses new turns; the refusal is logged
 (`acp.dispatch.turn_refused`), written to the child transcript as an
-`Error:` row and sent as the normal `error` event. `subagents` lists ACP
+`Error:` row for the person reading it ("This Claude Code session has
+ended. Start a new chat to continue.") and sent as the normal `error` event,
+whose `error_message` carries the agent-facing detail (spawn a new one,
+`resume_session_id=...`). `subagents` lists ACP
 children with `runtime: "acp"`, `acp_idle` (finished, takes follow-ups) and
 `acp_closed`; `kill` cancels and closes one.
 
@@ -181,9 +188,11 @@ workspace and in managed worktrees (`worktree: true`), nowhere else.
 - Work that writes files belongs in the project's own checkout: add it to
   `allowed_cwds`, or spawn with `worktree: true` from a repository that is
   already allowed.
-- A refused `cwd` fails the spawn with `ACP_CWD_NOT_ALLOWED` and the exact
-  command that allows it (the list is replaced as a whole, so keep the
-  entries you already have):
+- A refused `cwd` fails the spawn with `ACP_CWD_NOT_ALLOWED`. The error
+  tells the agent to check its guess first (a folder named in the task
+  usually lives in the agent workspace) and, if the task really targets that
+  directory, gives the exact command that allows it (the list is replaced as
+  a whole, so keep the entries you already have):
 
 ```sh
 agentos config set acp.allowed_cwds '["~/Code/my-app"]'
@@ -231,7 +240,18 @@ anything.
   after a gateway restart) but gets a fresh harness session instead starts
   its text with a one-line notice that the previous context was lost.
 - Cancel sends ACP `session/cancel`, waits 2 s, then stops the process
-  group (SIGTERM, SIGKILL 750 ms later).
+  group (SIGTERM, SIGKILL 750 ms later). A stopped turn keeps what it did
+  in the child transcript (tool calls and any text) followed by a
+  "Cancelled after N tool calls (m:ss)." row; its duration, tool calls and
+  cost (when reported) still reach `last_turn` and the completion.
+- Cost: Claude Code reports a running total per ACP session, and a resumed
+  session may carry it over. AgentOS keys its baseline by ACP session id, so
+  each turn is charged only its increase; a reading below the baseline (the
+  total restarted) is charged as it is.
+- Tool rows in a child transcript are titled with a short label built from
+  the tool call ("Run git status", "Read ~/app/src/x.py", "Search TODO",
+  "Fetch docs.python.org", "Looking up tools"); the ACP tool kind is in the
+  row's `input.acp_kind`.
 - `turn_timeout_s` (0 = none) is a wall-clock limit per turn. A quiet
   harness is not a failed one; only the limit ends a turn.
 

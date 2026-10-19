@@ -140,9 +140,12 @@ finished, failed, or needs an answer).
    never let a harness edit files or check out branches there. Work that
    writes goes to the user's project directory (listed in `[acp]
    allowed_cwds`) or to a `worktree: true` checkout. If the spawn is refused
-   with `ACP_CWD_NOT_ALLOWED`, tell the user the exact `agentos config set
-   acp.allowed_cwds ...` command from the error and ask them to run it; do
-   not move the job to another directory or into the workspace on your own.
+   with `ACP_CWD_NOT_ALLOWED`, first check that you picked the right
+   directory: a relative path or a folder the task names (`agents/...`,
+   `notes/...`) usually lives in your agent workspace, so retry with that
+   path relative to the workspace. Only if the task really targets the
+   refused directory, tell the user the exact `agentos config set
+   acp.allowed_cwds ...` command from the error and ask them to run it.
 3. One writer per checkout. Parallel workers on the same repo each get
    `worktree: true`.
 4. Be patient. A quiet harness is working; only cancel on the user's word,
@@ -155,7 +158,7 @@ finished, failed, or needs an answer).
 | --- | --- |
 | `ACP_HARNESS_MISSING` | The harness CLI is not installed. Tell the user which one (`agentos acp doctor <id>` shows the fix). |
 | `ACP_AGENT_NOT_ALLOWED` | Not in `[acp] allowed_agents`, or ACP is disabled. Report it and ask which allowed harness to use. |
-| `ACP_CWD_NOT_ALLOWED` | The `cwd` is outside the workspace, the worktrees and `[acp] allowed_cwds`. Give the user the exact `agentos config set acp.allowed_cwds '[...]'` command from the error and ask; do not pick another directory. |
+| `ACP_CWD_NOT_ALLOWED` | The `cwd` is outside the workspace, the worktrees and `[acp] allowed_cwds`. Check your guess first: a folder the task names usually sits in your agent workspace, so retry with the workspace-relative path. If the task really needs that directory, give the user the exact `agentos config set acp.allowed_cwds '[...]'` command from the error and ask. |
 | `ACP_SESSION_CLOSED` | The child was closed (`acp close` / `subagents kill`). Spawn a new one; pass the `resume_session_id` from the error to keep the harness conversation. |
 | `ACP_SESSION_INIT_FAILED` | The harness started but would not open a session (often not logged in). Ask the user to run the harness CLI once and sign in. |
 | `ACP_PERMISSION_PROMPT_UNAVAILABLE` | It needed approval and nobody can answer here. Report it; suggest a read-only task or a different `[acp] permission_mode`. |

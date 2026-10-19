@@ -338,8 +338,12 @@ async def test_turn_into_closed_session_is_logged_persisted_and_emitted(tmp_path
         transcript = await rig.sessions.read_recent_transcript(child, 10)
         assert transcript[-2]["content"] == "hello?"
         assert transcript[-1]["role"] == "system"
-        assert transcript[-1]["content"].startswith("Error: This Claude Code session")
-        assert "resume_session_id=sess-1" in transcript[-1]["content"]
+        # The row is for the person reading the chat; the event keeps the
+        # agent-facing detail.
+        assert transcript[-1]["content"] == (
+            "Error: This Claude Code session has ended. Start a new chat to continue."
+        )
+        assert "resume_session_id=sess-1" in errors[-1]["error_message"]
         # Shown by chat.history (the UI resyncs from it right after the error).
         from agentos.chat.history import transcript_entries_to_chat_messages
 
@@ -433,3 +437,177 @@ async def test_operator_cancel_ends_task_as_cancelled_not_failed(tmp_path) -> No
         errors = [p for k, n, p in rig.events if n == "session.event.error"]
         assert errors and errors[0]["code"] == "ACP_TURN_CANCELLED"
         assert errors[0]["terminal_reason"] == "cancelled"
+
+
+def _cost_script(cost: float, text: str = "ok") -> Script:
+    return Script(
+        events=[
+            AcpEvent(kind="usage", usage={"used": 1, "size": 2}, cost_usd=cost),
+            AcpEvent(kind="text_delta", text=text),
+        ],
+        result=AcpTurnResult(stop_reason="end_turn", usage=AcpUsage(cost_usd=cost)),
+    )
+
+
+async def test_resumed_turn_is_charged_only_its_cost_increase(tmp_path) -> None:
+    """agent:main:acp:108fc5c7: the resumed turn read the session-cumulative
+    1.1732 after 1.0338 and the whole amount was booked to it."""
+    runtime = FakeRuntime([_cost_script(1.0338, "first"), _cost_script(1.1732, "second")])
+    async with acp_rig(tmp_path, runtime) as rig:
+        out = await _spawn(task="once", acp_agent="claude")
+        child = out["session_key"]
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        await _completions(rig, 1)
+        follow = json.loads(await sessions_tool.sessions_send(child, "more"))
+        await rig.task_runtime.wait(follow["task_id"], timeout=5)
+
+        assert len([c for c in runtime.calls if c[0] == "ensure_session"]) == 2  # resumed
+        row = await rig.sessions.get_session(child)
+        assert abs(row.origin["last_turn"]["cost_usd"] - 0.1394) < 1e-6
+        assert abs(row.total_cost_usd - 1.1732) < 1e-6
+        assert row.origin["acp_cost_reading"] == {"acp_session_id": "sess-1", "amount": 1.1732}
+        transcript = await rig.sessions.read_recent_transcript(child, 10)
+        assert abs(transcript[-1]["turn_usage"]["cost_usd"] - 0.1394) < 1e-6
+
+
+async def test_cancelled_turn_records_its_cost_reading(tmp_path) -> None:
+    runtime = FakeRuntime(
+        [
+            _cost_script(0.5),
+            Script(
+                events=[AcpEvent(kind="usage", usage={"used": 1, "size": 2}, cost_usd=0.7)],
+                block=True,
+            ),
+            _cost_script(0.9),
+        ]
+    )
+    async with acp_rig(tmp_path, runtime) as rig:
+        out = await _spawn(task="one", acp_agent="claude", mode="persistent")
+        child = out["session_key"]
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        follow = json.loads(await sessions_tool.sessions_send(child, "two"))
+        await asyncio.wait_for(_wait_for_calls(runtime, 2), timeout=5)
+        await asyncio.sleep(0.01)
+        await rig.task_runtime.cancel(session_key=child, source="test", reason="t")
+        await rig.task_runtime.wait(follow["task_id"], timeout=5)
+        row = await rig.sessions.get_session(child)
+        assert abs(row.origin["last_turn"]["cost_usd"] - 0.2) < 1e-6
+        assert row.origin["last_turn"]["stop_reason"] == "cancelled"
+
+        third = json.loads(await sessions_tool.sessions_send(child, "three"))
+        await rig.task_runtime.wait(third["task_id"], timeout=5)
+        row = await rig.sessions.get_session(child)
+        assert abs(row.origin["last_turn"]["cost_usd"] - 0.2) < 1e-6
+        assert abs(row.total_cost_usd - 0.9) < 1e-6
+
+
+async def test_cancelled_turn_keeps_its_work_and_a_note(tmp_path) -> None:
+    """agent:main:acp:22cdc031 was stopped after 21 tool calls and its history
+    held only the task."""
+    runtime = FakeRuntime(
+        [
+            Script(
+                events=[
+                    AcpEvent(kind="text_delta", text="Looking around."),
+                    AcpEvent(
+                        kind="tool_call",
+                        tool_call_id="t1",
+                        tool_kind="read",
+                        title="Read a.py",
+                        raw_input={"file_path": "a.py"},
+                    ),
+                    AcpEvent(kind="tool_call_update", tool_call_id="t1", status="completed"),
+                    AcpEvent(
+                        kind="tool_call",
+                        tool_call_id="t2",
+                        tool_kind="execute",
+                        title="pytest -q",
+                        raw_input={"command": "pytest -q"},
+                    ),
+                ],
+                block=True,
+            )
+        ]
+    )
+    async with acp_rig(tmp_path, runtime) as rig:
+        out = await _spawn(task="long job", acp_agent="claude")
+        child = out["session_key"]
+        await asyncio.wait_for(runtime.turn_started.wait(), timeout=5)
+        await asyncio.sleep(0.02)
+        await rig.task_runtime.cancel(session_key=child, source="test", reason="stop")
+        record = await rig.task_runtime.wait(out["task_id"], timeout=5)
+        assert str(getattr(record.status, "value", record.status)) == "cancelled"
+
+        transcript = await rig.sessions.read_recent_transcript(child, 10)
+        assert [r["role"] for r in transcript] == ["user", "assistant", "system"]
+        assistant = transcript[1]
+        assert assistant["content"] == "Looking around."
+        names = [s.get("name") for s in assistant["tool_calls"] if s["type"] == "tool_use"]
+        assert names == ["Read a.py", "Run pytest -q"]
+        assert transcript[2]["content"] == "Cancelled after 2 tool calls (0:00)."
+        assert not transcript[2]["content"].startswith("Error:")
+
+        completions = await _completions(rig, 1)
+        usage = completions[-1]["usage"]
+        assert usage["tool_calls"] == 2 and isinstance(usage["duration_ms"], int)
+        assert usage["input_tokens"] is None  # nobody reported tokens for this turn
+        assert completions[-1]["status"] == "cancelled"
+
+
+async def test_operator_cancel_also_leaves_the_note(tmp_path) -> None:
+    runtime = FakeRuntime(
+        [
+            Script(
+                events=[AcpEvent(kind="tool_call", tool_call_id="t", tool_kind="read", title="R")],
+                block=True,
+            )
+        ]
+    )
+    async with acp_rig(tmp_path, runtime) as rig:
+        out = await _spawn(task="long", acp_agent="claude", mode="persistent")
+        await asyncio.wait_for(runtime.turn_started.wait(), timeout=5)
+        await asyncio.sleep(0.02)
+        assert await rig.manager.cancel(out["session_key"], reason="operator_cancel")
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        transcript = await rig.sessions.read_recent_transcript(out["session_key"], 10)
+        assert transcript[-1]["role"] == "system"
+        assert transcript[-1]["content"] == "Cancelled after 1 tool call (0:00)."
+
+
+def _narrated_script(final: str) -> Script:
+    return Script(
+        events=[
+            AcpEvent(kind="text_delta", text="Now the DCA mandate dumps."),
+            AcpEvent(kind="tool_call", tool_call_id="a", tool_kind="read", title="Read d.json"),
+            AcpEvent(kind="tool_call_update", tool_call_id="a", status="completed"),
+            AcpEvent(kind="text_delta", text="The two list dumps were truncated."),
+            AcpEvent(kind="tool_call", tool_call_id="b", tool_kind="read", title="Read e.json"),
+            AcpEvent(kind="tool_call_update", tool_call_id="b", status="completed"),
+            AcpEvent(kind="text_delta", text=final),
+        ],
+        result=AcpTurnResult(stop_reason="end_turn", tool_calls=2),
+    )
+
+
+async def test_completion_result_is_the_final_answer(tmp_path) -> None:
+    final = "**Summary:** three DCA mandates are active and the totals match the ledger."
+    async with acp_rig(tmp_path, FakeRuntime([_narrated_script(final)])) as rig:
+        out = await _spawn(task="summarize", acp_agent="claude")
+        child = out["session_key"]
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        completions = await _completions(rig, 1)
+        assert completions[-1]["result"]["text"] == final
+        # The child transcript keeps everything, as separate paragraphs.
+        transcript = await rig.sessions.read_recent_transcript(child, 10)
+        assert transcript[-1]["content"] == (
+            "Now the DCA mandate dumps.\n\nThe two list dumps were truncated.\n\n" + final
+        )
+
+
+async def test_short_final_answer_falls_back_to_the_full_text(tmp_path) -> None:
+    async with acp_rig(tmp_path, FakeRuntime([_narrated_script("Done.")])) as rig:
+        out = await _spawn(task="summarize", acp_agent="claude")
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        completions = await _completions(rig, 1)
+        text = completions[-1]["result"]["text"]
+        assert text.startswith("Now the DCA mandate dumps.") and text.endswith("Done.")
