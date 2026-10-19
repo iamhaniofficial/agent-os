@@ -265,6 +265,8 @@ export function ChatPage() {
     // Either kind of pin removes the router's choice, so both suppress the
     // router-fx strip — a model pin is no less decided than a tier pin.
     routePinned: route.isPinned,
+    // A coding harness's cards open its child session in this view.
+    onOpenSession: switchToSession,
   })
   const attachments = useAttachments()
   // Ghost-text next prompt in the composer, asked for when a turn ends.

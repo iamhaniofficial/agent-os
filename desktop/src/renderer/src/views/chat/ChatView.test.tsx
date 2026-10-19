@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import { useEffect } from 'react'
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useConnection } from '@/stores/connection'
 import { useGateway } from '~/stores/gateway'
@@ -131,5 +132,72 @@ describe('ChatView jump to latest', () => {
     expect(composerBlock).not.toBe(dock)
     expect(children.indexOf(dock)).toBeLessThan(children.indexOf(composerBlock))
     expect(composerBlock.querySelector('.chat-jump-dock')).toBeNull()
+  })
+})
+
+// A subagent's completion card in the parent chat: "Open session" goes to the
+// child's own chat, as a pushed route (Back returns to the parent).
+describe('ChatView coding-harness cards', () => {
+  const CHILD = 'agent:main:acp:cfb95897'
+  const where = { path: '' }
+  function Probe() {
+    const path = useLocation().pathname
+    useEffect(() => {
+      where.path = path
+    }, [path])
+    return null
+  }
+
+  it('opens the child session from its completion card', async () => {
+    answers['chat.history'] = {
+      messages: [
+        { role: 'user', text: 'Ask Claude Code to look around', timestamp: 1 },
+        {
+          role: 'system',
+          text: JSON.stringify({
+            type: 'subagent_completion',
+            child_session_key: CHILD,
+            status: 'succeeded',
+            runtime: 'acp',
+            acp_agent: 'claude',
+            acp_agent_name: 'Claude Code',
+            result: { text: 'All clear.' },
+            stats: 'runtime 50s • tokens 211207 (in 10 / out 4044) • cost $0.3995',
+          }),
+          provenance_source_tool: 'subagent_completion',
+          provenance_kind: 'internal_system',
+          timestamp: 2,
+        },
+      ],
+      history_scope: 'complete',
+    }
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { container } = render(
+      <MemoryRouter initialEntries={[`/sessions/${encodeURIComponent(KEY)}`]}>
+        <QueryClientProvider client={client}>
+          <Routes>
+            <Route
+              path="/sessions/:key?"
+              element={
+                <>
+                  <ChatView actionsSlot={slot} />
+                  <Probe />
+                </>
+              }
+            />
+          </Routes>
+        </QueryClientProvider>
+      </MemoryRouter>,
+    )
+    const card = await waitFor(() => {
+      const found = container.querySelector<HTMLElement>('.msg.subagent .acp-done')
+      expect(found).not.toBeNull()
+      return found as HTMLElement
+    })
+    expect(card.querySelector('.acp-done__title')).toHaveTextContent('Claude Code finished')
+    // The raw JSON is no longer the row; it waits behind Details.
+    expect(container.querySelector('.chat-subagent-disclosure')).toBeNull()
+    fireEvent.click(within(card).getByRole('button', { name: 'Open session' }))
+    await waitFor(() => expect(where.path).toBe(`/sessions/${encodeURIComponent(CHILD)}`))
   })
 })

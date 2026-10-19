@@ -20,7 +20,7 @@ import { t } from '@/i18n'
 import '@/i18n/en/chat'
 
 import type { StreamEventPayload } from '../types'
-import { createToolRenderer, type ToolRenderer } from './tools'
+import { createToolRenderer, type ToolRenderer, type ToolRendererDeps } from './tools'
 import { createArtifactRenderer, type Artifact, type ArtifactRenderer } from './artifacts'
 import {
   createRouterFxRenderer,
@@ -352,6 +352,8 @@ export interface StreamControllerDeps {
   sendUserAnswer?: (text: string) => boolean
   /** exit_plan_mode card → approve: plan mode off via RPC + go-ahead message. */
   approvePlan?: () => boolean
+  /** sessions_spawn(runtime="acp") → the harness run card (transcript/acp.ts). */
+  harnessCard?: ToolRendererDeps['harnessCard']
   /**
    * chat.js:7814 `_addMessage` with provenance options — append the subagent
    * completion system row. Distinct from `addMessage` above (which is the
@@ -1528,6 +1530,7 @@ export function createStreamController(
     openModal,
     sendUserAnswer: deps.sendUserAnswer,
     approvePlan: deps.approvePlan,
+    harnessCard: deps.harnessCard,
     diag,
   })
 
