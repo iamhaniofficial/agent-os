@@ -38,9 +38,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   named in a task usually live in the workspace), then names the exact
   `agentos config set` command.
 - Deferred tool loading. `subagents` (list, stop or steer your children) is
-  no longer hidden from the main agent: it joins the deferred set (now 25
-  builtins), so a stock request still carries 40 tool schemas.
-  `sessions_spawn(runtime="acp")` loads it into the session, so a
+  no longer hidden from the main agent: it joins the deferred set, which now
+  holds 25 rarely used builtins; deferral still cuts a stock request from 64
+  to 40 tool schemas. `sessions_spawn(runtime="acp")` loads it into the session, so a
   parent asked to stop a harness has it at hand; it had fallen back to
   `agentos acp close` through `exec_command`.
 - `acp.cancel` / `acp.close` reject a key that is not an existing ACP
