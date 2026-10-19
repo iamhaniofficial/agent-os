@@ -449,13 +449,36 @@
   white-space: nowrap;
   color: var(--muted-foreground);
 }
-/* Mode chips that no longer fit drop whole (clipped second line). */
+/* Mode chips that no longer fit drop whole (clipped second line); the
+   zero-width spacer lets even the first one leave rather than be clipped. */
 .acp-run__modes {
-  flex: 0 4 auto;
+  flex: 0 0.01 auto;
   flex-wrap: wrap;
+  align-content: flex-start;
   height: 1.3rem;
   min-width: 0;
   overflow: hidden;
+}
+.acp-run__modes::before {
+  content: '';
+  height: 1.3rem;
+  margin-right: -6px;
+}
+/* The completion's title wraps rather than be cut; the pill wraps whole. */
+.acp-done__head > .acp-done__titles {
+  flex: 1 1 8rem;
+  min-width: 0;
+}
+.acp-done__title {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+/* Settled, the outcome is never cut: the figures take a second line. */
+.acp-run:not([data-state='running']) .acp-run__status {
+  flex-wrap: wrap;
+}
+.acp-run:not([data-state='running']) .acp-run__activity {
+  flex: 1 0 auto;
 }
 .acp-chip,
 .acp-pill {

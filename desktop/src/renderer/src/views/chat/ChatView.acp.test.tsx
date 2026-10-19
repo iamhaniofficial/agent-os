@@ -196,8 +196,9 @@ describe('ACP session bar', () => {
     expect(within(bar).queryByRole('button')).toBeNull()
     const composer = screen.getByRole('textbox')
     expect(composer).toBeDisabled()
-    expect(composer).toHaveAttribute(
-      'placeholder',
+    // Said once, on its own line; the field points at it.
+    expect(composer).toHaveAttribute('placeholder', '')
+    expect(composer).toHaveAccessibleDescription(
       'This Claude Code session has ended and takes no new messages.',
     )
     expect(composer.closest('form')).toHaveAttribute('data-disabled', 'true')

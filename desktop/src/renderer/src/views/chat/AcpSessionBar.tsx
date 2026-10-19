@@ -206,7 +206,7 @@ export function AcpSessionBar({ view }: { view: AcpSessionView }) {
                 {working ? (
                   <button
                     type="button"
-                    className="acp-btn acp-btn--danger"
+                    className="acp-btn acp-btn--danger acp-bar__stop"
                     disabled={view.stopState !== 'idle'}
                     data-pending={view.stopState === 'pending' || undefined}
                     title={t('acp.bar.stopTitle').replace('{name}', name)}
@@ -217,7 +217,7 @@ export function AcpSessionBar({ view }: { view: AcpSessionView }) {
                 ) : null}
                 <button
                   type="button"
-                  className="acp-btn acp-btn--quiet"
+                  className="acp-btn acp-btn--quiet acp-bar__end"
                   disabled={view.endState !== 'idle'}
                   title={t('acp.bar.endTitle').replace('{name}', name)}
                   onClick={() => setConfirming(true)}
