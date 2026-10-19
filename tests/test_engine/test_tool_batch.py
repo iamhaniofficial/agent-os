@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -776,7 +777,10 @@ async def test_time_queued_for_readmission_does_not_count_against_the_call_timeo
         extended = scope.when()
     await other_task
 
-    assert extended is not None and extended - original >= held_for
+    # The loop clock ticks coarsely on Windows (~15.6ms), so a 20ms sleep can
+    # read as one tick; allow one clock step of slack.
+    tick = time.get_clock_info("monotonic").resolution
+    assert extended is not None and extended - original >= held_for - tick
     assert not admission.yielded
     admission.release()
 
