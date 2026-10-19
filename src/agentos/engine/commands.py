@@ -234,6 +234,17 @@ def _session_name(envelope: Any, args: str = "") -> dict[str, str]:
     return {"key": envelope.session_key, "name": args.strip()}
 
 
+def _restart_mode(envelope: Any, args: str = "") -> dict[str, str]:
+    """`/restart [force]` — drain the active turns (default) or cancel them.
+
+    The session key travels along so the gateway can confirm in this chat
+    once it is back; ``gateway.restart`` decides whether the caller may.
+    """
+
+    mode = "force" if args.strip().lower() == "force" else "safe"
+    return {"key": envelope.session_key, "mode": mode, "reason": "slash_command"}
+
+
 _W = Surface.WEB_CHAT
 _T = Surface.CLI_GATEWAY
 _S = Surface.CLI_STANDALONE
@@ -417,8 +428,7 @@ _COMMANDS: tuple[CommandDef, ...] = (
         name="/path",
         usage="/path <path> [prompt]",
         description=(
-            "Analyze a local path without uploading bytes; sends the path string "
-            "as prompt text."
+            "Analyze a local path without uploading bytes; sends the path string as prompt text."
         ),
         execution={_T: _local("path.analyze"), _S: _local("path.analyze")},
     ),
@@ -500,6 +510,18 @@ _COMMANDS: tuple[CommandDef, ...] = (
         description="Exit the REPL.",
         execution={_T: _local("repl.exit"), _S: _local("repl.exit")},
         aliases=("/quit",),
+    ),
+    CommandDef(
+        name="/restart",
+        usage="/restart [force]",
+        description="Restart the gateway. Drains active turns first; 'force' cancels them.",
+        execution={
+            _W: _rpc("gateway.restart", _restart_mode),
+            _C: _rpc("gateway.restart", _restart_mode),
+        },
+        argument_choices=(
+            ArgumentChoice("force", "Cancel the active turns instead of draining them"),
+        ),
     ),
     # ---- Channel only -----------------------------------------------------
     CommandDef(

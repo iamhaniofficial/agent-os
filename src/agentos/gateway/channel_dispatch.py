@@ -75,6 +75,10 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
+#: Sent to a channel sender whose message arrived while a restart was
+#: draining (``TaskRuntime.enqueue`` refuses it); the message is not queued.
+GATEWAY_RESTARTING_REPLY = "The gateway is restarting; please send that again in a moment."
+
 _DEFAULT_TYPING_KEEPALIVE_INTERVAL_S = 8.0
 
 
@@ -552,7 +556,10 @@ async def run_channel_dispatch(
         await status_reactor.received(msg)
 
         if task_runtime is not None:
-            from agentos.gateway.task_runtime import TaskQueueFullError
+            from agentos.gateway.task_runtime import (
+                TaskQueueFullError,
+                TaskRuntimeNotAdmittingError,
+            )
 
             # Cap check BEFORE enqueue/append: reject early so no transcript
             # entry is written and no runtime turn is started when the channel
@@ -618,6 +625,14 @@ async def run_channel_dispatch(
                 if stream_relay is not None:
                     await stream_relay.close()
 
+                if isinstance(exc, TaskRuntimeNotAdmittingError):
+                    # A restart is draining; the sender is told to resend
+                    # rather than being silently dropped.
+                    await status_reactor.failed(msg)
+                    await channel.send(
+                        _route_envelope_reply_message(GATEWAY_RESTARTING_REPLY, route_envelope)
+                    )
+                    continue
                 if not isinstance(exc, TaskQueueFullError):
                     raise
                 await status_reactor.failed(msg)
@@ -927,7 +942,7 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     status_reactor = _status_reactor(channel)
     await status_reactor.received(msg)
     raw_content = getattr(combined, "raw_content", None) or msg.content
-    from agentos.gateway.task_runtime import TaskQueueFullError
+    from agentos.gateway.task_runtime import TaskQueueFullError, TaskRuntimeNotAdmittingError
 
     # Cap check BEFORE enqueue/append: reject early so no transcript entry is
     # written and no runtime turn is started (accept-then-drop fix).
@@ -984,6 +999,11 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         if stream_relay is not None:
             await stream_relay.close()
 
+        if isinstance(exc, TaskRuntimeNotAdmittingError):
+            await status_reactor.failed(msg)
+            log.info("channel_dispatch.debounce_enqueue_failed", session_key=session_key, reason="gateway_restarting", coalesced_count=combined.coalesced_count)  # noqa: E501
+            await _reply_debounce_failure(channel, route_envelope, GATEWAY_RESTARTING_REPLY, session_key=session_key, reason="gateway_restarting")  # noqa: E501
+            return
         if isinstance(exc, TaskQueueFullError):
             await status_reactor.failed(msg)
             log.warning("channel_dispatch.debounce_enqueue_failed", session_key=session_key, reason="queue_full", coalesced_count=combined.coalesced_count)  # noqa: E501
@@ -1689,11 +1709,7 @@ class _RuntimeChannelStreamRelay:
         buffer = [first_text]
         size = len(first_text)
         loop = asyncio.get_running_loop()
-        deadline = (
-            loop.time() + self._coalesce_window_s
-            if self._coalesce_window_s > 0
-            else None
-        )
+        deadline = loop.time() + self._coalesce_window_s if self._coalesce_window_s > 0 else None
         while True:
             if self._coalesce_chars and size >= self._coalesce_chars:
                 return "".join(buffer), None

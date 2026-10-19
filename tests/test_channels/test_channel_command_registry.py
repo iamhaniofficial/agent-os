@@ -112,6 +112,11 @@ async def test_paired_channel_context_is_limited_by_protocol_surface() -> None:
         ("/model", "models.list", {}),
         ("/new", "sessions.reset", {"key": "agent:main:telegram:u1"}),
         ("/reset", "sessions.reset", {"key": "agent:main:telegram:u1"}),
+        (
+            "/restart",
+            "gateway.restart",
+            {"key": "agent:main:telegram:u1", "mode": "safe", "reason": "slash_command"},
+        ),
         ("/skills", "skills.list", {}),
         ("/status", "status", {}),
         ("/usage", "usage.status", {}),

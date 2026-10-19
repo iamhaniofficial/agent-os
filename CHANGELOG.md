@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- Restart the gateway from chat. `/restart [force]` in the web console and
+  the desktop app and, when `[gateway_control] chat_restart = true`, from any
+  paired Telegram, Discord or Slack sender; the `gateway` tool's `restart`
+  action works for the agent under the same toggle. The gateway acknowledges,
+  drains the active turns (30s; `force` cancels them), re-executes itself in
+  place so launchd, systemd, the desktop app and `agentos gateway start` all
+  keep tracking the same process, and posts "Gateway restarted" back to the
+  chat that asked. `agentos gateway restart` (new `--force`) and
+  `agentos upgrade` use the same in-place restart for a healthy gateway they
+  do not manage, which they used to refuse (exit 3) or silently skip with the
+  old code still running. New RPC `gateway.restart`. Not available on Windows.
+
 ### Changed
 - The Bankr mark now sits on Bankr's purple tile (the square app icon) wherever
   it appears: the Skills page's Bankr tab and catalog cards, the desktop Skills

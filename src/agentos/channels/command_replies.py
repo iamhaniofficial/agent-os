@@ -99,7 +99,23 @@ def format_channel_success_reply(*, name: str, method: str, payload: Any) -> str
         return _format_status(payload)
     if method == "usage.status":
         return _format_usage(payload)
+    if method == "gateway.restart":
+        return _format_restart(payload)
     return None
+
+
+def _format_restart(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("alreadyPending"):
+        return "A gateway restart is already in progress."
+    if not payload.get("accepted"):
+        return None
+    if payload.get("mode") == "force":
+        return "Restarting gateway now (force). I'll confirm here when it's back."
+    seconds = payload.get("drainTimeoutSeconds")
+    window = f" (up to {int(seconds)}s)" if isinstance(seconds, int | float) else ""
+    return f"Restarting gateway… draining active turns{window}. I'll confirm here when it's back."
 
 
 def _format_router_hold(payload: Any) -> str | None:

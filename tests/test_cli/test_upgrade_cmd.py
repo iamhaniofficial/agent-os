@@ -898,6 +898,60 @@ def test_start_only_starts_instead_of_restarting(monkeypatch: pytest.MonkeyPatch
     assert calls == ["start"]
 
 
+def test_unmanaged_gateway_is_restarted_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A gateway the CLI did not start (desktop, launchd, systemd, terminal)
+    used to be skipped with "nothing to restart" while the old code kept
+    running. It now restarts itself in place and the version is verified."""
+    from agentos.cli import gateway_cmd
+
+    calls: list[str] = []
+    _install_fake_lifecycle(
+        monkeypatch, _FakeLifecycleManager(calls, state="unmanaged", managed=False)
+    )
+    in_place: list[dict[str, Any]] = []
+
+    def fake_in_place(manager: Any, *, config_path: str | None, mode: str = "safe") -> Any:
+        in_place.append({"config_path": config_path, "mode": mode})
+        return types.SimpleNamespace(exit_code=0, message="", code="", state="running")
+
+    monkeypatch.setattr(gateway_cmd, "restart_gateway_in_place", fake_in_place)
+    monkeypatch.setattr(upgrade_cmd, "_query_gateway_version", lambda _: "99999.2.0")
+
+    verified = upgrade_cmd._restart_and_verify(
+        config_path=None, expected_version="99999.2.0", json_output=False
+    )
+
+    assert verified is True
+    assert calls == ["status"]
+    assert in_place == [{"config_path": None, "mode": "safe"}]
+
+
+def test_unmanaged_in_place_restart_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agentos.cli import gateway_cmd
+
+    calls: list[str] = []
+    _install_fake_lifecycle(
+        monkeypatch, _FakeLifecycleManager(calls, state="unmanaged", managed=False)
+    )
+    monkeypatch.setattr(
+        gateway_cmd,
+        "restart_gateway_in_place",
+        lambda manager, *, config_path, mode="safe": types.SimpleNamespace(
+            exit_code=3,
+            message="not on Windows",
+            code="UNMANAGED_GATEWAY_RUNNING",
+            state="unmanaged",
+        ),
+    )
+    monkeypatch.setattr(upgrade_cmd, "_query_gateway_version", lambda _: "99999.2.0")
+
+    verified = upgrade_cmd._restart_and_verify(
+        config_path=None, expected_version="99999.2.0", json_output=False
+    )
+
+    assert verified is False
+
+
 def test_stop_failure_falls_back_to_the_restart_path(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     manager = _FakeLifecycleManager(calls)

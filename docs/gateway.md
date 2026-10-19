@@ -118,6 +118,28 @@ Restart the gateway after changing:
 agentos gateway restart
 ```
 
+That works for a gateway started with `agentos gateway start` (stop, then
+start) and for one started any other way — the desktop app, launchd, systemd
+or a terminal `agentos gateway run` — which restarts itself **in place**: the
+gateway drains the turns in flight, re-executes itself under the same process
+id so every launcher keeps tracking it, and comes back on upgraded code. The
+CLI confirms the restart from the gateway's readiness probe. Not available on
+Windows, where the process image cannot be replaced.
+
+The same in-place restart is reachable from chat:
+
+- `/restart` in the web console or the desktop app (operators only, no
+  setting needed). The socket drops and reconnects; a toast reports when the
+  gateway is back.
+- `/restart` from a paired Telegram, Discord or Slack sender, and the agent's
+  own `gateway` tool, once `[gateway_control] chat_restart = true` is set and
+  the gateway has been restarted once. The reply acknowledges, then "Gateway
+  restarted (v…, Ns)" lands in the same chat or thread after boot.
+
+`/restart` waits up to 30 seconds for active turns to finish; `/restart force`
+(or `agentos gateway restart --force`) cancels them instead. A second
+request while one is pending is reported, not queued.
+
 ## Troubleshooting
 
 Check status and readiness:

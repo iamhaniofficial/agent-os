@@ -30,9 +30,7 @@ def test_usage_execution_surfaces_and_methods() -> None:
     cmd = DEFAULT_REGISTRY.find("/usage")
     assert cmd is not None
 
-    assert cmd.surfaces == frozenset(
-        {Surface.WEB_CHAT, Surface.CLI_GATEWAY, Surface.CHANNEL}
-    )
+    assert cmd.surfaces == frozenset({Surface.WEB_CHAT, Surface.CLI_GATEWAY, Surface.CHANNEL})
     assert cmd.execution_for(Surface.CLI_STANDALONE) is None
 
     for surface in (Surface.WEB_CHAT, Surface.CLI_GATEWAY, Surface.CHANNEL):
@@ -41,6 +39,32 @@ def test_usage_execution_surfaces_and_methods() -> None:
         assert execution.kind is ExecutionKind.RPC
         assert execution.action == "usage.status"
         assert execution.rpc_method == "usage.status"
+
+
+def test_restart_is_an_rpc_command_on_web_and_channel_only() -> None:
+    cmd = DEFAULT_REGISTRY.find("/restart")
+    assert cmd is not None
+
+    assert cmd.usage == "/restart [force]"
+    assert cmd.surfaces == frozenset({Surface.WEB_CHAT, Surface.CHANNEL})
+    assert [choice.value for choice in cmd.argument_choices] == ["force"]
+    for surface in (Surface.WEB_CHAT, Surface.CHANNEL):
+        execution = cmd.execution_for(surface)
+        assert execution is not None
+        assert execution.kind is ExecutionKind.RPC
+        assert execution.rpc_method == "gateway.restart"
+        assert execution.rpc_params is not None
+
+    envelope = type("Envelope", (), {"session_key": "agent:main:telegram:u1"})()
+    params = cmd.execution_for(Surface.CHANNEL).rpc_params  # type: ignore[union-attr]
+    assert params is not None
+    assert params(envelope, "") == {
+        "key": "agent:main:telegram:u1",
+        "mode": "safe",
+        "reason": "slash_command",
+    }
+    assert params(envelope, " Force ")["mode"] == "force"
+    assert params(envelope, "now")["mode"] == "safe"
 
 
 def test_deprecated_rpc_properties_project_channel_execution() -> None:
