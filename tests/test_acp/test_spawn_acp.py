@@ -51,6 +51,7 @@ async def test_spawn_creates_row_and_enqueues_acp_run(tmp_path) -> None:
         assert is_acp_key(key) and key.startswith("agent:main:acp:")
         assert out["runtime"] == "acp" and out["mode"] == "oneshot"
         assert out["acp_agent"] == "codex" and out["acp_agent_name"] == "Codex"
+        assert out["stop"] == f'subagents(action="kill", session_key="{key}")'
         assert out["harness_mode"] == "read-only"
         row = await rig.sessions.get_session(key)
         assert row.spawned_by == PARENT_KEY and row.spawn_depth == 1
@@ -316,3 +317,39 @@ async def test_finished_oneshot_child_lists_as_idle_and_can_be_killed(tmp_path) 
         assert row.origin["closed"] is True and row.origin["closed_reason"] == "agent_tool_kill"
         with pytest.raises(Exception, match="is closed"):
             await sessions_tool.sessions_send(key, "more")
+
+
+async def test_acp_spawn_loads_the_subagents_tool(tmp_path) -> None:
+    """After a spawn, "stop it" maps to subagents(action="kill"): the deferred
+    tool is loaded into the session (a parent had run `agentos acp close` in a
+    shell because the tool was not there)."""
+    from agentos.tools import deferred
+
+    loaded: list[list[str]] = []
+
+    async def _load(names):
+        loaded.append(list(names))
+        return list(names)
+
+    original = deferred.load_for_current_session
+    deferred.load_for_current_session = _load  # type: ignore[assignment]
+    try:
+        async with acp_rig(tmp_path):
+            out = await _spawn(task="x", acp_agent="claude")
+    finally:
+        deferred.load_for_current_session = original  # type: ignore[assignment]
+    assert loaded == [["subagents"]]
+    assert out["stop"].startswith('subagents(action="kill"')
+
+
+def test_sub_agent_skill_says_how_to_stop_a_harness() -> None:
+    from pathlib import Path
+
+    from agentos.skills.loader import SkillLoader
+
+    bundled = Path(__file__).resolve().parents[2] / "src" / "agentos" / "skills" / "bundled"
+    specs = {spec.name: spec for spec in SkillLoader(bundled_dir=bundled).load_all()}
+    # No requires_tools: that would hide the skill where subagents is denied.
+    assert specs["sub-agent"].requires_tools == []
+    text = specs["sub-agent"].content
+    assert 'subagents(action="kill",' in text and "Never run the" in text

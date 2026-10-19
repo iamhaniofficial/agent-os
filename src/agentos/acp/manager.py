@@ -70,6 +70,9 @@ _CANCEL_GRACE_S = 5.0
 _CLOSE_GRACE_S = 10.0
 #: Idle (process-less) session states kept in memory for ``status`` / activity.
 _MAX_IDLE_STATES = 256
+#: How long ``status`` waits for a fresh row read before it answers from the
+#: last row it saw (end-of-turn writes can queue reads for seconds).
+_STATUS_READ_BUDGET_S = 0.25
 
 #: Longest ``activity`` label (one line, ``$HOME`` shortened to ``~``).
 ACTIVITY_MAX_CHARS = MAX_LABEL_CHARS
@@ -112,6 +115,9 @@ class _SessionState:
     in_use: int = 0
     activity: str | None = None
     activity_kind: str | None = None
+    #: Last known row ``origin`` and ``status`` (for a ``status`` that cannot wait).
+    row_origin: dict[str, Any] | None = None
+    row_status: Any = None
     #: This turn's harness tool calls: id -> (title, kind, raw_input, tool name).
     turn_tools: dict[str, tuple[str | None, str | None, dict[str, Any] | None, str | None]] = field(
         default_factory=dict
@@ -224,6 +230,7 @@ class AcpSessionManager:
         self._shutting_down = False
         #: session key -> [lock, holders]: serializes writes to one session row.
         self._row_locks: dict[str, list[Any]] = {}
+        self._row_reads: set[asyncio.Task[Any]] = set()
         #: Set by the gateway wiring; ``None`` when the bridges are not built.
         self.permission_bridge: Any = None
         self.elicitation_bridge: Any = None
@@ -275,6 +282,10 @@ class AcpSessionManager:
     @property
     def config(self) -> Any:
         return self._config
+
+    @property
+    def session_manager(self) -> Any:
+        return self._session_manager
 
     @property
     def max_concurrent(self) -> int:
@@ -406,7 +417,46 @@ class AcpSessionManager:
                     "acp.manager.origin_update_failed", session_key=session_key, exc_info=True
                 )
                 return None
+            self.remember_row(session_key, origin, getattr(row, "status", None))
         return origin
+
+    def remember_row(self, session_key: str, origin: Mapping[str, Any], status: Any = None) -> None:
+        """Keep the latest row ``origin`` of a session this manager tracks, so
+        ``status`` can answer without waiting for the database."""
+        state = self._states.get(session_key)
+        if state is None or not isinstance(origin, Mapping):
+            return
+        state.row_origin = dict(origin)
+        if status is not None:
+            state.row_status = status
+
+    async def _row_for_status(self, session_key: str) -> tuple[Mapping[str, Any] | None, Any]:
+        """``(origin, status)`` for :meth:`status`: a fresh read when it comes
+        quickly, else the last row this manager saw (the read still finishes
+        and refreshes it). Never takes the row guard."""
+        state = self._states.get(session_key)
+        read = asyncio.ensure_future(self._get_session_row(session_key))
+
+        def _keep(task: asyncio.Task[Any]) -> None:
+            self._row_reads.discard(task)
+            if task.cancelled() or task.exception() is not None:
+                return
+            row = task.result()
+            origin = getattr(row, "origin", None) if row is not None else None
+            if isinstance(origin, Mapping) and origin.get("kind") == "acp":
+                self.remember_row(session_key, origin, getattr(row, "status", None))
+
+        read.add_done_callback(_keep)
+        self._row_reads.add(read)
+        if state is not None and state.row_origin is not None:
+            done, _pending = await asyncio.wait({read}, timeout=_STATUS_READ_BUDGET_S)
+            if read not in done:
+                return state.row_origin, state.row_status
+        row = await asyncio.shield(read)
+        origin = getattr(row, "origin", None) if row is not None else None
+        return (origin if isinstance(origin, Mapping) else None), (
+            getattr(row, "status", None) if row is not None else None
+        )
 
     async def _spec_from_row(self, session_key: str) -> AcpSessionSpec:
         row = await self._get_session_row(session_key)
@@ -958,8 +1008,7 @@ class AcpSessionManager:
         ``require_acp`` raises ``ACP_SESSION_INVALID`` when the key is not an
         ACP session row (the ``acp.status`` RPC contract).
         """
-        row = await self._get_session_row(session_key)
-        origin = getattr(row, "origin", None) if row is not None else None
+        origin, session_status = await self._row_for_status(session_key)
         is_acp = isinstance(origin, Mapping) and origin.get("kind") == "acp"
         if require_acp and not is_acp:
             raise AcpError(
@@ -991,7 +1040,6 @@ class AcpSessionManager:
                     info[key] = origin.get(key)
             if info.get("harness_mode") is None:
                 info["harness_mode"] = origin.get("harness_mode")
-            session_status = getattr(row, "status", None)
             closed = bool(info.get("closed")) or origin_is_closed(
                 origin, session_status=session_status
             )

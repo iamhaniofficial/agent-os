@@ -63,7 +63,16 @@ INTERNAL_TOOL_LABELS: dict[str, str] = {
 
 #: Titles a harness sends before the tool's input is known.
 PLACEHOLDER_TITLES = frozenset(
-    {"terminal", "preparing file…", "preparing file...", "edit", "read", "unknown tool", "other"}
+    {
+        "terminal",
+        "preparing file…",
+        "preparing file...",
+        "edit",
+        "read",
+        "read file",
+        "unknown tool",
+        "other",
+    }
 )
 
 _PATH_KEYS = ("file_path", "path", "abs_path", "filePath", "notebook_path", "filename", "file")

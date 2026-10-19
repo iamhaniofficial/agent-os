@@ -470,13 +470,13 @@ malformed or repetitive tool calls terminate predictably.
 ### Deferred tools
 
 By default a request carries only the tools a typical turn needs. The long tail
-— 24 builtins: audio generation, project and skill administration, `browser`,
-`x_search`, `http_request`, and a few more — is left out; the system prompt
+— 25 builtins: audio generation, project and skill administration, `browser`,
+`x_search`, `http_request`, `subagents`, and a few more — is left out; the system prompt
 lists each by name with a one-line summary under "Tools that must be loaded
 first", and so does the `tool_search` tool. The model calls `tool_search` to
 load the ones a task needs, and they stay loaded for the rest of the session (a
 reset starts lean again). On a stock gateway a request carries 40 tool schemas
-instead of 63. The spreadsheet/document builders and the git tools stay loaded:
+instead of 64. The spreadsheet/document builders and the git tools stay loaded:
 with them one load away the model reached for the shell instead. Reading a skill with `skill_view` also loads the tools that skill
 lists in `requires_tools`. Policy still applies: a tool the session may not use
 is neither listed nor loadable. A surface narrowed by an allowlist (an agent's

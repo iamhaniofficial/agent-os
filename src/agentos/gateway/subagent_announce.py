@@ -133,6 +133,11 @@ async def announce_subagent_completion(
             payload["stats"] = stats
         if child_row is not None:
             payload.update(_child_runtime_fields(child_row))
+            payload.update(
+                _user_stop_fields(
+                    child_row, status=payload.get("status"), cancel_source=event.cancel_source
+                )
+            )
         get_session = getattr(session_manager, "get_session", None)
         if callable(get_session):
             parent = await get_session(event.parent_session_key)
@@ -389,6 +394,58 @@ def _child_runtime_fields(row: Any) -> dict[str, Any]:
     }
 
 
+#: Cancel sources that mean the parent replaced the turn (a steer), not a stop.
+_PARENT_STEER_CANCEL_SOURCES = frozenset({"acp_steer"})
+
+
+def _task_cancel_source(task_row: Any) -> str | None:
+    details = _row_value(task_row, "details")
+    if not isinstance(details, dict):
+        return None
+    cancellation = details.get("cancellation")
+    if not isinstance(cancellation, dict):
+        return None
+    source = cancellation.get("source")
+    return source if isinstance(source, str) and source else None
+
+
+def _user_stop_fields(row: Any, *, status: Any, cancel_source: str | None) -> dict[str, Any]:
+    """For an ACP run the user (or an operator) stopped: ``stopped_by`` and a
+    ``terminal_message`` that tells the parent not to start it again.
+
+    A stop comes from the card or bar Stop (``acp.cancel``), ``acp close``,
+    the child chat's Stop, or ``subagents kill``; a parent's steer replaces
+    the turn instead (and is not announced at all). Live testing showed a
+    parent reading the generic "The task was cancelled before it finished."
+    and rerunning the same job right after the user stopped it.
+    """
+    if str(getattr(status, "value", status) or "") != "cancelled":
+        return {}
+    origin = _origin_from_session(row)
+    if origin.get("kind") != "acp" or cancel_source in _PARENT_STEER_CANCEL_SOURCES:
+        return {}
+    try:
+        from agentos.acp.manager import agent_display_name
+        from agentos.acp.projector import format_clock, tool_calls_phrase
+    except Exception:  # pragma: no cover - acp package always ships with the engine
+        return {}
+    name = agent_display_name(str(origin.get("agent_id") or "")) or "coding harness"
+    last_turn = origin.get("last_turn")
+    turn = last_turn if isinstance(last_turn, dict) else {}
+    if turn.get("stop_reason") == "cancelled":
+        tool_calls = _int_value(turn.get("tool_calls"))
+        when = " " + tool_calls_phrase(
+            tool_calls, format_clock(_int_value(turn.get("duration_ms")))
+        )
+    else:
+        when = ""  # stopped before the turn ran: no numbers of its own
+    message = (
+        f"The user stopped this {name} run{when}. Do not restart it; tell the user what was "
+        "done so far and ask how to continue."
+    )
+    return {"stopped_by": "user", "terminal_message": message}
+
+
 def _stats_for_row(row: Any) -> str | None:
     if _origin_from_session(row).get("kind") != "acp":
         return None
@@ -443,42 +500,53 @@ async def _read_child_result(
     return _result_payload("")
 
 
-#: A tail shorter than this ("Done.") is not an answer on its own.
+#: A text run shorter than this ("Done.") is never the answer on its own.
 _MIN_FINAL_ANSWER_CHARS = 40
+#: ... nor is one under this share of the turn's longest text run.
+_FINAL_ANSWER_SHARE = 0.5
 _RESUME_NOTICE_PREFIX = "Started a new "
 _RESUME_NOTICE_SUFFIX = "the previous context could not be resumed."
 
 
 def _final_answer_text(row: Any, full_text: str) -> str:
-    """Text after the harness's last tool call, else the full text.
+    """The harness's answer, not its narration.
 
-    A resume notice at the top of the turn stays: the parent must know the
+    The text runs of the turn (split by tool calls) are scanned for the last
+    *substantial* one, at least ``max(40, half the longest run)`` characters;
+    the answer is that run through the end, joined with blank lines. So a
+    report followed by a tool call and a short closing remark keeps the
+    report, and interim "Now reading X." lines before the answer are dropped.
+    Without tool calls, or without a substantial run, it is the full text. A
+    resume notice at the top of the turn stays: the parent must know the
     harness lost its earlier context.
     """
     segments = _row_value(row, "tool_calls")
-    if not isinstance(segments, list):
+    if not isinstance(segments, list) or not any(
+        isinstance(seg, dict) and seg.get("type") in ("tool_use", "tool_result") for seg in segments
+    ):
         return full_text
-    last_tool = -1
-    for index, segment in enumerate(segments):
-        if isinstance(segment, dict) and segment.get("type") in ("tool_use", "tool_result"):
-            last_tool = index
-    if last_tool < 0:
+    runs = [
+        text
+        for seg in segments
+        if isinstance(seg, dict) and seg.get("type") == "text"
+        for text in [str(seg.get("text") or "").strip()]
+        if text
+    ]
+    if not runs:
         return full_text
-    tail = "".join(
-        str(segment.get("text") or "")
-        for segment in segments[last_tool + 1 :]
-        if isinstance(segment, dict) and segment.get("type") == "text"
-    ).strip()
-    if len(tail) < _MIN_FINAL_ANSWER_CHARS:
+    threshold = max(_MIN_FINAL_ANSWER_CHARS, _FINAL_ANSWER_SHARE * max(len(r) for r in runs))
+    start = next((i for i in range(len(runs) - 1, -1, -1) if len(runs[i]) >= threshold), None)
+    if start is None:
         return full_text
+    answer = "\n\n".join(runs[start:])
     first = full_text.lstrip().split("\n\n", 1)[0].strip()
     if (
         first.startswith(_RESUME_NOTICE_PREFIX)
         and first.endswith(_RESUME_NOTICE_SUFFIX)
-        and not tail.startswith(first)
+        and not answer.startswith(first)
     ):
-        return f"{first}\n\n{tail}"
-    return tail
+        return f"{first}\n\n{answer}"
+    return answer
 
 
 def _result_payload(text: str, *, source_role: str | None = None) -> dict[str, Any]:
@@ -583,6 +651,11 @@ async def _build_terminal_group_payloads(
         stats = _stats_for_row(row)
         if stats:
             payload["stats"] = stats
+        payload.update(
+            _user_stop_fields(
+                row, status=payload.get("status"), cancel_source=_task_cancel_source(task_row)
+            )
+        )
         agent_id = _row_value(row, "agent_id")
         if "agent_id" not in payload and isinstance(agent_id, str) and agent_id:
             payload["agent_id"] = agent_id
@@ -903,6 +976,10 @@ def _format_parent_wake_message(
         stats = payload.get("stats")
         if isinstance(stats, str) and stats:
             lines.append(f"Stats: {stats}")
+        stop_message = payload.get("terminal_message")
+        if payload.get("stopped_by") == "user" and isinstance(stop_message, str) and stop_message:
+            lines.append("stopped_by=user")
+            lines.append(stop_message)
         lines.extend(
             [
                 "<untrusted_subagent_result>",
@@ -910,13 +987,16 @@ def _format_parent_wake_message(
                 "</untrusted_subagent_result>",
             ]
         )
-    lines.extend(
-        [
-            "",
-            "Synthesize these completed subagent results for the user. "
-            "Mention failed or timed-out children explicitly.",
-        ]
+    closing = (
+        "Synthesize these completed subagent results for the user. "
+        "Mention failed or timed-out children explicitly."
     )
+    if any(payload.get("stopped_by") == "user" for payload in payloads):
+        closing += (
+            " The user stopped a run marked stopped_by=user: do not start it again; say what "
+            "it did before it stopped and ask the user how to continue."
+        )
+    lines.extend(["", closing])
     return "\n".join(lines)
 
 

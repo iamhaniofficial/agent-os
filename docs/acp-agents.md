@@ -150,10 +150,21 @@ parent's system message) also carries `runtime: "acp"`, `acp_agent`,
 object (`duration_ms`, `input_tokens`, `output_tokens`, `total_tokens`,
 `cost_usd`, `tool_calls`; `null` when the harness did not report a value).
 Other subagent completions carry `runtime: "subagent"`. The completion's
-`result.text` is the harness's final answer: the text after its last tool
-call (the whole text when that part is only a line or two); the narration in
-between stays in the child transcript, where text runs separated by a tool
-call are separate paragraphs.
+`result.text` is the harness's final answer: the text runs of the turn (split
+by tool calls) from the last substantial one (at least 40 characters and half
+the longest run) to the end, so interim "Now reading X." lines are dropped
+and a report followed by a tool call and a closing remark is kept; the whole
+text when no run qualifies. The child transcript keeps everything, with text
+runs separated by a tool call as separate paragraphs. `sessions_history` on
+an ACP child clips each tool input and result to 500 characters (`[…N
+chars]`) so the harness's own text is not lost to truncation.
+
+When the user stops a run (the card or bar Stop, `acp.cancel`, the child
+chat's Stop, `subagents kill`), the completion carries `stopped_by: "user"`
+and a `terminal_message` that the parent's wake shows as well: "The user
+stopped this Claude Code run after N tool calls (m:ss). Do not restart it;
+tell the user what was done so far and ask how to continue." A parent's
+`steer` replaces the turn and is not reported as a stop.
 
 To continue a child, `sessions_send` to its key: `followup` queues the text
 as the next turn, `steer` cancels the running turn and sends the new text.
@@ -171,7 +182,9 @@ ended. Start a new chat to continue.") and sent as the normal `error` event,
 whose `error_message` carries the agent-facing detail (spawn a new one,
 `resume_session_id=...`). `subagents` lists ACP
 children with `runtime: "acp"`, `acp_idle` (finished, takes follow-ups) and
-`acp_closed`; `kill` cancels and closes one.
+`acp_closed`; `kill` cancels and closes one. `subagents` is a deferred tool:
+spawning a harness loads it (otherwise one `tool_search` does). `acp.cancel` and
+`acp.close` refuse a key that is not an existing ACP session.
 
 The operator-only `acp` tool (not exposed by default) offers `agents`,
 `sessions`, `status`, `cancel`, `close`, `set_mode`, `set_model` and

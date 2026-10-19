@@ -611,3 +611,168 @@ async def test_short_final_answer_falls_back_to_the_full_text(tmp_path) -> None:
         completions = await _completions(rig, 1)
         text = completions[-1]["result"]["text"]
         assert text.startswith("Now the DCA mandate dumps.") and text.endswith("Done.")
+
+
+def _stoppable_script() -> Script:
+    return Script(
+        events=[
+            AcpEvent(kind="tool_call", tool_call_id="t1", tool_kind="read", title="Read a"),
+            AcpEvent(kind="tool_call_update", tool_call_id="t1", status="completed"),
+            AcpEvent(kind="tool_call", tool_call_id="t2", tool_kind="read", title="Read b"),
+        ],
+        block=True,
+    )
+
+
+def _capture_parent_wakes(rig) -> list[str]:
+    sent: list[str] = []
+    original_send = rig.task_runtime.send
+
+    async def _capture(session_key, message, provenance=None, stream_event_sink=None):
+        if session_key == PARENT_KEY:
+            sent.append(message)
+            from types import SimpleNamespace
+
+            return SimpleNamespace(task_id="wake")
+        return await original_send(session_key, message, provenance=provenance)
+
+    rig.task_runtime.send = _capture  # type: ignore[method-assign]
+    return sent
+
+
+STOP_TEXT = (
+    "The user stopped this Claude Code run after 2 tool calls (0:00). Do not restart it; "
+    "tell the user what was done so far and ask how to continue."
+)
+
+
+async def test_user_stop_tells_the_parent_not_to_restart(tmp_path) -> None:
+    """o01ewhl3: after the user pressed Stop the parent read "The task was
+    cancelled before it finished." and spawned the same job again."""
+    from agentos.gateway import rpc_acp
+    from agentos.gateway.rpc import get_dispatcher
+    from agentos.gateway.rpc.registry import RpcContext
+
+    runtime = FakeRuntime([_stoppable_script()])
+    async with acp_rig(tmp_path, runtime) as rig:
+        sent = _capture_parent_wakes(rig)
+        out = await _spawn(task="long job", acp_agent="claude")
+        child = out["session_key"]
+        await sessions_tool.sessions_yield()
+        await asyncio.wait_for(runtime.turn_started.wait(), timeout=5)
+        await asyncio.sleep(0.02)
+        # The card / bar Stop: acp.cancel over RPC.
+        rpc_acp.set_acp_manager(rig.manager)
+        try:
+            ctx = RpcContext(
+                conn_id="desk",
+                config=rig.config,
+                session_manager=rig.sessions,
+                task_runtime=rig.task_runtime,
+            )
+            res = await get_dispatcher().dispatch("1", "acp.cancel", {"session_key": child}, ctx)
+        finally:
+            rpc_acp.set_acp_manager(None)
+        assert res.ok, res.error
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        assert await wait_until(lambda: bool(sent)), "parent was not woken"
+
+        # What the parent model reads on wake.
+        wake = sent[-1]
+        assert "stopped_by=user" in wake
+        assert STOP_TEXT in wake
+        assert "do not start it again" in wake
+        # The persisted completion and the live event say the same.
+        completions = await _completions(rig, 1)
+        assert completions[-1]["stopped_by"] == "user"
+        assert completions[-1]["terminal_message"] == STOP_TEXT
+        assert completions[-1]["cancel_source"] == "acp_rpc_cancel"
+        live = [p for _, n, p in rig.events if n == "session.event.subagent_completion"]
+        assert live[-1]["terminal_message"] == STOP_TEXT
+
+
+async def test_stop_before_the_parent_yields_still_reaches_the_wake(tmp_path) -> None:
+    """The group wake built from the session rows (parent yields after the
+    child already stopped) carries the stop too."""
+    runtime = FakeRuntime([_stoppable_script()])
+    async with acp_rig(tmp_path, runtime) as rig:
+        sent = _capture_parent_wakes(rig)
+        out = await _spawn(task="long job", acp_agent="claude")
+        await asyncio.wait_for(runtime.turn_started.wait(), timeout=5)
+        await asyncio.sleep(0.02)
+        await rig.task_runtime.cancel(
+            session_key=out["session_key"], source="agent_tool_kill", reason="kill"
+        )
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        await _completions(rig, 1)
+        await sessions_tool.sessions_yield()
+        assert await wait_until(lambda: bool(sent)), "parent was not woken"
+        assert STOP_TEXT in sent[-1]
+
+
+def test_a_parent_steer_is_not_a_user_stop() -> None:
+    from agentos.gateway.subagent_announce import _user_stop_fields
+
+    row = {"origin": {"kind": "acp", "agent_id": "claude", "last_turn": {}}}
+    assert _user_stop_fields(row, status="cancelled", cancel_source="acp_steer") == {}
+    assert _user_stop_fields(row, status="succeeded", cancel_source=None) == {}
+    fields = _user_stop_fields(row, status="cancelled", cancel_source="sessions_abort")
+    assert fields["stopped_by"] == "user"
+    assert fields["terminal_message"].startswith("The user stopped this Claude Code run.")
+    subagent = {"origin": {"kind": "subagent"}}
+    assert _user_stop_fields(subagent, status="cancelled", cancel_source=None) == {}
+
+
+async def test_report_followed_by_a_tool_and_a_remark_keeps_the_report(tmp_path) -> None:
+    """agent:main:acp:578b561b: the full report, then ToolSearch, then a short
+    meta remark; result.text was only the remark."""
+    report = "## Report\n\n" + "Finding: the ledger and the mandates agree. " * 30
+    remark = (
+        "I will not call ExitPlanMode; the full report is in the previous message, "
+        "so there is nothing left to approve."
+    )
+    script = Script(
+        events=[
+            AcpEvent(kind="tool_call", tool_call_id="r", tool_kind="read", title="Read x"),
+            AcpEvent(kind="tool_call_update", tool_call_id="r", status="completed"),
+            AcpEvent(kind="text_delta", text=report),
+            AcpEvent(kind="tool_call", tool_call_id="s", tool_kind="other", title="ToolSearch"),
+            AcpEvent(kind="tool_call_update", tool_call_id="s", status="completed"),
+            AcpEvent(kind="text_delta", text=remark),
+        ],
+        result=AcpTurnResult(stop_reason="end_turn"),
+    )
+    async with acp_rig(tmp_path, FakeRuntime([script])) as rig:
+        out = await _spawn(task="plan", acp_agent="claude", harness_mode="plan")
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        completions = await _completions(rig, 1)
+        assert completions[-1]["result"]["text"] == report.strip() + "\n\n" + remark
+
+
+async def test_sessions_history_clips_tool_bodies_of_acp_children(tmp_path) -> None:
+    big = "x" * 4000
+    script = Script(
+        events=[
+            AcpEvent(
+                kind="tool_call",
+                tool_call_id="w",
+                tool_kind="edit",
+                title="Write a.py",
+                raw_input={"file_path": "a.py", "content": big},
+            ),
+            AcpEvent(kind="tool_call_update", tool_call_id="w", status="completed", raw_output=big),
+            AcpEvent(kind="text_delta", text="The report the parent needs."),
+        ],
+        result=AcpTurnResult(stop_reason="end_turn"),
+    )
+    async with acp_rig(tmp_path, FakeRuntime([script])) as rig:
+        out = await _spawn(task="write", acp_agent="claude")
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        history = json.loads(await sessions_tool.sessions_history(out["session_key"]))
+        assistant = [m for m in history["messages"] if m["role"] == "assistant"][-1]
+        assert assistant["content"] == "The report the parent needs."
+        use = next(s for s in assistant["tool_calls"] if s["type"] == "tool_use")
+        result = next(s for s in assistant["tool_calls"] if s["type"] == "tool_result")
+        assert use["input"]["content"] == "x" * 500 + "[…3500 chars]"
+        assert result["result"].startswith("x" * 500 + "[…")
+        assert len(json.dumps(history)) < 3000

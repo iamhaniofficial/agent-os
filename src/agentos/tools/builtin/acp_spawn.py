@@ -466,7 +466,21 @@ async def spawn_acp_session(
             "base_ref": worktree_info["base_ref"],
         }
     payload["followup"] = "sessions_send(session_key, message, mode='followup'|'steer')"
+    payload["stop"] = f'subagents(action="kill", session_key="{session_key}")'
+    await _load_subagents_tool()
     return json.dumps(payload)
+
+
+async def _load_subagents_tool() -> None:
+    """Put the (deferred) ``subagents`` tool in the session that just spawned
+    a harness, so "stop it" maps to ``subagents(action="kill")``: without it a
+    parent stopped a harness by running ``agentos acp close`` in a shell."""
+    try:
+        from agentos.tools.deferred import load_for_current_session
+
+        await load_for_current_session(["subagents"])
+    except Exception:  # noqa: BLE001 - the spawn already succeeded
+        log.debug("acp.spawn.subagents_load_failed", exc_info=True)
 
 
 # --------------------------------------------------------------------------
@@ -574,6 +588,56 @@ async def send_to_acp_session(
             "mode": send_mode,
         }
     )
+
+
+#: Longest tool input value / tool result kept per segment in ``sessions_history``.
+HISTORY_TOOL_BODY_CHARS = 500
+
+
+def _clip(text: str, limit: int = HISTORY_TOOL_BODY_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}[…{len(text) - limit} chars]"
+
+
+def _clip_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _clip(value)
+    if isinstance(value, dict):
+        return {k: _clip_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clip_value(v) for v in value]
+    return value
+
+
+def compact_acp_history(messages: list[Any]) -> list[Any]:
+    """``sessions_history`` rows of an ACP child with tool bodies clipped.
+
+    A harness turn carries dozens of tool calls with results up to 4k chars
+    each; a parent reading the child's history got an 83k-char result that
+    was cut before the assistant's report and concluded the history was
+    unavailable. Tool inputs and results keep their first
+    :data:`HISTORY_TOOL_BODY_CHARS` characters plus a ``[…N chars]`` marker;
+    message text is untouched.
+    """
+    out: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get("tool_calls"), list):
+            out.append(message)
+            continue
+        segments: list[Any] = []
+        for segment in message["tool_calls"]:
+            if not isinstance(segment, dict):
+                segments.append(segment)
+                continue
+            segment = dict(segment)
+            if segment.get("type") == "tool_result" and isinstance(segment.get("result"), str):
+                segment["result"] = _clip(segment["result"])
+            elif segment.get("type") == "tool_use" and "input" in segment:
+                segment["input"] = _clip_value(segment["input"])
+            segments.append(segment)
+        out.append({**message, "tool_calls": segments})
+    return out
 
 
 def row_is_acp(row: Any) -> bool:

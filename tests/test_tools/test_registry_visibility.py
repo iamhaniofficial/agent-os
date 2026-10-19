@@ -83,7 +83,7 @@ def test_default_registry_removes_obsolete_wrapper_tools_but_keeps_canonical_too
     assert registry.get("subagents") is not None
 
 
-def test_default_schema_keeps_canonical_tools_and_subagents_stays_explicit_only() -> None:
+def test_default_schema_keeps_canonical_tools_and_subagents_is_deferred() -> None:
     import agentos.tools.builtin  # noqa: F401
     from agentos.tools.registry import get_default_registry
 
@@ -92,8 +92,12 @@ def test_default_schema_keeps_canonical_tools_and_subagents_stays_explicit_only(
 
     default_names = {tool.name for tool in registry.to_tool_definitions(agent_ctx)}
     assert {"image_generate", "sessions_spawn", "sessions_send"} <= default_names
-    assert "subagents" not in default_names
     assert "create_pptx" not in default_names
+    # subagents is on the surface but deferred: one tool_search (or an ACP
+    # spawn) loads it; it is not on every request.
+    assert "subagents" in default_names
+    request_names = {tool.name for tool in registry.request_tool_definitions(agent_ctx)}
+    assert "subagents" not in request_names
 
     surfaced_ctx = ToolContext(
                 caller_kind=CallerKind.AGENT,
