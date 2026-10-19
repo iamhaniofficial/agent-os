@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- The Bankr mark now sits on Bankr's purple tile (the square app icon) wherever
+  it appears: the Skills page's Bankr tab and catalog cards, the desktop Skills
+  panel, and the Bankr LLM Gateway provider tile in desktop Settings and the
+  setup wizard, which now fills its plate edge to edge.
+
 ## [2026.10.16] - 2026-10-16
 
 ### Added
