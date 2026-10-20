@@ -550,6 +550,8 @@ async def send_to_acp_session(
                 task_id = _field(row, "task_id")
                 if isinstance(task_id, str):
                     active_ids.append(task_id)
+        if active_ids or manager.is_turn_active(session_key):
+            manager.note_stop(session_key, "agent")
         if active_ids:
             superseded = list(origin.get("superseded_task_ids") or []) + active_ids
             origin["superseded_task_ids"] = superseded[-_SUPERSEDED_KEEP:]
@@ -694,11 +696,13 @@ async def acp_subagent_action(
         runtime = sessions_tool._get_task_runtime()
     except ToolError:
         runtime = None
+    manager = get_acp_manager()
+    if manager is not None:
+        manager.note_stop(session_key, "agent")
     if runtime is not None:
         await runtime.cancel(
             session_key=session_key, source="agent_tool_kill", reason="agent_tool_kill"
         )
-    manager = get_acp_manager()
     if manager is not None:
         await manager.close(session_key, reason="agent_tool_kill")
     else:

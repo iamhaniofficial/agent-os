@@ -142,3 +142,78 @@ async def test_list_does_not_repeat_a_child_that_straddles_a_page_boundary(_inst
     # page two.
     assert listed.count("subagent:c050") == 1
     assert len(listed) == len(set(listed))
+
+
+def _rich_row(index: int) -> dict[str, Any]:
+    """A real session row: origin carries the child's whole grounded task."""
+    return {
+        "session_key": f"agent:research:subagent:{index:08x}",
+        "spawned_by": PARENT,
+        "status": "done" if index else "running",
+        "agent_id": "research",
+        "label": None,
+        "display_name": f"Research the market for widget {index} in detail",
+        "started_at": 1_760_000_000_000 + index,
+        "ended_at": None,
+        "updated_at": index,
+        "model": "some/model",
+        "origin": {
+            "kind": "subagent",
+            "parent_session_key": PARENT,
+            "task": f"Find every supplier of widget {index}. " * 20,
+            "execution_task": "You are a subagent. " * 300,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_rows_are_compact_and_survive_the_transcript_cap(_install) -> None:
+    """``subagents(list)`` came back as ``"subagents": []`` with
+    ``result_truncated``: each raw row was ~2 kB and the 2,000-char transcript
+    cap dropped them all."""
+    from agentos.engine.runtime import _persisted_tool_result_segment
+    from agentos.engine.types import ToolResultEvent
+
+    _install(_SqliteLikeSessionManager([_rich_row(i) for i in range(5)]))
+    token = current_tool_context.set(
+        ToolContext(caller_kind=CallerKind.AGENT, session_key=PARENT, agent_id="main")
+    )
+    try:
+        raw = await agents_tool.subagents("list")
+    finally:
+        current_tool_context.reset(token)
+    payload = json.loads(raw)
+    assert payload["total"] == 5
+    first = payload["subagents"][0]
+    assert first["status"] == "running"  # active children first
+    assert set(first) <= {
+        "session_key",
+        "runtime",
+        "status",
+        "agent_id",
+        "label",
+        "started_at",
+        "ended_at",
+        "task",
+    }
+    assert len(first["task"]) <= 80 and "execution_task" not in raw
+    assert len(raw) < 2000  # a normal list fits whole
+
+    # A long list is cut from the end, never to nothing.
+    _install(_SqliteLikeSessionManager([_rich_row(i) for i in range(40)]))
+    token = current_tool_context.set(
+        ToolContext(caller_kind=CallerKind.AGENT, session_key=PARENT, agent_id="main")
+    )
+    try:
+        long_raw = await agents_tool.subagents("list")
+    finally:
+        current_tool_context.reset(token)
+    assert len(long_raw) > 2000
+    segment = _persisted_tool_result_segment(
+        ToolResultEvent(tool_use_id="t", tool_name="subagents", result=long_raw),
+        max_chars=2000,
+    )
+    kept = json.loads(segment["result"])
+    assert segment["result_truncated"] is True
+    assert kept["subagents"], "the transcript cap must not empty the list"
+    assert kept["total"] == 40

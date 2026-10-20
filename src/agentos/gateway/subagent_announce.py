@@ -134,7 +134,7 @@ async def announce_subagent_completion(
         if child_row is not None:
             payload.update(_child_runtime_fields(child_row))
             payload.update(
-                _user_stop_fields(
+                _stop_fields(
                     child_row, status=payload.get("status"), cancel_source=event.cancel_source
                 )
             )
@@ -175,6 +175,10 @@ async def announce_subagent_completion(
         await _announce_to_parent_channel(payload, parent=parent, channel_manager=channel_manager)
 
     if task_runtime is not None and parent_wake_payloads:
+        if _only_agent_stops(parent_wake_payloads):
+            # The parent stopped this child itself and already answered in
+            # that turn; waking it again made it reply twice.
+            return
         await _send_parent_wake(
             event.parent_session_key,
             parent_task_id,
@@ -310,6 +314,8 @@ async def close_subagent_spawn_group(
             parent_task_id=parent_task_id,
             pending_count=0,
         )
+    if _only_agent_stops(payloads):
+        return False  # the parent stopped them itself: nothing to wake it for
     await _send_parent_wake(
         parent_session_key,
         parent_task_id,
@@ -396,6 +402,8 @@ def _child_runtime_fields(row: Any) -> dict[str, Any]:
 
 #: Cancel sources that mean the parent replaced the turn (a steer), not a stop.
 _PARENT_STEER_CANCEL_SOURCES = frozenset({"acp_steer"})
+#: Cancel sources that are the parent agent stopping its own child.
+_AGENT_STOP_CANCEL_SOURCES = frozenset({"agent_tool_kill", "acp_tool_cancel", "acp_tool_close"})
 
 
 def _task_cancel_source(task_row: Any) -> str | None:
@@ -409,15 +417,17 @@ def _task_cancel_source(task_row: Any) -> str | None:
     return source if isinstance(source, str) and source else None
 
 
-def _user_stop_fields(row: Any, *, status: Any, cancel_source: str | None) -> dict[str, Any]:
-    """For an ACP run the user (or an operator) stopped: ``stopped_by`` and a
-    ``terminal_message`` that tells the parent not to start it again.
+def _stop_fields(row: Any, *, status: Any, cancel_source: str | None) -> dict[str, Any]:
+    """For a stopped ACP run: who stopped it, what the parent must do, and a
+    line for the person reading the chat.
 
-    A stop comes from the card or bar Stop (``acp.cancel``), ``acp close``,
-    the child chat's Stop, or ``subagents kill``; a parent's steer replaces
-    the turn instead (and is not announced at all). Live testing showed a
-    parent reading the generic "The task was cancelled before it finished."
-    and rerunning the same job right after the user stopped it.
+    ``stopped_by`` is ``"user"`` for the card or bar Stop (``acp.cancel``),
+    ``acp close``, the child chat's Stop; ``"agent"`` when the parent stopped
+    its own child (``subagents kill``). ``terminal_message`` is for the parent
+    model (live testing showed a parent reading the generic "The task was
+    cancelled before it finished." and rerunning the same job after the user
+    stopped it); ``user_message`` is for the UI. A parent's steer replaces
+    the turn instead and is not announced at all.
     """
     if str(getattr(status, "value", status) or "") != "cancelled":
         return {}
@@ -439,11 +449,29 @@ def _user_stop_fields(row: Any, *, status: Any, cancel_source: str | None) -> di
         )
     else:
         when = ""  # stopped before the turn ran: no numbers of its own
-    message = (
-        f"The user stopped this {name} run{when}. Do not restart it; tell the user what was "
-        "done so far and ask how to continue."
-    )
-    return {"stopped_by": "user", "terminal_message": message}
+    if cancel_source in _AGENT_STOP_CANCEL_SOURCES:
+        return {
+            "stopped_by": "agent",
+            "terminal_message": (
+                f"You stopped this {name} run{when}. It will not report back; start it again "
+                "only if the user asks."
+            ),
+            "user_message": f"Stopped by the agent{when}.",
+        }
+    return {
+        "stopped_by": "user",
+        "terminal_message": (
+            f"The user stopped this {name} run{when}. Do not restart it; tell the user what "
+            "was done so far and ask how to continue."
+        ),
+        "user_message": f"You stopped this {name} run{when}.",
+    }
+
+
+def _only_agent_stops(payloads: list[dict[str, Any]] | None) -> bool:
+    """Nothing to wake the parent for: it stopped these children itself and
+    already answered in the turn that did it."""
+    return bool(payloads) and all(p.get("stopped_by") == "agent" for p in payloads or [])
 
 
 def _stats_for_row(row: Any) -> str | None:
@@ -652,7 +680,7 @@ async def _build_terminal_group_payloads(
         if stats:
             payload["stats"] = stats
         payload.update(
-            _user_stop_fields(
+            _stop_fields(
                 row, status=payload.get("status"), cancel_source=_task_cancel_source(task_row)
             )
         )
@@ -977,8 +1005,9 @@ def _format_parent_wake_message(
         if isinstance(stats, str) and stats:
             lines.append(f"Stats: {stats}")
         stop_message = payload.get("terminal_message")
-        if payload.get("stopped_by") == "user" and isinstance(stop_message, str) and stop_message:
-            lines.append("stopped_by=user")
+        stopped_by = payload.get("stopped_by")
+        if stopped_by in ("user", "agent") and isinstance(stop_message, str) and stop_message:
+            lines.append(f"stopped_by={stopped_by}")
             lines.append(stop_message)
         lines.extend(
             [

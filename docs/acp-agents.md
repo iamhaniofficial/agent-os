@@ -159,12 +159,19 @@ runs separated by a tool call as separate paragraphs. `sessions_history` on
 an ACP child clips each tool input and result to 500 characters (`[…N
 chars]`) so the harness's own text is not lost to truncation.
 
-When the user stops a run (the card or bar Stop, `acp.cancel`, the child
-chat's Stop, `subagents kill`), the completion carries `stopped_by: "user"`
-and a `terminal_message` that the parent's wake shows as well: "The user
+When the user stops a run (the card or bar Stop, `acp.cancel`, `acp close`,
+the child chat's Stop), the completion carries `stopped_by: "user"`, a
+`terminal_message` for the parent that its wake shows as well ("The user
 stopped this Claude Code run after N tool calls (m:ss). Do not restart it;
-tell the user what was done so far and ask how to continue." A parent's
-`steer` replaces the turn and is not reported as a stop.
+tell the user what was done so far and ask how to continue.") and a
+`user_message` for the chat ("You stopped this Claude Code run after N tool
+calls (m:ss)."). When the parent stops its own child (`subagents kill`), the
+completion says `stopped_by: "agent"` ("Stopped by the agent after ...") and
+is recorded in the parent transcript without waking the parent, which
+already answered in the turn that stopped it. A parent's `steer` replaces the
+turn and is not reported as a stop. The stopped turn's `last_turn` carries
+`stopped_by` and a `summary` ("Stopped by you after 3 tool calls (0:18).")
+instead of an error text.
 
 To continue a child, `sessions_send` to its key: `followup` queues the text
 as the next turn, `steer` cancels the running turn and sends the new text.

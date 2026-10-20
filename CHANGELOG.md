@@ -71,6 +71,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   wiped by the history resync that follows it. Refusals and failed harness
   turns now log `acp.dispatch.turn_refused` / `acp.dispatch.turn_failed`
   and leave an `Error: ...` row in the child transcript.
+- One slow request no longer holds back the rest of its WebSocket: requests
+  on a connection are still answered in order, except `chat.suggestNext`
+  (an auxiliary model call at every turn end), `acp.doctor`,
+  `providers.probe`, `onboarding.channel.probe` and `trading.probe`, which
+  answer when ready. `chat.history`, `sessions.list` and `acp.status` sent
+  right after a turn ended waited ~4-5 s behind the suggestion.
+- `subagents(action="list")` returns one short row per child (key, runtime,
+  agent or harness, status, label, times, an 80-character task preview),
+  running children first, with a `total`; a list that used to fill 8 kB with
+  each child's full grounded task was emptied by the transcript cap.
+- A stopped ACP run carries a user-facing `user_message` in its completion
+  ("You stopped this Claude Code run after 21 tool calls (1:00)." / "Stopped
+  by the agent after ..."), and its `last_turn` a `stopped_by` and `summary`
+  instead of the agent-facing "cancelled by an operator" error text.
+- A parent that stops its own ACP child (`subagents kill`) gets the completion
+  recorded but is no longer woken by it, so it does not answer twice.
+- An ACP turn whose prompt is with the harness but has no event yet shows
+  "Waiting for Claude Code…" instead of "Starting Claude Code…".
 
 ## [2026.10.16] - 2026-10-16
 

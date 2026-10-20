@@ -240,6 +240,10 @@ async def acp(
             info = await manager.status(session_key)
             info["session_status"] = getattr(row, "status", None)
             return json.dumps({"action": "status", **info}, default=str)
+        if action in ("cancel", "close"):
+            # An agent calling this tool stops its own harness; an operator
+            # surface (no tool context) speaks for the user.
+            manager.note_stop(session_key, "agent" if current_tool_context.get() else "user")
         if action == "cancel":
             cancelled_tasks = 0
             try:

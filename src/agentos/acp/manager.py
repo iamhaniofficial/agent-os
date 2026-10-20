@@ -118,6 +118,8 @@ class _SessionState:
     #: Last known row ``origin`` and ``status`` (for a ``status`` that cannot wait).
     row_origin: dict[str, Any] | None = None
     row_status: Any = None
+    #: Who asked to stop the running turn ("user" / "agent"), if anyone said.
+    stop_by: str | None = None
     #: This turn's harness tool calls: id -> (title, kind, raw_input, tool name).
     turn_tools: dict[str, tuple[str | None, str | None, dict[str, Any] | None, str | None]] = field(
         default_factory=dict
@@ -156,6 +158,12 @@ def origin_is_closed(origin: Mapping[str, Any] | None, *, session_status: Any = 
 def starting_label(agent_id: str | None) -> str:
     """``activity`` while the harness process starts ("Starting Claude Code…")."""
     return f"Starting {agent_display_name(agent_id) or 'the harness'}…"
+
+
+def waiting_label(agent_id: str | None) -> str:
+    """``activity`` once the prompt is with the harness and nothing came back
+    yet ("Waiting for Claude Code…"): the process is up, the model is slow."""
+    return f"Waiting for {agent_display_name(agent_id) or 'the harness'}…"
 
 
 def resume_notice(agent_id: str | None) -> str:
@@ -592,10 +600,23 @@ class AcpSessionManager:
             return
         self._reset_activity(state)
         state.idle = False
+        state.stop_by = None
         if state.handle is None:
             state.activity = starting_label(
                 agent_id or (state.spec.agent_id if state.spec is not None else None)
             )
+
+    def note_stop(self, session_key: str, by: str) -> None:
+        """Record who is stopping this session's turn ("user" or "agent") just
+        before the cancel, so the turn's ``last_turn`` can say so."""
+        self._state_for(session_key).stop_by = by
+
+    def take_stop_note(self, session_key: str) -> str | None:
+        state = self._states.get(session_key)
+        if state is None:
+            return None
+        by, state.stop_by = state.stop_by, None
+        return by
 
     @staticmethod
     def _reset_activity(state: _SessionState) -> None:
@@ -702,6 +723,10 @@ class AcpSessionManager:
                     await asyncio.shield(self._finish_oneshot(state))
                 raise
             state.active_turn = turn
+            if state.activity_kind is None:
+                # Harness up and prompt sent; "Starting..." until the first
+                # event read as a hang when the model took a minute to answer.
+                state.activity = waiting_label(spec.agent_id)
             log.info(
                 "acp.manager.turn_start",
                 session_key=session_key,

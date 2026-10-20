@@ -553,3 +553,18 @@ async def test_status_reflects_a_close_without_a_new_read(sessions) -> None:
     await manager.status(key)  # warms the row cache
     await manager.close(key)
     assert (await manager.status(key))["closed"] is True
+
+
+async def test_activity_says_waiting_once_the_prompt_is_sent(sessions) -> None:
+    """agent:main:acp:0d499dc5: the resumed harness was up and the prompt sent,
+    but the model took over a minute; the bar still said "Starting"."""
+    key = "agent:main:acp:aaaa0023"
+    await _acp_row(sessions, key, mode="oneshot")
+    runtime = FakeRuntime([Script(block=True)])
+    manager = _manager(runtime, sessions)
+    task = asyncio.create_task(manager.run_turn(key, "go"))
+    await asyncio.wait_for(runtime.turn_started.wait(), timeout=2)
+    await asyncio.sleep(0.01)
+    assert manager.list_sessions()[0]["activity"] == "Waiting for Claude Code…"
+    runtime.release.set()
+    await task
