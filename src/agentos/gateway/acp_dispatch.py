@@ -184,6 +184,7 @@ async def _persist_turn(
     error_row: bool = True,
     row_text: str | None = None,
     note: str | None = None,
+    stopped_by: str | None = None,
 ) -> float | None:
     """:func:`_write_turn` under the manager's row guard (when there is one),
     so an operator ``close`` racing a stopped turn cannot lose its write."""
@@ -197,6 +198,7 @@ async def _persist_turn(
         "error_row": error_row,
         "row_text": row_text,
         "note": note,
+        "stopped_by": stopped_by,
         "remember": getattr(manager, "remember_row", None),
     }
     guard = getattr(manager, "row_guard", None)
@@ -217,6 +219,7 @@ async def _write_turn(
     error_row: bool = True,
     row_text: str | None = None,
     note: str | None = None,
+    stopped_by: str | None = None,
     remember: Any = None,
 ) -> float | None:
     """Write transcript rows, usage totals and ``origin.last_turn``.
@@ -261,6 +264,7 @@ async def _write_turn(
         error_code=error_code,
         tool_calls=projector.tool_calls if result is None else None,
         stop_reason="cancelled" if error_code == CANCELLED_CODE else None,
+        stopped_by=stopped_by if error_code == CANCELLED_CODE else None,
     )
     fields: dict[str, Any] = {"origin": origin}
     if result is not None:
@@ -454,6 +458,7 @@ async def _projected_turn_stream(
                         error=_cancelled_error(),
                         error_row=False,
                         note=cancel_note(projector.tool_calls, duration_ms),
+                        stopped_by=manager.take_stop_note(session_key) or "user",
                     )
                 )
 
@@ -501,6 +506,7 @@ async def _projected_turn_stream(
             # A stop the user (or parent) asked for is not a failure to report.
             error_row=False,
             note=cancel_note(projector.tool_calls, duration_ms),
+            stopped_by=manager.take_stop_note(session_key) or "user",
         )
         yield error_event(cancelled)
         return

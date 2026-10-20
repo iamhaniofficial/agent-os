@@ -215,6 +215,13 @@ async def _require_acp_session(ctx: RpcContext, manager: Any, key: str) -> None:
         raise RpcHandlerError("ACP_SESSION_INVALID", f"Session {key} is not an ACP session")
 
 
+def _note_user_stop(manager: Any, key: str) -> None:
+    """The desktop / web Stop and Close come from the person at the screen."""
+    note = getattr(manager, "note_stop", None)
+    if callable(note):
+        note(key, "user")
+
+
 async def _cancel_session_tasks(ctx: RpcContext, key: str, *, source: str) -> int:
     """Cancel the session's queued/running task-runtime turns (a harness that
     is still starting has no ACP turn to cancel yet)."""
@@ -236,6 +243,7 @@ async def _handle_acp_cancel(params: dict | None, ctx: RpcContext) -> dict[str, 
     manager = _require_manager(ctx)
     await _require_acp_session(ctx, manager, key)
     reason = str(p.get("reason") or "operator")
+    _note_user_stop(manager, key)
     cancelled_tasks = await _cancel_session_tasks(ctx, key, source="acp_rpc_cancel")
     try:
         result = await _call_with_optional_kw(manager.cancel, key, reason=reason)
@@ -257,6 +265,7 @@ async def _handle_acp_close(params: dict | None, ctx: RpcContext) -> dict[str, A
     manager = _require_manager(ctx)
     discard = bool(p.get("discard", False))
     await _require_acp_session(ctx, manager, key)
+    _note_user_stop(manager, key)
     await _cancel_session_tasks(ctx, key, source="acp_rpc_close")
     try:
         result = await _call_with_optional_kw(manager.close, key, discard=discard)

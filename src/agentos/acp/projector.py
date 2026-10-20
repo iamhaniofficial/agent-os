@@ -528,6 +528,7 @@ def last_turn_record(
     error_code: str | None = None,
     tool_calls: int | None = None,
     stop_reason: str | None = None,
+    stopped_by: str | None = None,
 ) -> dict[str, Any]:
     """The ``origin["last_turn"]`` entry the announce ``Stats:`` line reads.
 
@@ -558,11 +559,24 @@ def last_turn_record(
         )
     if turn_cost is not None:
         record["cost_usd"] = round(float(turn_cost), 6)
-    if error:
+    if stopped_by:
+        # A stop is not a failure: no agent-facing error text, a summary the
+        # UIs can show as it is ("Stopped by you after 3 tool calls (0:18).").
+        record["stopped_by"] = stopped_by
+        record["summary"] = stop_summary(
+            stopped_by, record["tool_calls"], format_clock(record["duration_ms"])
+        )
+    elif error:
         record["error"] = error[:500]
     if error_code:
         record["error_code"] = error_code
     return record
+
+
+def stop_summary(stopped_by: str, tool_calls: int, clock: str) -> str:
+    """User-facing line for a stopped turn: "Stopped by you after 3 tool calls (0:18)."."""
+    who = "you" if stopped_by == "user" else "the agent"
+    return f"Stopped by {who} {tool_calls_phrase(tool_calls, clock)}."
 
 
 def _format_duration(ms: int) -> str:

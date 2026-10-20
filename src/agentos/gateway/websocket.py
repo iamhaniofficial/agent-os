@@ -846,6 +846,43 @@ async def handle_ws_connection(
         log.info("ws.disconnected", conn_id=conn_id)
 
 
+#: Methods answered off the connection's request loop. Requests on one
+#: connection are otherwise handled strictly in order (``chat.send`` before
+#: ``sessions.abort``, ``subscribe`` before the history read, ``reset`` before
+#: the next send), and clients rely on that. These handlers wait seconds on a
+#: model or the network, and neither write state nor read anything a later
+#: request on the same connection depends on, so they run concurrently and
+#: their response goes out when it is ready (frames carry the request id).
+#: ``chat.suggestNext`` -- an auxiliary model call at every turn end -- held
+#: back ``chat.history``, ``sessions.list`` and ``acp.status`` by ~5 s.
+DETACHED_METHODS: frozenset[str] = frozenset(
+    {
+        "chat.suggestNext",
+        "acp.doctor",
+        "providers.probe",
+        "onboarding.channel.probe",
+        "trading.probe",
+    }
+)
+#: At most this many detached requests per connection; more run in order.
+MAX_DETACHED_PER_CONNECTION = 8
+
+
+async def _dispatch_and_send(
+    conn: WsConnection,
+    dispatcher: RpcDispatcher,
+    req_id: str,
+    method: str,
+    params: Any,
+    ctx: RpcContext,
+) -> None:
+    res = await dispatcher.dispatch(req_id, method, params, ctx)
+    try:
+        await conn.send_res(res)
+    except Exception:  # noqa: BLE001 - the client may be gone by now
+        log.debug("ws.detached_send_failed", conn_id=conn.conn_id, method=method, exc_info=True)
+
+
 async def _tick_loop(conn: WsConnection, tick_interval_ms: int) -> None:
     interval_s = max(1.0, tick_interval_ms / 1000)
     while True:
@@ -878,6 +915,59 @@ async def _message_loop(
     memory_managers: dict[str, Any] | None = None,
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
+) -> None:
+    detached: set[asyncio.Task[None]] = set()
+    try:
+        await _receive_loop(
+            conn,
+            config,
+            dispatcher,
+            detached,
+            session_manager,
+            provider_selector,
+            tool_registry,
+            subscription_manager,
+            channel_manager,
+            usage_tracker,
+            skill_loader,
+            cron_scheduler,
+            turn_runner,
+            task_runtime,
+            heartbeat_service,
+            heartbeat_loop,
+            agent_registry,
+            diagnostics_state,
+            memory_managers,
+            memory_stores,
+            memory_retrievers,
+        )
+    finally:
+        for task in list(detached):
+            task.cancel()
+
+
+async def _receive_loop(
+    conn: WsConnection,
+    config: GatewayConfig,
+    dispatcher: RpcDispatcher,
+    detached: set[asyncio.Task[None]],
+    session_manager: Any,
+    provider_selector: Any,
+    tool_registry: Any,
+    subscription_manager: Any,
+    channel_manager: Any,
+    usage_tracker: Any,
+    skill_loader: Any,
+    cron_scheduler: Any,
+    turn_runner: Any,
+    task_runtime: Any,
+    heartbeat_service: Any,
+    heartbeat_loop: Any,
+    agent_registry: Any,
+    diagnostics_state: Any,
+    memory_managers: dict[str, Any] | None,
+    memory_stores: dict[str, Any] | None,
+    memory_retrievers: dict[str, Any] | None,
 ) -> None:
     ws = conn.ws
     keepalive_timeout = max(0.0, float(getattr(config, "client_ws_keepalive_timeout_s", 0.0)))
@@ -944,6 +1034,14 @@ async def _message_loop(
                 memory_stores=memory_stores or {},
                 memory_retrievers=memory_retrievers or {},
             )
+            if method in DETACHED_METHODS and len(detached) < MAX_DETACHED_PER_CONNECTION:
+                task = asyncio.create_task(
+                    _dispatch_and_send(conn, dispatcher, req_id, method, params, ctx),
+                    name=f"ws-detached-{conn.conn_id}-{method}",
+                )
+                detached.add(task)
+                task.add_done_callback(detached.discard)
+                continue
             res = await dispatcher.dispatch(req_id, method, params, ctx)
             await conn.send_res(res)
         else:

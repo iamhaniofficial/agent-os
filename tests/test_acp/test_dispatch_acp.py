@@ -700,8 +700,9 @@ async def test_stop_before_the_parent_yields_still_reaches_the_wake(tmp_path) ->
         out = await _spawn(task="long job", acp_agent="claude")
         await asyncio.wait_for(runtime.turn_started.wait(), timeout=5)
         await asyncio.sleep(0.02)
+        rig.manager.note_stop(out["session_key"], "user")
         await rig.task_runtime.cancel(
-            session_key=out["session_key"], source="agent_tool_kill", reason="kill"
+            session_key=out["session_key"], source="sessions_abort", reason="stop"
         )
         await rig.task_runtime.wait(out["task_id"], timeout=5)
         await _completions(rig, 1)
@@ -711,16 +712,17 @@ async def test_stop_before_the_parent_yields_still_reaches_the_wake(tmp_path) ->
 
 
 def test_a_parent_steer_is_not_a_user_stop() -> None:
-    from agentos.gateway.subagent_announce import _user_stop_fields
+    from agentos.gateway.subagent_announce import _stop_fields
 
     row = {"origin": {"kind": "acp", "agent_id": "claude", "last_turn": {}}}
-    assert _user_stop_fields(row, status="cancelled", cancel_source="acp_steer") == {}
-    assert _user_stop_fields(row, status="succeeded", cancel_source=None) == {}
-    fields = _user_stop_fields(row, status="cancelled", cancel_source="sessions_abort")
+    assert _stop_fields(row, status="cancelled", cancel_source="acp_steer") == {}
+    assert _stop_fields(row, status="succeeded", cancel_source=None) == {}
+    fields = _stop_fields(row, status="cancelled", cancel_source="sessions_abort")
     assert fields["stopped_by"] == "user"
     assert fields["terminal_message"].startswith("The user stopped this Claude Code run.")
+    assert fields["user_message"] == "You stopped this Claude Code run."
     subagent = {"origin": {"kind": "subagent"}}
-    assert _user_stop_fields(subagent, status="cancelled", cancel_source=None) == {}
+    assert _stop_fields(subagent, status="cancelled", cancel_source=None) == {}
 
 
 async def test_report_followed_by_a_tool_and_a_remark_keeps_the_report(tmp_path) -> None:
@@ -776,3 +778,59 @@ async def test_sessions_history_clips_tool_bodies_of_acp_children(tmp_path) -> N
         assert use["input"]["content"] == "x" * 500 + "[…3500 chars]"
         assert result["result"].startswith("x" * 500 + "[…")
         assert len(json.dumps(history)) < 3000
+
+
+async def test_user_stop_has_a_user_facing_message_and_last_turn_summary(tmp_path) -> None:
+    runtime = FakeRuntime([_stoppable_script()])
+    async with acp_rig(tmp_path, runtime) as rig:
+        out = await _spawn(task="long job", acp_agent="claude")
+        child = out["session_key"]
+        await asyncio.wait_for(runtime.turn_started.wait(), timeout=5)
+        await asyncio.sleep(0.02)
+        rig.manager.note_stop(child, "user")  # what acp.cancel records first
+        await rig.task_runtime.cancel(session_key=child, source="acp_rpc_cancel", reason="x")
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        completions = await _completions(rig, 1)
+        assert completions[-1]["user_message"] == (
+            "You stopped this Claude Code run after 2 tool calls (0:00)."
+        )
+        assert completions[-1]["terminal_message"] == STOP_TEXT  # still for the parent
+        last_turn = (await rig.sessions.get_session(child)).origin["last_turn"]
+        assert last_turn["stopped_by"] == "user"
+        assert last_turn["summary"] == "Stopped by you after 2 tool calls (0:00)."
+        assert "error" not in last_turn  # no "cancelled by an operator..." text
+        assert last_turn["error_code"] == "ACP_TURN_CANCELLED"
+        status = await rig.manager.status(child)
+        assert status["last_turn"]["summary"] == "Stopped by you after 2 tool calls (0:00)."
+
+
+async def test_parent_kill_is_recorded_but_does_not_wake_the_parent(tmp_path) -> None:
+    """The parent killed its child, answered in that turn, then answered again
+    when the cancelled completion woke it."""
+    from agentos.tools.builtin import agents as agents_tool
+
+    runtime = FakeRuntime([_stoppable_script()])
+    async with acp_rig(tmp_path, runtime) as rig:
+        sent = _capture_parent_wakes(rig)
+        out = await _spawn(task="long job", acp_agent="claude")
+        child = out["session_key"]
+        await sessions_tool.sessions_yield()
+        await asyncio.wait_for(runtime.turn_started.wait(), timeout=5)
+        await asyncio.sleep(0.02)
+        killed = json.loads(await agents_tool.subagents(action="kill", session_key=child))
+        assert killed["status"] == "killed"
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+
+        completions = await _completions(rig, 1)
+        assert completions[-1]["stopped_by"] == "agent"
+        assert completions[-1]["user_message"] == (
+            "Stopped by the agent after 2 tool calls (0:00)."
+        )
+        assert completions[-1]["terminal_message"].startswith("You stopped this Claude Code run")
+        live = [p for _, n, p in rig.events if n == "session.event.subagent_completion"]
+        assert live and live[-1]["stopped_by"] == "agent"
+        await asyncio.sleep(0.05)
+        assert sent == []  # recorded, not woken
+        last_turn = (await rig.sessions.get_session(child)).origin["last_turn"]
+        assert last_turn["stopped_by"] == "agent"
+        assert last_turn["summary"] == "Stopped by the agent after 2 tool calls (0:00)."
