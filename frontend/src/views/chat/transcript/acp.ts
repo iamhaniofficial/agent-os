@@ -497,14 +497,56 @@ function pill(outcome: AcpRunState, label: string): HTMLSpanElement {
   return p
 }
 
-function resultText(payload: Record<string, unknown>): { text: string; truncated: boolean } {
+interface ResultText {
+  text: string
+  truncated: boolean
+  /** Characters the payload carries, and the reply's full length when known. */
+  shownChars: number
+  fullChars: number | null
+}
+
+function resultText(payload: Record<string, unknown>): ResultText {
   const result = payload.result
-  if (typeof result === 'string') return { text: result.trim(), truncated: false }
-  if (result && typeof result === 'object') {
-    const r = result as { text?: unknown; truncated?: unknown }
-    return { text: text(r.text), truncated: r.truncated === true }
+  if (typeof result === 'string') {
+    return { text: result.trim(), truncated: false, shownChars: result.length, fullChars: null }
   }
-  return { text: '', truncated: false }
+  if (result && typeof result === 'object') {
+    const r = result as { text?: unknown; truncated?: unknown; full_chars?: unknown }
+    const raw = typeof r.text === 'string' ? r.text : ''
+    const full = finite(r.full_chars)
+    return {
+      text: text(r.text),
+      truncated: r.truncated === true,
+      shownChars: raw.length,
+      fullChars: full !== null && full > raw.length ? full : null,
+    }
+  }
+  return { text: '', truncated: false, shownChars: 0, fullChars: null }
+}
+
+/**
+ * The quiet line at the end of a reply the gateway cut short: how much of it
+ * this is, and the way to the rest ("Showing 12,000 of 17,116 characters —
+ * Open session for the full report"). Without a navigator it just says so.
+ */
+function buildTruncatedLine(result: ResultText, open: (() => void) | null): HTMLParagraphElement {
+  const line = el('p', 'acp-done__more')
+  const lead =
+    result.fullChars !== null
+      ? t('chat.acpTruncatedCount', { shown: result.shownChars, full: result.fullChars })
+      : t('chat.acpTruncatedPart')
+  if (!open) {
+    line.textContent = `${lead}.`
+    return line
+  }
+  line.appendChild(document.createTextNode(`${lead} — `))
+  const link = button('acp-link', 'open-full-report', t('chat.acpTruncatedOpen'))
+  link.addEventListener('click', (event) => {
+    event.preventDefault()
+    open()
+  })
+  line.appendChild(link)
+  return line
 }
 
 /** Who stopped a run, from the payload's or a turn record's `stopped_by`. */
@@ -565,7 +607,11 @@ export function completionUserLine(
 }
 
 /** Measure once laid out: a reply that fits needs no clamp. jsdom has no layout. */
-function unclampIfItFits(region: HTMLElement, toggle: HTMLButtonElement): void {
+function unclampIfItFits(
+  region: HTMLElement,
+  toggle: HTMLButtonElement,
+  onUnclamp: () => void = () => {},
+): void {
   if (typeof requestAnimationFrame !== 'function') return
   requestAnimationFrame(() => {
     const clip = region.firstElementChild as HTMLElement | null
@@ -573,6 +619,7 @@ function unclampIfItFits(region: HTMLElement, toggle: HTMLButtonElement): void {
     if (clip.scrollHeight <= clip.clientHeight + 1) {
       region.dataset.clamp = 'false'
       toggle.remove()
+      onUnclamp()
     }
   })
 }
@@ -624,7 +671,9 @@ export function buildCompletionCard(
   if (chips) card.appendChild(chips)
 
   const foot = el('div', 'acp-done__foot')
-  const { text: reply, truncated } = resultText(payload)
+  const result = resultText(payload)
+  const { text: reply, truncated } = result
+  const navigate = childKey && options.openSession ? options.openSession : null
   // Never `terminal_message`: it is written for the parent model ("…Do not
   // restart it; tell the user…"). The user reads `user_message`, or a line
   // made here from the outcome, who stopped it and the numbers.
@@ -645,10 +694,22 @@ export function buildCompletionCard(
     options.markdown.bindCopy(body)
     options.markdown.bindHighlight?.(body)
     clip.appendChild(body)
+    // A reply cut short ends on a line that says so, where the text stops.
+    const more = truncated
+      ? buildTruncatedLine(result, navigate ? () => navigate(childKey) : null)
+      : null
+    if (more) clip.appendChild(more)
     region.appendChild(clip)
     card.appendChild(region)
     const long = reply.length > CLAMP_CHARS || reply.split('\n').length > CLAMP_LINES
     region.dataset.clamp = long ? 'true' : 'false'
+    // Under the clamp the line is out of sight: out of the tab order too.
+    const setMoreReachable = (reachable: boolean) => {
+      if (!more) return
+      if (reachable) more.removeAttribute('inert')
+      else more.setAttribute('inert', '')
+    }
+    setMoreReachable(!long)
     if (long) {
       const id = nextId('acp-result')
       region.id = id
@@ -662,19 +723,18 @@ export function buildCompletionCard(
         region.dataset.expanded = expanded ? 'true' : 'false'
         toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false')
         toggle.textContent = expanded ? t('chat.acpShowLess') : t('chat.acpShowMore')
+        setMoreReachable(expanded)
       })
       foot.appendChild(toggle)
-      unclampIfItFits(region, toggle)
+      unclampIfItFits(region, toggle, () => setMoreReachable(true))
     }
-    if (truncated) card.appendChild(el('p', 'acp-done__note', t('chat.acpResultTruncated')))
   } else if (outcome === 'done') {
     card.appendChild(el('p', 'acp-done__note', t('chat.acpNoReply')))
   }
 
-  if (childKey && options.openSession) {
+  if (navigate) {
     const open = button('acp-btn', 'open-session', t('chat.acpOpenSession'))
     open.title = childKey
-    const navigate = options.openSession
     open.addEventListener('click', (event) => {
       event.preventDefault()
       navigate(childKey)

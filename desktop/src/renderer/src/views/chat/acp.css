@@ -792,6 +792,36 @@
 .acp-done__result[data-clamp='true'][data-expanded='true']::after {
   opacity: 0;
 }
+/* The end of a reply the gateway cut short: a quiet line where the text
+   stops, with the way to the rest. */
+.acp-done__more {
+  margin: 10px 0 0;
+  padding-top: 8px;
+  border-top: 1px dashed var(--hairline);
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+.msg-body .acp-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--acp-ink);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--acp-ink) 45%, transparent);
+  text-underline-offset: 2px;
+  cursor: default;
+  transition: text-decoration-color 140ms var(--acp-ease);
+}
+.msg-body .acp-link:hover {
+  text-decoration-color: currentColor;
+}
+.msg-body .acp-link:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
 .acp-done__result-text > :first-child {
   margin-top: 0;
 }

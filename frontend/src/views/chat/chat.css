@@ -596,6 +596,22 @@
 .acp-done__result-text > :last-child {
   margin-bottom: 0;
 }
+.acp-done__more {
+  margin: 8px 0 0;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  font-size: 0.72rem;
+  color: var(--muted-foreground);
+}
+.acp-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--primary);
+  text-decoration: underline;
+  cursor: pointer;
+}
 .acp-done__error {
   margin: 0;
   color: var(--danger);
