@@ -41,16 +41,25 @@ export function useNextSuggestion(
     wasBusyRef.current = busy
     const generation = ++generationRef.current
     if (busy || !wasBusy) return
-    rpc
-      .call<{ text?: string | null }>('chat.suggestNext', { sessionKey })
-      .then((res) => {
-        if (generation !== generationRef.current) return
-        const text = typeof res?.text === 'string' ? res.text.trim() : ''
-        setSuggestion(text || null)
-      })
-      .catch(() => {
-        /* no suggestion — the composer keeps its normal placeholder */
-      })
+    // Asked a beat after the turn ends, not in the same tick: the reads that
+    // say what state the chat is in (history, `sessions.resolve`, a coding
+    // harness's `acp.status`) go out first. A suggestion is a model call and
+    // can take seconds; nothing should wait behind it, on a gateway that
+    // answers one request at a time per connection least of all.
+    const timer = setTimeout(() => {
+      if (generation !== generationRef.current) return
+      rpc
+        .call<{ text?: string | null }>('chat.suggestNext', { sessionKey })
+        .then((res) => {
+          if (generation !== generationRef.current) return
+          const text = typeof res?.text === 'string' ? res.text.trim() : ''
+          setSuggestion(text || null)
+        })
+        .catch(() => {
+          /* no suggestion — the composer keeps its normal placeholder */
+        })
+    }, 0)
+    return () => clearTimeout(timer)
   }, [busy, rpc, sessionKey])
 
   const clear = useCallback(() => {

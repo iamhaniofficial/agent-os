@@ -6,6 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useConnection } from '@/stores/connection'
 import { useGateway } from '~/stores/gateway'
 import { ChatView } from './ChatView'
+import { useNextSuggestion } from '@/views/chat/useNextSuggestion'
+import type { WsRpcClient } from '@/lib/ws-rpc'
+import { lastTurnLine } from './AcpSessionBar'
 import { ACP_STATUS_POLL_MS, useAcpSession } from './useAcpSession'
 
 // A coding harness's own chat (defects 1 and 5): the session bar over the
@@ -19,6 +22,7 @@ function emit(event: string, ...args: unknown[]) {
   handlers.get(event)?.forEach((h) => h(...args))
 }
 const rpc = {
+  state: 'connected',
   waitForConnection: vi.fn(async () => {}),
   call: vi.fn(async (method: string): Promise<unknown> => {
     if (method === 'acp.status') {
@@ -185,6 +189,28 @@ describe('ACP session bar', () => {
     const detail = bar.querySelector('.acp-bar__detail')
     expect(detail).toHaveTextContent('Last turn failed: ACP session was closed')
     expect(detail).toHaveAttribute('data-tone', 'error')
+  })
+
+  // Round 4: after a user Stop the tooltip said "Last turn failed: Harness
+  // turn was cancelled by an operator or the parent agent; do not retry it".
+  it('says a stopped last turn was stopped, never that it failed', async () => {
+    status = {
+      ...base,
+      last_turn: {
+        error: 'Harness turn was cancelled by an operator or the parent agent; do not retry it',
+        error_code: 'ACP_CANCELLED',
+        stop_reason: 'cancelled',
+        stopped_by: 'user',
+      },
+    }
+    mount()
+    const bar = await screen.findByTestId('acp-bar')
+    const detail = bar.querySelector('.acp-bar__detail')!
+    expect(detail).toHaveTextContent('Stopped by you')
+    expect(detail).not.toHaveAttribute('data-tone')
+    const tip = bar.querySelector('.acp-bar__status')!.getAttribute('title') || ''
+    expect(tip).toBe('Idle · Stopped by you')
+    expect(bar.textContent).not.toMatch(/failed|do not retry/i)
   })
 
   it('shows Closed and switches the composer off with the reason', async () => {
@@ -394,5 +420,59 @@ describe('useAcpSession state', () => {
     status = { ...base, active_turn: true, activity: 'Run pytest -q' }
     await tick()
     expect(result.current.activity).toBe('Run pytest -q')
+  })
+
+  // Round 4: after a turn the composer asks `chat.suggestNext` (a model call
+  // of a few seconds). On a gateway that answers one request at a time per
+  // connection, a status read sent after it waited behind it: the bar said
+  // Working for seconds after the harness was done.
+  it("reads the harness's status before the composer asks for a suggestion", async () => {
+    status = { ...base, active_turn: true }
+    const { rerender } = renderHook(
+      ({ running }) => {
+        useAcpSession(KEY, running)
+        useNextSuggestion(rpc as unknown as WsRpcClient, KEY, running)
+      },
+      { initialProps: { running: true } },
+    )
+    await settle()
+    rpc.call.mockClear()
+    status = { ...base }
+    rerender({ running: false })
+    await settle()
+    const order = rpc.call.mock.calls
+      .map((c) => c[0])
+      .filter((m) => m === 'acp.status' || m === 'chat.suggestNext')
+    // The status read goes out first, in the turn's own tick; the suggestion
+    // a beat later.
+    expect(order[0]).toBe('acp.status')
+    expect(order.indexOf('chat.suggestNext')).toBeGreaterThan(0)
+  })
+})
+
+describe('lastTurnLine', () => {
+  it('reads a stop as a stop, the summary first, and only a real error as a failure', () => {
+    const parentText = 'cancelled by an operator or the parent agent; do not retry it'
+    expect(lastTurnLine({ stopped_by: 'user', error: parentText })).toEqual({
+      text: 'Stopped by you',
+      tone: '',
+    })
+    expect(
+      lastTurnLine({ stopped_by: 'user', summary: 'You stopped it after 21 tool calls (1:00).' }),
+    ).toEqual({ text: 'You stopped it after 21 tool calls (1:00).', tone: '' })
+    expect(lastTurnLine({ stopped_by: 'agent' })).toEqual({
+      text: 'Stopped by the agent',
+      tone: '',
+    })
+    expect(lastTurnLine({ error: parentText, error_code: 'ACP_CANCELLED' })).toEqual({
+      text: 'Stopped',
+      tone: '',
+    })
+    expect(lastTurnLine({ error: 'harness exited (code 1)' })).toEqual({
+      text: 'Last turn failed: harness exited (code 1)',
+      tone: 'error',
+    })
+    expect(lastTurnLine({ stop_reason: 'end_turn' })).toBeNull()
+    expect(lastTurnLine(null)).toBeNull()
   })
 })

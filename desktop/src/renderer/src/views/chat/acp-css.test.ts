@@ -283,6 +283,20 @@ describe('desktop ACP skin at narrow widths', () => {
     expect(rule('.acp-done__head > .acp-pill')).toMatch(/flex-shrink: 0;/)
     expect(rule('.acp-done__head > .acp-done__titles')).toMatch(/flex: 1 1 \d+rem;/)
     expect(bare).toMatch(/\n\.acp-done__title \{\s*white-space: normal;/)
+    // A running step keeps a readable floor or leaves whole ("R 12 tool
+    // calls 1:07" at 640 px): the status row is its own size container.
+    expect(rule('.acp-run__status')).toMatch(/container: acp-run-status \/ inline-size;/)
+    expect(rule(".acp-run[data-state='running'] .acp-run__activity")).toMatch(/min-width: \d+rem;/)
+    const hideStep = bare.match(
+      /@container acp-run-status \(width < (\d+)px\) \{\s*\.acp-run\[data-state='running'\] \.acp-run__activity \{\s*display: none;/,
+    )
+    expect(hideStep).not.toBeNull()
+    // The floor fits beside the dot (16), two gaps (9) and the widest figures
+    // ("120 tool calls" + the clock, ~124) at the step's threshold.
+    const floor =
+      Number(rule(".acp-run[data-state='running'] .acp-run__activity").match(/([\d.]+)rem/)?.[1]) *
+      16
+    expect(16 + 9 + floor + 9 + 124).toBeLessThanOrEqual(Number(hideStep?.[1]))
     // A settled run card keeps its outcome whole ("Cancell…" at 640 px):
     // the figures wrap onto a second line instead.
     expect(rule(".acp-run:not([data-state='running']) .acp-run__status")).toMatch(

@@ -507,6 +507,63 @@ function resultText(payload: Record<string, unknown>): { text: string; truncated
   return { text: '', truncated: false }
 }
 
+/** Who stopped a run, from the payload's or a turn record's `stopped_by`. */
+export function stoppedBy(value: unknown): 'user' | 'agent' | '' {
+  const who = text(value).toLowerCase()
+  if (who === 'user' || who === 'operator' || who === 'you') return 'user'
+  if (who === 'agent' || who === 'parent' || who === 'parent_agent' || who === 'model') {
+    return 'agent'
+  }
+  return ''
+}
+
+/** "after 21 tool calls (1:00)" — or '' when the numbers are not known. */
+function whenPhrase(usage: AcpUsage): string {
+  if (usage.durationMs === null) return ''
+  const clock = formatElapsedClock(usage.durationMs / 1000)
+  const calls = usage.toolCalls ?? 0
+  return calls > 0
+    ? tPlural('chat.acpWhenTools', calls, { clock })
+    : t('chat.acpWhenNoTools', { clock })
+}
+
+/**
+ * The one line the user reads under a run that did not finish: the
+ * payload's `user_message` when the gateway wrote one, else made from the
+ * outcome, who stopped it and the numbers. Never the parent-facing
+ * `terminal_message`. '' for a finished run.
+ */
+export function completionUserLine(
+  payload: Record<string, unknown>,
+  outcome: AcpOutcome,
+  name: string,
+  usage: AcpUsage,
+): string {
+  const written = text(payload.user_message)
+  if (written) return written
+  if (outcome === 'done') return ''
+  const when = whenPhrase(usage)
+  if (outcome === 'cancelled') {
+    const who = stoppedBy(payload.stopped_by)
+    if (who === 'user') {
+      return when
+        ? t('chat.acpStoppedByYou', { name, when })
+        : t('chat.acpStoppedByYouPlain', { name })
+    }
+    if (who === 'agent') {
+      return when ? t('chat.acpStoppedByAgent', { when }) : t('chat.acpStoppedByAgentPlain')
+    }
+    return when ? t('chat.acpStopped', { name, when }) : t('chat.acpStoppedPlain', { name })
+  }
+  if (text(payload.status).toLowerCase() === 'timeout') {
+    return when ? t('chat.acpTimedOut', { name, when }) : t('chat.acpTimedOutPlain', { name })
+  }
+  // A failure: the harness's own error is the most telling line there is.
+  const error = text(payload.error_message)
+  if (error) return error
+  return when ? t('chat.acpFailedAfter', { name, when }) : t('chat.acpFailedPlain', { name })
+}
+
 /** Measure once laid out: a reply that fits needs no clamp. jsdom has no layout. */
 function unclampIfItFits(region: HTMLElement, toggle: HTMLButtonElement): void {
   if (typeof requestAnimationFrame !== 'function') return
@@ -562,18 +619,25 @@ export function buildCompletionCard(
   head.appendChild(pill(outcome, statusLabel(status, outcome)))
   card.appendChild(head)
 
-  const chips = buildUsageChips(fillUsage(completionUsage(payload), options.fallbackUsage))
+  const usage = fillUsage(completionUsage(payload), options.fallbackUsage)
+  const chips = buildUsageChips(usage)
   if (chips) card.appendChild(chips)
 
   const foot = el('div', 'acp-done__foot')
   const { text: reply, truncated } = resultText(payload)
-  const failureText = text(payload.terminal_message) || text(payload.error_message)
-  if (outcome === 'failed' && failureText) {
-    card.appendChild(el('p', 'acp-done__error', failureText))
-  } else if (outcome === 'cancelled' && failureText && !reply) {
+  // Never `terminal_message`: it is written for the parent model ("…Do not
+  // restart it; tell the user…"). The user reads `user_message`, or a line
+  // made here from the outcome, who stopped it and the numbers.
+  const userLine = completionUserLine(payload, outcome, subject.name, usage)
+  if (outcome === 'failed' && userLine) {
+    card.appendChild(el('p', 'acp-done__error', userLine))
+  } else if (outcome === 'cancelled' && userLine) {
     // Someone stopped it: a notice, never the error style.
-    card.appendChild(el('p', 'acp-done__notice', failureText))
-  } else if (reply) {
+    card.appendChild(el('p', 'acp-done__notice', userLine))
+  }
+  // What a stopped run did so far stays readable under its notice; a failed
+  // one shows its error instead.
+  if (reply && !(outcome === 'failed' && userLine)) {
     const region = el('div', 'acp-done__result')
     const clip = el('div', 'acp-done__result-clip')
     const body = el('div', 'acp-done__result-text msg-text-seg')
@@ -688,6 +752,8 @@ function activityLabel(row: AcpLiveRow, name: string): string {
 }
 
 function outcomeFromLastTurn(lastTurn: Record<string, unknown>): AcpOutcome {
+  // A stop is a stop, whoever made it and whatever error text came with it.
+  if (stoppedBy(lastTurn.stopped_by)) return 'cancelled'
   if (text(lastTurn.error) || text(lastTurn.error_code)) {
     const code = text(lastTurn.error_code).toLowerCase()
     return code.includes('cancel') ? 'cancelled' : 'failed'
@@ -834,8 +900,12 @@ export function createAcpMounter(deps: AcpMounterDeps) {
       if (state.activityKind) status.dataset.activityKind = state.activityKind
       else delete status.dataset.activityKind
     }
+    const label = stateLabel(state, name)
+    // The row carries the step too: a narrow card drops the step whole and
+    // leaves it to this tooltip rather than show a sliver of it.
+    if (status) status.title = label
     const slot = card.querySelector<HTMLElement>('.acp-run__activity')
-    if (slot) swapActivity(slot, stateLabel(state, name), animate && previous !== undefined)
+    if (slot) swapActivity(slot, label, animate && previous !== undefined)
 
     const tools = card.querySelector<HTMLElement>('.acp-run__tools')
     const toolCount = state.state === 'running' ? state.toolCalls : (state.usage?.toolCalls ?? null)

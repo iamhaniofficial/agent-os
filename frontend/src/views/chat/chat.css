@@ -473,6 +473,19 @@
   white-space: normal;
   overflow-wrap: anywhere;
 }
+/* A running step keeps a readable floor, or leaves whole on a narrow card
+   (the row's tooltip carries it) rather than show a sliver. */
+.acp-run__status {
+  container: acp-run-status / inline-size;
+}
+.acp-run[data-state='running'] .acp-run__activity {
+  min-width: 6rem;
+}
+@container acp-run-status (width < 260px) {
+  .acp-run[data-state='running'] .acp-run__activity {
+    display: none;
+  }
+}
 /* Settled, the outcome is never cut: the figures take a second line. */
 .acp-run:not([data-state='running']) .acp-run__status {
   flex-wrap: wrap;
