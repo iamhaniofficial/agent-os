@@ -237,11 +237,24 @@ router operations such as `/new`, `/reset`, `/compact`, `/abort`, `/c0`
 through `/c3`, and `/auto`. Direct messages and configured groups use the same
 rules; there is no command privilege tier.
 
+`/restart [force]` is the one exception that is gated by configuration rather
+than by pairing: it asks the gateway to restart itself in place and is refused
+on every channel until the operator sets `[gateway_control] chat_restart =
+true` (see [Configuration](configuration.md#gateway-control)). With the toggle
+on, any paired sender may use it; without it, the sender gets a reply naming
+the setting. The native command menus (Telegram, Discord, Slack) always list
+`/restart`, since they are registered once at channel start. A restart
+acknowledges first, drains the active turns (`force` cancels them), and posts
+"Gateway restarted" back into the same chat or thread once the new process is
+up. Messages that arrive while the gateway is draining get "The gateway is
+restarting; please send that again in a moment." and are not queued.
+
 Tool visibility is not derived from a sender role. It is resolved from the
 agent/global tool configuration, runtime capabilities, sandbox policy, and
 approval gates. Channel RPC exposure is a separate protocol boundary: channel
 clients receive only the explicitly registered channel-safe RPC methods, while
-Control-only configuration and lifecycle RPCs remain unavailable.
+Control-only configuration RPCs remain unavailable. `gateway.restart` is the one
+lifecycle RPC exposed to channels, behind the toggle above.
 
 ## Slack Modes
 

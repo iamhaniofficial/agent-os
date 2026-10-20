@@ -2188,6 +2188,22 @@ class UpdatesConfig(BaseModel):
     notify: bool = True
 
 
+class GatewayControlConfig(BaseModel):
+    """Who may restart the gateway from a chat surface (``[gateway_control]``).
+
+    ``chat_restart`` gates the ``/restart`` slash command on paired channels
+    and the agent's ``gateway`` tool. Control-surface callers (the web UI,
+    the desktop app, the CLI) can always restart the gateway: they already
+    hold ``updates.apply`` and ``config.patch``, which are strictly more
+    powerful. Off by default so a paired chat sender cannot bounce the
+    gateway until the operator opts in.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    chat_restart: bool = False
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -2488,6 +2504,7 @@ class GatewayConfig(BaseSettings):
     budgets: BudgetsConfig = Field(default_factory=BudgetsConfig)
 
     updates: UpdatesConfig = Field(default_factory=UpdatesConfig)
+    gateway_control: GatewayControlConfig = Field(default_factory=GatewayControlConfig)
     trading: TradingConfig = Field(default_factory=TradingConfig)
 
     # Component enable flags

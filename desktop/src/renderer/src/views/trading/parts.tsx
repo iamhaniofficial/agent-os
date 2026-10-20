@@ -1,4 +1,4 @@
-import { LoaderCircle, TriangleAlert, X } from 'lucide-react'
+import { Copy, LoaderCircle, TriangleAlert, X } from 'lucide-react'
 import {
   Component,
   useEffect,
@@ -12,8 +12,9 @@ import { ModalShell } from '@/components/ModalShell'
 import { Button } from '~/components/ui/button'
 import { t } from '~/i18n'
 import { cn } from '~/lib/utils'
-import { ChainBadge } from './ChainMark'
+import { ChainMark } from './ChainMark'
 import {
+  chainName,
   clampSymbol,
   errorText,
   formatUsd,
@@ -127,6 +128,7 @@ export function AssetCell({
   sub,
   tag,
   wallet,
+  onCopy,
 }: {
   token: Token
   showChain?: boolean
@@ -136,6 +138,9 @@ export function AssetCell({
   /** Whose row this is, when the table mixes wallets: the same token twice
    *  otherwise reads as a duplicate. */
   wallet?: string
+  /** Put the token's contract address on the clipboard. A small icon after
+   *  the ticker; the click stays out of the row it sits in. */
+  onCopy?: () => void
 }) {
   // Not everything is indexed, and a row with two blanks in it reads as a bug.
   // Fall back to what is always true: the address, and that it has no name.
@@ -149,13 +154,34 @@ export function AssetCell({
           <span className="trd-asset__ticker" title={token.symbol || token.address}>
             {ticker}
           </span>
-          {showChain ? <ChainBadge chainId={token.chainId} className="trd-asset__chain" /> : null}
+          {showChain ? (
+            // The mark alone: the network's name would push the ticker's
+            // neighbours to a second line. It stays on hover and for readers.
+            <span className="trd-asset__chainmark" title={chainName(token.chainId)}>
+              <ChainMark chainId={token.chainId} />
+            </span>
+          ) : null}
           {!token.verified && !token.native ? (
             <TriangleAlert
               className="trd-asset__warn size-3"
               strokeWidth={2}
               aria-label={t('trading.holdings.unverified')}
             />
+          ) : null}
+          {onCopy ? (
+            <button
+              type="button"
+              className="trd-asset__copy app-no-drag"
+              aria-label={`${t('trading.holdings.copyAddress')} ${ticker}`}
+              title={`${t('trading.holdings.copyAddress')}: ${token.address}`}
+              data-testid="asset-copy"
+              onClick={(e) => {
+                e.stopPropagation()
+                onCopy()
+              }}
+            >
+              <Copy className="size-3" strokeWidth={1.75} aria-hidden />
+            </button>
           ) : null}
         </span>
         <span className="trd-asset__name">

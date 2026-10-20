@@ -237,6 +237,18 @@ class PendingOverflowPolicy(StrEnum):
     DROP_OLDEST = "drop_oldest"
 
 
+class TaskRuntimeNotAdmittingError(RuntimeError):
+    """Raised by :meth:`TaskRuntime.enqueue` once admission has been stopped.
+
+    The gateway stops admitting work while it drains for a restart: a turn
+    accepted after the drain began would either be abandoned at the deadline
+    or keep the drain from ever finishing.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("the gateway is restarting and is not accepting new turns")
+
+
 class TaskQueueFullError(RuntimeError):
     """Raised when a session's waiting queue reaches its configured limit."""
 
@@ -402,6 +414,21 @@ class TaskRuntime:
         self._agent_active_sessions: dict[str, set[str]] = {}
         self._agent_in_flight: dict[str, int] = {}
         self._fair_cond: asyncio.Condition | None = None
+        # Flipped off by ``stop_admission`` while the gateway drains for a
+        # restart; ``enqueue`` refuses new work until ``resume_admission``.
+        self._admitting = True
+
+    def stop_admission(self) -> None:
+        """Refuse every further :meth:`enqueue` until :meth:`resume_admission`."""
+        self._admitting = False
+
+    def resume_admission(self) -> None:
+        """Accept new work again after a restart that did not go through."""
+        self._admitting = True
+
+    @property
+    def admitting(self) -> bool:
+        return self._admitting
 
     async def enqueue(
         self,
@@ -420,6 +447,8 @@ class TaskRuntime:
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
     ) -> TaskHandle:
+        if not self._admitting:
+            raise TaskRuntimeNotAdmittingError()
         envelope = replace(
             envelope,
             agent_id=normalize_agent_id(envelope.agent_id),

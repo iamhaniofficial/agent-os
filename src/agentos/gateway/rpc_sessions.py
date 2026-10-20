@@ -1199,7 +1199,24 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
             # rollback / queue-full leaves the uuid alive until TTL so
             # the user can retry against the same uuid.
             _consumed_file_uuids = []  # noqa: F841 — explicit no-evict marker
-            from agentos.gateway.task_runtime import TaskQueueFullError
+            from agentos.gateway.task_runtime import (
+                TaskQueueFullError,
+                TaskRuntimeNotAdmittingError,
+            )
+
+            if isinstance(exc, TaskRuntimeNotAdmittingError):
+                # A restart is draining: the runtime refuses new turns so the
+                # drain can end. Same rollback as queue-full so a resend after
+                # the restart does not leave a ghost user message behind.
+                orphan_id, rollback_ok = await _rollback_persisted_user_message(
+                    "gateway_restarting"
+                )
+                raise RpcHandlerError(
+                    "GATEWAY_RESTARTING",
+                    "The gateway is restarting; send the message again in a moment.",
+                    details={"rollback_message_id": orphan_id, "rollback_ok": rollback_ok},
+                    retryable=True,
+                ) from exc
 
             if not isinstance(exc, TaskQueueFullError):
                 raise

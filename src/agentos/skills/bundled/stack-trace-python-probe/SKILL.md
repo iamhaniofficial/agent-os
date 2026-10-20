@@ -1,6 +1,6 @@
 ---
 name: stack-trace-python-probe
-description: "Internal helper for meta-stack-trace-investigator. Use when a Python traceback needs Python-specific root-cause checks, pytest reproducer guidance, and defensive patch targets."
+description: "Fixed-shape step helper for stack-trace meta-skill DAGs; not offered to the model. Use when a Python traceback needs Python-specific root-cause checks, pytest reproducer guidance, and defensive patch targets."
 user-invocable: false
 disable-model-invocation: true
 provenance:

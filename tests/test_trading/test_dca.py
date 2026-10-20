@@ -242,6 +242,8 @@ def test_reasons_and_payload_pieces() -> None:
         "human": "123.456789",
         "usd": 123.456789,
     }
+    # 20 billion tokens of an 18-decimal token: 29 digits of base units.
+    assert dca.amount_json(2 * 10**28 + 1, 18, None)["human"] == ("20000000000.000000000000000001")
 
 
 # ── create / approve ───────────────────────────────────────────────────────

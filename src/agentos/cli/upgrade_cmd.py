@@ -337,16 +337,26 @@ def _restart_and_verify(
         action = "start"
     else:
         status = manager.status()
-        if not (status.state == "running" and status.managed):
+        if status.state == "unmanaged":
+            # Started by the desktop app, launchd, systemd or a terminal: the
+            # pidfile path cannot touch it, but it can restart itself in
+            # place. Before this, the upgrade reported success here while the
+            # old code kept running.
+            from agentos.cli.gateway_cmd import restart_gateway_in_place
+
+            console.print("Restarting the gateway in place (it was not started by this CLI)…")
+            result = restart_gateway_in_place(manager, config_path=config_path)
+            action = "restart"
+        elif not (status.state == "running" and status.managed):
             console.print(
-                "[dim]Gateway is not running (managed) — nothing to restart. "
+                "[dim]Gateway is not running — nothing to restart. "
                 "It will pick up the new version on next start.[/dim]"
             )
             return True
-
-        console.print("Restarting managed gateway…")
-        result = manager.restart()
-        action = "restart"
+        else:
+            console.print("Restarting managed gateway…")
+            result = manager.restart()
+            action = "restart"
     if result.exit_code != 0:
         console.print(
             f"[red]Gateway {action} failed:[/red] {result.message or result.code or result.state}"

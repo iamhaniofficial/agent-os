@@ -71,6 +71,19 @@ when they differ it sets `versionMismatch` and prints a diagnostic advising a
 restart — the normal state right after a package upgrade with `--no-restart`,
 or after a manual upgrade.
 
+`agentos gateway restart` stops and starts a gateway that `agentos gateway
+start` spawned. A healthy gateway the CLI does not manage (started by the
+desktop app, launchd, systemd or a terminal `gateway run`) is restarted **in
+place** instead: the CLI calls the `gateway.restart` RPC, the gateway drains
+its active turns and re-executes itself under the same process id, and the
+command returns once the readiness probe passes (`managed: false`,
+`details.inPlace: true` in `--json`). `--force` cancels the active turns
+instead of draining them. On Windows, where in-place restart is not
+available, the command still exits 3 (`UNMANAGED_GATEWAY_RUNNING`). The same
+restart is available as `/restart [force]` in the web console and, behind
+`[gateway_control] chat_restart = true`, from paired channels; see
+[Gateway](gateway.md#when-to-restart).
+
 Terminal chat:
 
 ```sh
@@ -318,7 +331,7 @@ agentos upgrade --restore-snapshot latest   # put the last snapshot back
 | `--dry-run` | Print the upgrade command that would run, whether a snapshot would be taken and whether the gateway would be restarted; touch nothing. |
 | `--source` | `auto` (default): PyPI, or the GitHub release wheel when GitHub is ahead or PyPI is unreachable. `pypi` / `github` force one. |
 | `--no-snapshot` | Skip the pre-upgrade snapshot (default: taken). |
-| `--no-restart` | Upgrade the package but do not restart the gateway. Prints an unmissable warning that it still runs the old version; run `agentos gateway restart` yourself. The data check is skipped too — only a restarted gateway has migrated anything. |
+| `--no-restart` | Upgrade the package but do not restart the gateway. Prints an unmissable warning that it still runs the old version; run `agentos gateway restart` yourself. The data check is skipped too — only a restarted gateway has migrated anything. Without the flag, a gateway the CLI does not manage (desktop app, launchd, systemd, a terminal) is restarted in place over `gateway.restart` rather than skipped. |
 | `--timeout` | Upgrade-subprocess timeout in seconds (default 600). On timeout the tool's process group is killed with recovery guidance — never a half-state. |
 | `--verify-data` | Run `PRAGMA quick_check` on every SQLite file under `~/.agentos/state/` and exit; nothing else happens. Exit 1 on a problem, naming the last snapshot. |
 | `--restore-snapshot DIR\|latest` | Copy a pre-upgrade snapshot back file for file. Refuses while a gateway answers on the configured endpoint (a live database would replay its journal over the restored file). |

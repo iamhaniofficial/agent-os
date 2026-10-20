@@ -37,6 +37,9 @@ CHANNEL_RPC_METHODS: frozenset[str] = frozenset(
         "chat.history",
         "commands.list_for_surface",
         "doctor.memory.status",
+        # The one lifecycle RPC a channel may reach; its handler refuses
+        # channel callers unless ``[gateway_control] chat_restart`` is on.
+        "gateway.restart",
         "models.list",
         "plan.mode.set",
         "router.hold.clear",

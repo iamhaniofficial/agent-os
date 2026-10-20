@@ -126,7 +126,7 @@ than reading a version out of `uv tool list` or `pip show`.
 
 | Group | Subcommands |
 | --- | --- |
-| `gateway` | `run`, `start`, `status`, `stop`, `restart` (`--port`, `--bind`, `--listen`, `--config`, `--json`, `--debug`) |
+| `gateway` | `run`, `start`, `status`, `stop`, `restart` (`--port`, `--bind`, `--listen`, `--config`, `--json`, `--debug`; `restart --force` cancels active turns). `restart` restarts a gateway it did not start (desktop app, launchd, systemd, terminal) in place over the `gateway.restart` RPC. |
 | `config` | `get [key]` (empty key = show all), `set <dot.key> <value>` |
 | `env` | `list [--missing] [--category]`, `get <NAME> [--reveal] [-y]`, `set <NAME> --stdin`, `import <NAME>`, `unset <NAME> [-y]` |
 | `providers` | `list`, `status`, `configure <id> [-m MODEL] [-k API_KEY] [--base-url] [--proxy]` |
@@ -325,6 +325,17 @@ Default port **18791**, loopback bind. `--listen HOST` overrides
 the installed CLI version (`cliVersion`) and the running gateway's version
 (`gatewayVersion`); a `versionMismatch` diagnostic means the gateway is running
 old code — restart it.
+
+`agentos gateway restart` restarts a gateway started by `gateway start`
+(stop, then start) and restarts any other healthy gateway (desktop app,
+launchd, systemd, a terminal `gateway run`) **in place**: the gateway drains
+its active turns and re-executes itself under the same pid, so every launcher
+keeps tracking it. `--force` cancels the active turns instead. Not on Windows.
+The same restart is `/restart [force]` in the web console and the desktop app
+(operators, always), and from a paired channel or the agent's `gateway` tool
+only when `[gateway_control] chat_restart = true` (default `false`; takes
+effect after one restart). The gateway posts "Gateway restarted" back into
+the chat that asked once it is up again.
 
 ### Version
 

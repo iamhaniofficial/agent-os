@@ -1169,21 +1169,49 @@ class GatewayServer:
     _channel_manager: Any = field(default=None, repr=False)
     _services: ServiceContainer | None = field(default=None, repr=False)
     _background_completion_manager: Any = field(default=None, repr=False)
+    # The process-wide pid lock, released explicitly before an in-place
+    # restart (``atexit`` does not run across ``execve``).
+    _pid_lock: Any = field(default=None, repr=False)
+    # ``gateway.restart.GatewayRestarter`` once wired; ``run_gateway`` awaits
+    # its task after the server task ends so the exec happens outside the loop.
+    _restarter: Any = field(default=None, repr=False)
+    _closed: bool = field(default=False, repr=False)
 
-    async def close(self, reason: str = "shutdown") -> None:
-        """Gracefully shut down: stop channels, broadcast shutdown, close WS, stop server."""
+    async def close(
+        self,
+        reason: str = "shutdown",
+        *,
+        drain_timeout: float = 30.0,
+        cancel_in_flight: bool = False,
+    ) -> None:
+        """Gracefully shut down: stop channels, broadcast shutdown, close WS, stop server.
+
+        ``drain_timeout`` bounds how long in-flight turns may run on. With
+        ``cancel_in_flight`` they are cancelled at once instead of drained
+        (the ``/restart force`` path). A second call is a no-op: the
+        ``CancelledError`` branch in ``run_gateway`` and a restart in progress
+        must not close the same services twice.
+        """
+        if self._closed:
+            return
+        self._closed = True
         # Drain in-flight turns FIRST so replies are not lost.
         # task_runtime.shutdown() waits for all running turns to complete before
         # returning; only then do we stop channel delivery.
         if self._services is not None and self._services.task_runtime is not None:
             try:
-                await self._services.task_runtime.shutdown(graceful=True, graceful_timeout=30.0)
+                if cancel_in_flight:
+                    await self._services.task_runtime.shutdown(cancel=True, timeout=drain_timeout)
+                else:
+                    await self._services.task_runtime.shutdown(
+                        graceful=True, graceful_timeout=drain_timeout
+                    )
             except Exception:
                 pass
 
         if self._background_completion_manager is not None:
             try:
-                await self._background_completion_manager.close(timeout=30.0)
+                await self._background_completion_manager.close(timeout=drain_timeout)
             except Exception:
                 log.debug("gateway.background_completion_close_failed", exc_info=True)
             try:
@@ -2742,8 +2770,18 @@ async def start_gateway_server(
     server_handle._channel_manager = channel_manager
     server_handle._services = svc
     server_handle._background_completion_manager = background_completion_manager
+    server_handle._pid_lock = _pid_lock
 
     if run:
+        # In-place restart (``/restart``, ``gateway.restart``, the ``gateway``
+        # tool, the CLI fallback). Wired only for a real ``gateway run``: an
+        # embedded boot has no ``run_gateway`` to perform the exec.
+        from agentos.gateway.restart import GatewayRestarter, set_restarter
+
+        restarter = GatewayRestarter(server_handle, config, pid_lock=_pid_lock)
+        server_handle._restarter = restarter
+        set_restarter(restarter)
+
         uvicorn_kwargs: dict[str, Any] = {
             "app": app,
             "host": config.host,
@@ -2798,6 +2836,17 @@ async def start_gateway_server(
 
     if run:
         create_background_task(preload_agentos_router_runtime(config))
+        # If the previous image restarted in place on request, tell the chat
+        # that asked. Channels are up by now, which is what the send needs.
+        from agentos.gateway.restart import announce_restart_completion
+
+        create_background_task(
+            announce_restart_completion(
+                config,
+                channel_manager=channel_manager,
+                session_manager=svc.session_manager,
+            )
+        )
 
     app.state.gateway_ready = True
     return server_handle

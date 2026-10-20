@@ -5,7 +5,12 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { useRpc } from '@/app/providers'
-import { normalizeSlashCommand, slashCommandKey, type SlashCommand } from './logic'
+import {
+  normalizeSlashCommand,
+  slashCommandKey,
+  watchGatewayReconnect,
+  type SlashCommand,
+} from './logic'
 import { resetSession } from './resetSession'
 
 /**
@@ -379,6 +384,34 @@ export function useSlashCommands(opts?: {
             .catch((err: unknown) =>
               toast.error(
                 t('chat.slashRouterUnpinFailed', {
+                  message: err instanceof Error ? err.message : String(err),
+                }),
+              ),
+            )
+          return
+        }
+        // `/restart [force]` — the gateway restarts itself in place. The socket
+        // drops (close 1012) and the client reconnects on its own; the "back"
+        // toast fires on the first reconnect after that drop.
+        case 'gateway.restart':
+        case '/restart': {
+          const mode = args.trim().toLowerCase() === 'force' ? 'force' : 'safe'
+          rpc
+            .call('gateway.restart', { key, mode, reason: 'slash_command' })
+            .then((res: unknown) => {
+              const payload = res as { accepted?: boolean; alreadyPending?: boolean } | null
+              if (payload?.alreadyPending) {
+                toast.info(t('chat.slashRestartPending'))
+                return
+              }
+              toast.info(
+                t(mode === 'force' ? 'chat.slashRestartForced' : 'chat.slashRestartRequested'),
+              )
+              watchGatewayReconnect(rpc, () => toast.success(t('chat.slashRestartDone')))
+            })
+            .catch((err: unknown) =>
+              toast.error(
+                t('chat.slashRestartFailed', {
                   message: err instanceof Error ? err.message : String(err),
                 }),
               ),
