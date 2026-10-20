@@ -2,7 +2,8 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import { useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { t } from '~/i18n'
-import { PanelBoundary } from './parts'
+import { AssetCell, PanelBoundary } from './parts'
+import { USDC } from './test-utils'
 
 let fail = true
 function Flaky() {
@@ -52,5 +53,16 @@ describe('PanelBoundary', () => {
 
   it('has its copy in the catalogue', () => {
     expect(t('trading.panel.failed')).toBe('This panel failed to render')
+  })
+})
+
+describe('AssetCell · chain', () => {
+  it('shows the network as its mark alone, named on hover and for readers', () => {
+    render(<AssetCell token={USDC} showChain />)
+    const mark = document.querySelector('.trd-asset__chainmark')
+    expect(mark?.getAttribute('title')).toBe('Base')
+    expect(screen.getByRole('img', { name: 'Base' })).toBeTruthy()
+    // The ticker line carries no network name to wrap on.
+    expect(document.querySelector('.trd-asset__symbol')?.textContent).toBe('USDC')
   })
 })

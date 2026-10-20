@@ -2549,28 +2549,22 @@ body[data-dragging] .trd-book__handle {
 .trd-book .trd-asset__text {
   min-width: 0;
 }
-/* A long ticker keeps its letters; the chain chip drops to the next line. */
-.trd-book .trd-asset__symbol {
-  flex-wrap: wrap;
-  row-gap: 1px;
-}
+/* One line: a long ticker gives way (ellipsis, full name on hover) before
+   the chain mark, the warning or the copy button drop to a second line. */
 .trd-book .trd-asset__ticker {
-  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.trd-book .trd-asset__chain,
-.trd-book .trd-asset__warn {
+.trd-book .trd-asset__chainmark,
+.trd-book .trd-asset__warn,
+.trd-book .trd-asset__copy {
   flex-shrink: 0;
 }
 @container book (max-width: 339px) {
   .trd-table .trd-col--amount,
   .trd-table .trd-col--value {
     width: 72px;
-  }
-  .trd-asset__chain {
-    display: none;
   }
 }
 

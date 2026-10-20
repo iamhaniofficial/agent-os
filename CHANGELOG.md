@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- Desktop Trade tab: token rows name their network with its mark alone (the
+  name is the tooltip), so a long ticker no longer pushes the chain or the
+  copy-address button onto a second line in the chat-side panel or the desk.
+
 ## [2026.10.19] - 2026-10-19
 
 ### Added

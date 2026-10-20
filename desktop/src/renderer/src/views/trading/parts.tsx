@@ -12,8 +12,9 @@ import { ModalShell } from '@/components/ModalShell'
 import { Button } from '~/components/ui/button'
 import { t } from '~/i18n'
 import { cn } from '~/lib/utils'
-import { ChainBadge } from './ChainMark'
+import { ChainMark } from './ChainMark'
 import {
+  chainName,
   clampSymbol,
   errorText,
   formatUsd,
@@ -153,7 +154,13 @@ export function AssetCell({
           <span className="trd-asset__ticker" title={token.symbol || token.address}>
             {ticker}
           </span>
-          {showChain ? <ChainBadge chainId={token.chainId} className="trd-asset__chain" /> : null}
+          {showChain ? (
+            // The mark alone: the network's name would push the ticker's
+            // neighbours to a second line. It stays on hover and for readers.
+            <span className="trd-asset__chainmark" title={chainName(token.chainId)}>
+              <ChainMark chainId={token.chainId} />
+            </span>
+          ) : null}
           {!token.verified && !token.native ? (
             <TriangleAlert
               className="trd-asset__warn size-3"
