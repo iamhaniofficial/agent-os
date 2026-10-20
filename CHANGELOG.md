@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [2026.10.20] - 2026-10-20
+
 ### Added
 - `acp.status {session_key}` gateway RPC: one status object for any ACP
   session (live, idle or closed) with `agent_name`, `activity`,
@@ -112,6 +114,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   forbid copying files out of a harness's own directories.
 - An ACP child's `activity` reads "Thinking…" once its tool calls have
   finished and no text has arrived, instead of the last command for minutes.
+- Trading: base-unit conversions (`to_human` / `to_raw` in the PnL ledger) no
+  longer round amounts past 28 significant digits, so large raw balances of
+  18-decimal tokens convert exactly.
+- Skills: the five `stack-trace-*-probe` skills no longer describe themselves
+  as helpers of a `meta-stack-trace-investigator` skill that never shipped.
 
 ## [2026.10.19] - 2026-10-19
 
