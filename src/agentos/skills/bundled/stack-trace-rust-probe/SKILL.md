@@ -1,6 +1,6 @@
 ---
 name: stack-trace-rust-probe
-description: "Internal helper for meta-stack-trace-investigator. Use when a Rust panic or backtrace needs Rust-specific Result/Option checks, cargo test guidance, and patch targets."
+description: "Fixed-shape step helper for stack-trace meta-skill DAGs; not offered to the model. Use when a Rust panic or backtrace needs Rust-specific Result/Option checks, cargo test guidance, and patch targets."
 user-invocable: false
 disable-model-invocation: true
 provenance:

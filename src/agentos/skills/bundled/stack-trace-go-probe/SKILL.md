@@ -1,6 +1,6 @@
 ---
 name: stack-trace-go-probe
-description: "Internal helper for meta-stack-trace-investigator. Use when a Go panic or stack trace needs Go-specific nil/error checks, go test reproducer guidance, and patch targets."
+description: "Fixed-shape step helper for stack-trace meta-skill DAGs; not offered to the model. Use when a Go panic or stack trace needs Go-specific nil/error checks, go test reproducer guidance, and patch targets."
 user-invocable: false
 disable-model-invocation: true
 provenance:
