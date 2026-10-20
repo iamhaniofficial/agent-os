@@ -93,12 +93,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   child's work. The completion's `result` now has `full_chars`, the parent's
   wake names the cut and the exact `sessions_history(session_key=...,
   answer_offset=N)` call, and `sessions_history` pages the rest of that
-  answer (8,000 characters per call).
+  answer in pages that reach the model whole.
 - A parent asked to continue a stopped child spawned a new one after
   `resume_forbidden`. That error (and every ACP completion) now points to
   `sessions_send(session_key=<child>)`, which resumes the same harness
   conversation; a session key passed as `resume_session_id` is called out as
   such, and the child's record id is accepted next to its `acp_session_id`.
+- `sessions_history(answer_offset=...)` pages arrived cut: 8,000-character
+  pages were stored (and replayed in later turns) at the 2,000-character
+  tool-result ceiling with "…". Pages are now at most 3,900 characters of
+  encoded JSON and `sessions_history` keeps results up to 4,000, so every
+  page reaches the model whole. One harness turn now keeps up to 100,000
+  characters of text instead of 24,000, which had cut long reports before
+  any paging. The truncated-answer wake line and the `sub-agent` skill also
+  forbid copying files out of a harness's own directories.
+- An ACP child's `activity` reads "Thinking…" once its tool calls have
+  finished and no text has arrived, instead of the last command for minutes.
 
 ## [2026.10.16] - 2026-10-16
 

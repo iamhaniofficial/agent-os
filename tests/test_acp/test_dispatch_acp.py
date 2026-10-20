@@ -867,36 +867,77 @@ async def test_a_cut_answer_tells_the_parent_where_the_rest_is(tmp_path) -> None
         assert result["full_chars"] == len(report.strip())
         wake = sent[-1]
         assert "result_truncated=true" in wake
+        assert "never copy files out of a harness's own directories (~/.claude" in wake
         assert (
             f"The answer was cut at 12,000 of {len(report.strip()):,} characters; read the "
             f'rest with sessions_history(session_key="{child}", answer_offset=12000) - do '
             "not redo the work."
         ) in wake
 
-        # ... and that call returns exactly the rest, in pages.
+        # ... and that call starts exactly where the completion stopped.
         page = json.loads(await sessions_tool.sessions_history(child, answer_offset=12_000))
         assert page["answer_total_chars"] == len(report.strip())
-        assert page["answer"] == report.strip()[12_000 : 12_000 + 8_000]
         assert result["text"] + page["answer"] == report.strip()[: 12_000 + len(page["answer"])]
-        assert page["next_offset"] is None  # 5,116 left: one page
 
 
-async def test_a_long_answer_pages_in_8000_character_steps(tmp_path) -> None:
-    report = "x" * 30_000
+async def test_every_character_of_a_long_answer_reaches_the_model_once(tmp_path) -> None:
+    """agent:main:acp:fd260ca2 (full_chars 24,064): the 8,389- and
+    4,277-character pages were stored cut to 2,000 characters with "…", and
+    the answer itself had been cut at the old 24,000-character turn cap.
+
+    Pages are checked the way the model receives them: in the turn (the
+    provider cap, smallest at a 4k-token window) and in later turns (the
+    persisted transcript segment)."""
+    from agentos.context_budget import ContextBudgetGovernor
+    from agentos.engine.runtime import _persisted_tool_result_segment
+    from agentos.engine.types import ToolResultEvent
+    from agentos.result_budget import register_persisted_result_budget
+
+    register_persisted_result_budget(
+        "sessions_history", sessions_tool._sessions_history_persist_budget
+    )
+    # Markdown with quotes, backslashes, newlines and non-ASCII: JSON escaping
+    # makes the encoded page longer than its text.
+    line = '| "item" | ok — "quoted" \\ path\\to\\file |\n'
+    report = (line * 2_000)[:24_064]
     script = Script(
-        events=[AcpEvent(kind="text_delta", text=report)],
+        events=[
+            AcpEvent(kind="tool_call", tool_call_id="r", tool_kind="read", title="Read x"),
+            AcpEvent(kind="tool_call_update", tool_call_id="r", status="completed"),
+            AcpEvent(kind="text_delta", text=report),
+        ],
         result=AcpTurnResult(stop_reason="end_turn"),
     )
+    smallest_turn_cap = ContextBudgetGovernor.from_values(
+        context_window_tokens=4_000,
+        max_output_tokens=1_000,
+        thinking_budget_tokens=0,
+        context_overflow_threshold=0.85,
+    ).tool_result_provider_chars_for(None)
     async with acp_rig(tmp_path, FakeRuntime([script])) as rig:
-        out = await _spawn(task="long", acp_agent="claude")
-        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        out = await _spawn(task="report", acp_agent="claude")
         child = out["session_key"]
-        first = json.loads(await sessions_tool.sessions_history(child, answer_offset=12_000))
-        assert len(first["answer"]) == 8_000 and first["next_offset"] == 20_000
-        assert "answer_offset=20000" in first["note"]
-        # The projector caps one turn's text at 24,000 characters.
-        last = json.loads(await sessions_tool.sessions_history(child, answer_offset=20_000))
-        assert last["next_offset"] is None and last["answer_total_chars"] > 24_000 - 1
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        completions = await _completions(rig, 1)
+        answer = report.strip()
+        assert completions[-1]["result"]["full_chars"] == len(answer)  # not cut at 24,000
+        received = completions[-1]["result"]["text"]
+        offset: int | None = len(received)
+        calls = 0
+        while offset is not None:
+            raw = await sessions_tool.sessions_history(child, answer_offset=offset)
+            calls += 1
+            assert len(raw) <= smallest_turn_cap  # arrives whole in the turn
+            segment = _persisted_tool_result_segment(
+                ToolResultEvent(tool_use_id=f"p{calls}", tool_name="sessions_history", result=raw)
+            )
+            assert "result_truncated" not in segment  # ... and in later turns
+            page = json.loads(segment["result"])
+            assert page["answer_offset"] == len(received)
+            received += page["answer"]
+            offset = page["next_offset"]
+        assert received == answer  # every character exactly once
+        assert calls <= 5
 
 
 async def test_parent_can_continue_a_stopped_child_instead_of_respawning(tmp_path) -> None:

@@ -161,7 +161,8 @@ when it was cut, the parent's wake says so ("The answer was cut at 12,000 of
 17,116 characters; read the rest with sessions_history(session_key=...,
 answer_offset=12000) - do not redo the work.") and
 `sessions_history(session_key, answer_offset=N)` returns the rest of that same
-answer, 8,000 characters per call with a `next_offset`. Otherwise
+answer in pages of up to 3,900 characters (sized so a page reaches the model
+whole, now and in later turns) with a `next_offset`. Otherwise
 `sessions_history` on an ACP child clips each tool input and result to 500
 characters (`[…N chars]`) so the harness's own text is not lost to
 truncation.
@@ -275,6 +276,10 @@ anything.
   session may carry it over. AgentOS keys its baseline by ACP session id, so
   each turn is charged only its increase; a reading below the baseline (the
   total restarted) is charged as it is.
+- One harness turn keeps up to 100,000 characters of text (the rest is
+  marked as cut). While a turn runs, `activity` names the tool call in
+  progress, "Thinking…" when none is running and no text has arrived, and
+  "Writing the answer" while text streams.
 - Tool rows in a child transcript are titled with a short label built from
   the tool call ("Run git status", "Read ~/app/src/x.py", "Search TODO",
   "Fetch docs.python.org", "Looking up tools"); the ACP tool kind is in the

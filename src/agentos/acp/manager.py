@@ -35,7 +35,6 @@ from typing import Any
 import structlog
 
 from agentos.acp.labels import (
-    KIND_LABELS,
     MAX_LABEL_CHARS,
     TOOL_KINDS,
     harness_tool_name,
@@ -79,6 +78,8 @@ ACTIVITY_MAX_CHARS = MAX_LABEL_CHARS
 #: ``activity_kind`` while the harness streams its answer.
 TEXT_ACTIVITY_KIND = "text"
 TEXT_ACTIVITY_LABEL = "Writing the answer"
+#: ``activity`` between steps: no tool running, no text yet (kind ``think``).
+THINKING_ACTIVITY_LABEL = "Thinking…"
 
 
 class AcpUnavailableError(AcpError):
@@ -120,6 +121,9 @@ class _SessionState:
     row_status: Any = None
     #: Who asked to stop the running turn ("user" / "agent"), if anyone said.
     stop_by: str | None = None
+    #: Tool calls of this turn that have not completed or failed yet, in the
+    #: order they started (a dict used as an ordered set).
+    open_tools: dict[str, None] = field(default_factory=dict)
     #: This turn's harness tool calls: id -> (title, kind, raw_input, tool name).
     turn_tools: dict[str, tuple[str | None, str | None, dict[str, Any] | None, str | None]] = field(
         default_factory=dict
@@ -623,6 +627,7 @@ class AcpSessionManager:
         state.activity = None
         state.activity_kind = None
         state.turn_tools = {}
+        state.open_tools = {}
 
     @staticmethod
     def _track_activity(state: _SessionState, event: AcpEvent) -> None:
@@ -643,11 +648,28 @@ class AcpSessionManager:
                 normalized = tool_kind if tool_kind in TOOL_KINDS else "other"
                 state.activity = tool_label(title, normalized, raw_input, tool_name=tool_name)
                 state.activity_kind = normalized
+            if event.status in ("completed", "failed"):
+                state.open_tools.pop(tool_id, None)
+                if state.open_tools:
+                    # Another call still runs: that is what is happening now.
+                    running = next(reversed(state.open_tools))
+                    r_title, r_kind, r_input, r_name = state.turn_tools[running]
+                    r_kind = r_kind if r_kind in TOOL_KINDS else "other"
+                    state.activity = tool_label(r_title, r_kind, r_input, tool_name=r_name)
+                    state.activity_kind = r_kind
+                else:
+                    # The step is over and nothing else runs: the harness is
+                    # working out what to do next (or composing a long answer
+                    # it sends late), not still running the last command.
+                    state.activity = THINKING_ACTIVITY_LABEL
+                    state.activity_kind = "think"
+            else:
+                state.open_tools[tool_id] = None
         elif kind == "text_delta" and event.text:
             state.activity = TEXT_ACTIVITY_LABEL
             state.activity_kind = TEXT_ACTIVITY_KIND
         elif kind == "thought_delta" and event.text:
-            state.activity = KIND_LABELS["think"]
+            state.activity = THINKING_ACTIVITY_LABEL
             state.activity_kind = "think"
 
     async def _notify_slot_waiters(self) -> None:

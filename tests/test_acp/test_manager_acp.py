@@ -568,3 +568,60 @@ async def test_activity_says_waiting_once_the_prompt_is_sent(sessions) -> None:
     assert manager.list_sessions()[0]["activity"] == "Waiting for Claude Code…"
     runtime.release.set()
     await task
+
+
+def test_activity_says_thinking_once_no_tool_is_running() -> None:
+    """agent:main:acp:fd260ca2: "Run python3 -I -c ..." stayed up for ~8
+    minutes after the command finished while Claude composed its answer."""
+    from agentos.acp.manager import _SessionState
+
+    state = _SessionState(session_key="agent:main:acp:aaaa0024")
+    track = AcpSessionManager._track_activity
+
+    track(
+        state,
+        AcpEvent(
+            kind="tool_call",
+            tool_call_id="a",
+            tool_kind="execute",
+            title="python3 -I -c 'x'",
+            raw_input={"command": "python3 -I -c 'x'"},
+        ),
+    )
+    assert state.activity == "Run python3 -I -c 'x'" and state.activity_kind == "execute"
+    # The client merges title/kind into the completion update; the step is done.
+    track(
+        state,
+        AcpEvent(
+            kind="tool_call_update",
+            tool_call_id="a",
+            tool_kind="execute",
+            title="python3 -I -c 'x'",
+            status="completed",
+        ),
+    )
+    assert state.activity == "Thinking…" and state.activity_kind == "think"
+
+    # Two calls in flight: when one ends, the other is what runs now.
+    track(state, AcpEvent(kind="tool_call", tool_call_id="b", tool_kind="read", title="Read b"))
+    track(
+        state,
+        AcpEvent(kind="tool_call", tool_call_id="c", tool_kind="search", title="grep x"),
+    )
+    track(
+        state,
+        AcpEvent(
+            kind="tool_call_update",
+            tool_call_id="c",
+            tool_kind="search",
+            title="grep x",
+            status="completed",
+        ),
+    )
+    assert state.activity == "Read b" and state.activity_kind == "read"
+    track(state, AcpEvent(kind="tool_call_update", tool_call_id="b", status="failed"))
+    assert state.activity == "Thinking…"
+
+    track(state, AcpEvent(kind="text_delta", text="Here is the report"))
+    assert state.activity == "Writing the answer" and state.activity_kind == "text"
+    assert len(state.turn_tools) == 3

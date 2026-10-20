@@ -33,7 +33,12 @@ from agentos.acp.types import AcpEvent, AcpTurnResult, AcpUsage
 log = structlog.get_logger("agentos.acp.projector")
 
 #: Cap on the assistant text kept for one harness turn (UI, transcript, announce).
-MAX_ASSISTANT_TEXT_CHARS = 24_000
+#: A long harness report is the work itself: at 24,000 a 25-34k-character
+#: report reached the parent with its ending dropped (``full_chars`` 24,064 =
+#: the cap plus the truncation marker) and the parent went to read the
+#: harness's own files instead. The parent reads past the completion's
+#: 12,000 characters with ``sessions_history(answer_offset=...)``.
+MAX_ASSISTANT_TEXT_CHARS = 100_000
 #: Cap on one tool result kept in the transcript.
 MAX_TOOL_RESULT_CHARS = 4_000
 
