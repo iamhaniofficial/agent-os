@@ -216,22 +216,20 @@ export function useAcpSession(sessionKey: string, turnRunning: boolean): AcpSess
     if (hint && was && !turnRunning && active) void refresh()
   }, [hint, turnRunning, active, refresh])
 
-  // Read on entry and on every edge; poll while the chat or the harness runs.
+  // Read on entry (mount, a session switch) and on every edge, whether or not
+  // the window is visible: a session opened while hidden must not keep the
+  // last answer it happened to have. Only the repeating poll — every 1.5 s
+  // while the chat or the harness runs — pauses while hidden; coming back,
+  // it reads at once and then resumes.
   useEffect(() => {
     if (!hint) return
     let disposed = false
     const read = () => {
       if (!disposed) void refresh()
     }
-    read()
-    if (!polling) {
-      return () => {
-        disposed = true
-      }
-    }
     let timer: ReturnType<typeof setInterval> | null = null
     const arm = () => {
-      if (timer !== null || document.hidden) return
+      if (!polling || timer !== null || document.hidden) return
       timer = setInterval(read, ACP_STATUS_POLL_MS)
     }
     const disarm = () => {
@@ -246,6 +244,7 @@ export function useAcpSession(sessionKey: string, turnRunning: boolean): AcpSess
       read()
       arm()
     }
+    read()
     arm()
     document.addEventListener('visibilitychange', onVisibility)
     return () => {

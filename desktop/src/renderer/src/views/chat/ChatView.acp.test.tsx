@@ -403,6 +403,72 @@ describe('useAcpSession state', () => {
     expect(result.current.startedAt).toBeNull()
   })
 
+  // Round 6: a child session opened (or switched to) while the window was
+  // hidden kept "Starting Claude Code… 6:18" until the window came back.
+  it('reads at once when opened or switched to while hidden; only the poll waits', async () => {
+    const setHidden = (hidden: boolean) => {
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden })
+      act(() => {
+        document.dispatchEvent(new Event('visibilitychange'))
+      })
+    }
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true })
+    status = { ...base, active_turn: true, activity: 'Starting Claude Code', turn_elapsed_s: 2 }
+    const { result, rerender } = renderHook(({ key, running }) => useAcpSession(key, running), {
+      initialProps: { key: KEY, running: true },
+    })
+    await settle()
+    // Opened while hidden: one read straight away...
+    expect(acpCalls('acp.status')).toEqual([['acp.status', { session_key: KEY }]])
+    expect(result.current.state).toBe('working')
+    // ...and no repeating poll until the window shows.
+    await tick(ACP_STATUS_POLL_MS * 8)
+    expect(acpCalls('acp.status')).toHaveLength(1)
+
+    // Switched to another harness session while still hidden: read it at once.
+    const OTHER = 'agent:main:acp:0badf00d'
+    status = { ...base, session_key: OTHER, agent_id: 'codex', agent_name: 'Codex' }
+    rerender({ key: OTHER, running: false })
+    await settle()
+    expect(rpc.call).toHaveBeenLastCalledWith('acp.status', { session_key: OTHER })
+    expect(result.current.name).toBe('Codex')
+    expect(result.current.state).toBe('idle')
+
+    // Back on the first one, still hidden; the harness finished meanwhile.
+    status = { ...base, active_turn: true, activity: 'Starting Claude Code', turn_elapsed_s: 2 }
+    rerender({ key: KEY, running: true })
+    await settle()
+    expect(result.current.state).toBe('working')
+    status = { ...base, last_turn: { duration_ms: 378_000, stop_reason: 'end_turn' } }
+    const before = acpCalls('acp.status').length
+    // The window shows: an immediate read, before the poll resumes.
+    setHidden(false)
+    await settle()
+    expect(acpCalls('acp.status')).toHaveLength(before + 1)
+    expect(result.current.state).toBe('idle')
+    expect(result.current.startedAt).toBeNull()
+  })
+
+  it('reads the moment the window shows even when nothing is polling', async () => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true })
+    status = { ...base }
+    const { result } = renderHook(() => useAcpSession(KEY, false))
+    await settle()
+    expect(acpCalls('acp.status')).toHaveLength(1)
+    // Closed from elsewhere while the window was away.
+    status = { ...base, closed: true, idle: false }
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false })
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    await settle()
+    expect(acpCalls('acp.status')).toHaveLength(2)
+    expect(result.current.state).toBe('closed')
+    // At rest it does not poll.
+    await tick(ACP_STATUS_POLL_MS * 6)
+    expect(acpCalls('acp.status')).toHaveLength(2)
+  })
+
   it("never shows the previous turn's step when a new turn starts", async () => {
     status = { ...base, activity: 'Read old.py' }
     const { result, rerender } = renderHook(({ running }) => useAcpSession(KEY, running), {
