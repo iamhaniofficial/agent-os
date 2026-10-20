@@ -137,7 +137,7 @@ The main agent delegates with `sessions_spawn`:
 | `cwd` | Working directory (default: the agent workspace). Must be inside the workspace, a managed worktree or an `[acp] allowed_cwds` entry; see [Working directory](#working-directory). |
 | `mode` | `oneshot` (default for spawn): the harness process exits after each turn, and a follow-up resumes the same harness session in a new process. `persistent`: the process stays up between turns. |
 | `harness_mode` | ACP session mode id the harness advertises (`read-only`, `acceptEdits`, `plan`, ...). |
-| `resume_session_id` | Continue an earlier harness session recorded for you or one of your children. |
+| `resume_session_id` | Carry a closed child's harness conversation (its `acp_session_id`) into a new child. A finished or stopped child is continued with `sessions_send` to its key instead; a session key passed here is refused with that advice. |
 | `worktree`, `worktree_name`, `worktree_base_ref` | Run in a managed git worktree under `<state>/acp/worktrees/` instead of the checkout itself. |
 
 The child session key looks like `agent:main:acp:1a2b3c4d`. After spawning,
@@ -155,9 +155,16 @@ by tool calls) from the last substantial one (at least 40 characters and half
 the longest run) to the end, so interim "Now reading X." lines are dropped
 and a report followed by a tool call and a closing remark is kept; the whole
 text when no run qualifies. The child transcript keeps everything, with text
-runs separated by a tool call as separate paragraphs. `sessions_history` on
-an ACP child clips each tool input and result to 500 characters (`[…N
-chars]`) so the harness's own text is not lost to truncation.
+runs separated by a tool call as separate paragraphs. `result.text` holds
+up to 12,000 characters and `result.full_chars` the answer's whole length;
+when it was cut, the parent's wake says so ("The answer was cut at 12,000 of
+17,116 characters; read the rest with sessions_history(session_key=...,
+answer_offset=12000) - do not redo the work.") and
+`sessions_history(session_key, answer_offset=N)` returns the rest of that same
+answer, 8,000 characters per call with a `next_offset`. Otherwise
+`sessions_history` on an ACP child clips each tool input and result to 500
+characters (`[…N chars]`) so the harness's own text is not lost to
+truncation.
 
 When the user stops a run (the card or bar Stop, `acp.cancel`, `acp close`,
 the child chat's Stop), the completion carries `stopped_by: "user"`, a

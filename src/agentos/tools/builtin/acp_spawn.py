@@ -232,7 +232,15 @@ async def authorize_resume(
     mgr: Any, *, requester_key: str, resume_session_id: str
 ) -> dict[str, Any]:
     """The ACP origin that recorded ``resume_session_id`` for the requester
-    or one of its children; raise when nobody it owns ever had it."""
+    or one of its children; raise when nobody it owns ever had it.
+
+    The id is the harness's ACP session id (also accepted: the record id, or
+    an id the child itself was resumed from). A parent that passes a child's
+    *session key* (or its short hex) is told to ``sessions_send`` to that
+    child instead: that resumes the same harness conversation, where a new
+    spawn with a guessed id failed with ``resume_forbidden`` and the parent
+    then started over from scratch.
+    """
     wanted = resume_session_id.strip()
     candidates: list[Any] = []
     try:
@@ -241,13 +249,36 @@ async def authorize_resume(
         own = None
     if own is not None:
         candidates.append(own)
-    candidates.extend(await _list_children(mgr, requester_key))
+    children = await _list_children(mgr, requester_key)
+    candidates.extend(children)
+    matches: list[dict[str, Any]] = []
     for row in candidates:
         origin = _origin(row)
-        if origin.get("kind") == "acp" and str(origin.get("acp_session_id") or "") == wanted:
-            return origin
+        if origin.get("kind") != "acp":
+            continue
+        recorded = {
+            str(origin.get(field) or "")
+            for field in ("acp_session_id", "record_id", "resume_session_id")
+        }
+        if wanted in recorded - {""}:
+            matches.append(origin)
+    if matches:
+        # Prefer a row that knows the harness session id the record resolves to.
+        return next((o for o in matches if o.get("acp_session_id")), matches[0])
+    for row in children:
+        key = str(_field(row, "session_key") or "")
+        if row_is_acp(row) and wanted and (wanted == key or key.endswith(":" + wanted)):
+            raise ToolError(
+                f'resume_forbidden: "{wanted}" is the session key of your harness child '
+                f"{key}, not a harness session id. To continue that child, call "
+                f'sessions_send(session_key="{key}", message=...): it resumes the same '
+                "harness conversation. Do not spawn a new one."
+            )
     raise ToolError(
-        "resume_forbidden: resume_session_id was not recorded for this session or its children"
+        "resume_forbidden: resume_session_id was not recorded for this session or its "
+        "children. To continue one of your harness children (finished or stopped), "
+        "call sessions_send(session_key=<the child key>, message=...) - "
+        'subagents(action="list") shows the keys. Do not spawn a new one.'
     )
 
 
@@ -383,7 +414,8 @@ async def spawn_acp_session(
     if model:
         origin["model"] = model
     if resume_origin is not None:
-        origin["resume_session_id"] = resume_session_id
+        # The harness session id itself, even when the caller named the record.
+        origin["resume_session_id"] = resume_origin.get("acp_session_id") or resume_session_id
         if resume_origin.get("record_id"):
             origin["record_id"] = resume_origin.get("record_id")
     if worktree_info is not None:

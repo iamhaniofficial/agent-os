@@ -672,7 +672,11 @@ async def sessions_list(
     name="sessions_history",
     concurrency="parallel",
     read_only=True,
-    description="Retrieve conversation history from a session's transcript.",
+    description=(
+        "Retrieve conversation history from a session's transcript. With answer_offset, "
+        "return only a child's final answer from that character on (the rest of a "
+        "completion that was cut), up to 8,000 characters per call."
+    ),
     params={
         "session_key": {
             "type": "string",
@@ -683,21 +687,32 @@ async def sessions_list(
             "description": "Max messages to return (1-100)",
             "default": 20,
         },
+        "answer_offset": {
+            "type": "integer",
+            "description": "Child sessions: page the final answer from this character "
+            "(the number a cut-off completion names) instead of listing messages",
+        },
     },
     required=["session_key"],
 )
-async def sessions_history(session_key: str, limit: int = 20) -> str:
+async def sessions_history(
+    session_key: str, limit: int = 20, answer_offset: int | None = None
+) -> str:
     if not (1 <= limit <= 100):
         raise ToolError("Limit must be between 1 and 100")
+    if answer_offset is not None and answer_offset < 0:
+        raise ToolError("answer_offset must be 0 or more")
 
     try:
         mgr = _get_session_manager()
         session = await mgr.get_session(session_key)
         if session is None:
             raise ToolError(f"Session not found: {session_key}")
-        messages = await mgr.read_recent_transcript(session_key, limit)
         from agentos.tools.builtin.acp_spawn import compact_acp_history, row_is_acp
 
+        if answer_offset is not None:
+            return await _answer_page(mgr, session_key, answer_offset, acp=row_is_acp(session))
+        messages = await mgr.read_recent_transcript(session_key, limit)
         if row_is_acp(session):
             # Tool bodies clipped so the harness's own text survives truncation.
             messages = compact_acp_history(list(messages or []))
@@ -712,6 +727,30 @@ async def sessions_history(session_key: str, limit: int = 20) -> str:
         raise
     except (ImportError, AttributeError, NotImplementedError) as exc:
         raise _manager_unavailable(exc) from exc
+
+
+#: Characters of a child's final answer one ``answer_offset`` call returns.
+ANSWER_PAGE_CHARS = 8000
+
+
+async def _answer_page(mgr: Any, session_key: str, offset: int, *, acp: bool) -> str:
+    """One page of the child's final answer -- the same text the completion's
+    ``result.text`` was cut from, so its offsets line up."""
+    from agentos.gateway.subagent_announce import read_child_answer
+
+    answer = await read_child_answer(session_key, session_manager=mgr, final_answer=acp)
+    page = answer[offset : offset + ANSWER_PAGE_CHARS]
+    end = offset + len(page)
+    payload: dict[str, Any] = {
+        "session_key": session_key,
+        "answer_offset": offset,
+        "answer_total_chars": len(answer),
+        "answer": page,
+        "next_offset": end if end < len(answer) else None,
+    }
+    if payload["next_offset"] is not None:
+        payload["note"] = f"More follows: call again with answer_offset={end}."
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------

@@ -342,7 +342,12 @@ async def test_group_payloads_fall_back_when_task_ledger_is_unavailable() -> Non
             "status": "timeout",
             "terminal_reason": "timeout",
             "parent_task_id": PARENT_TASK,
-            "result": {"text": "late output", "truncated": False, "source_role": "assistant"},
+            "result": {
+                "text": "late output",
+                "truncated": False,
+                "full_chars": 11,
+                "source_role": "assistant",
+            },
             "agent_id": "worker",
         }
     ]

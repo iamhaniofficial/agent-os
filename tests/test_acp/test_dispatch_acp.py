@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
 from acp_runtime_helpers import wait_until
 from acp_s_fakes import FakeRuntime, Script
 from acp_s_harness import PARENT_KEY, acp_rig
@@ -685,10 +686,13 @@ async def test_user_stop_tells_the_parent_not_to_restart(tmp_path) -> None:
         # The persisted completion and the live event say the same.
         completions = await _completions(rig, 1)
         assert completions[-1]["stopped_by"] == "user"
-        assert completions[-1]["terminal_message"] == STOP_TEXT
+        assert completions[-1]["terminal_message"].startswith(STOP_TEXT)
+        # ... and how to continue that run instead of spawning a new one.
+        assert f'sessions_send(session_key="{child}"' in completions[-1]["terminal_message"]
         assert completions[-1]["cancel_source"] == "acp_rpc_cancel"
         live = [p for _, n, p in rig.events if n == "session.event.subagent_completion"]
-        assert live[-1]["terminal_message"] == STOP_TEXT
+        assert live[-1]["terminal_message"] == completions[-1]["terminal_message"]
+        assert f'continue_with=sessions_send(session_key="{child}"' in wake
 
 
 async def test_stop_before_the_parent_yields_still_reaches_the_wake(tmp_path) -> None:
@@ -794,7 +798,7 @@ async def test_user_stop_has_a_user_facing_message_and_last_turn_summary(tmp_pat
         assert completions[-1]["user_message"] == (
             "You stopped this Claude Code run after 2 tool calls (0:00)."
         )
-        assert completions[-1]["terminal_message"] == STOP_TEXT  # still for the parent
+        assert completions[-1]["terminal_message"].startswith(STOP_TEXT)  # for the parent
         last_turn = (await rig.sessions.get_session(child)).origin["last_turn"]
         assert last_turn["stopped_by"] == "user"
         assert last_turn["summary"] == "Stopped by you after 2 tool calls (0:00)."
@@ -834,3 +838,101 @@ async def test_parent_kill_is_recorded_but_does_not_wake_the_parent(tmp_path) ->
         last_turn = (await rig.sessions.get_session(child)).origin["last_turn"]
         assert last_turn["stopped_by"] == "agent"
         assert last_turn["summary"] == "Stopped by the agent after 2 tool calls (0:00)."
+
+
+async def test_a_cut_answer_tells_the_parent_where_the_rest_is(tmp_path) -> None:
+    """agent:main:acp:ef3f879b: a 17,116-character report was cut at 12,000
+    and the parent re-read every file itself instead of reading the rest."""
+    head = "".join(f"Section {i}: " + "finding " * 30 + "\n" for i in range(40))
+    report = (head * 2)[:17_116]
+    script = Script(
+        events=[
+            AcpEvent(kind="tool_call", tool_call_id="r", tool_kind="read", title="Read x"),
+            AcpEvent(kind="tool_call_update", tool_call_id="r", status="completed"),
+            AcpEvent(kind="text_delta", text=report),
+        ],
+        result=AcpTurnResult(stop_reason="end_turn"),
+    )
+    async with acp_rig(tmp_path, FakeRuntime([script])) as rig:
+        sent = _capture_parent_wakes(rig)
+        out = await _spawn(task="audit", acp_agent="claude")
+        child = out["session_key"]
+        await sessions_tool.sessions_yield()
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        assert await wait_until(lambda: bool(sent)), "parent was not woken"
+
+        completions = await _completions(rig, 1)
+        result = completions[-1]["result"]
+        assert result["truncated"] is True and len(result["text"]) == 12_000
+        assert result["full_chars"] == len(report.strip())
+        wake = sent[-1]
+        assert "result_truncated=true" in wake
+        assert (
+            f"The answer was cut at 12,000 of {len(report.strip()):,} characters; read the "
+            f'rest with sessions_history(session_key="{child}", answer_offset=12000) - do '
+            "not redo the work."
+        ) in wake
+
+        # ... and that call returns exactly the rest, in pages.
+        page = json.loads(await sessions_tool.sessions_history(child, answer_offset=12_000))
+        assert page["answer_total_chars"] == len(report.strip())
+        assert page["answer"] == report.strip()[12_000 : 12_000 + 8_000]
+        assert result["text"] + page["answer"] == report.strip()[: 12_000 + len(page["answer"])]
+        assert page["next_offset"] is None  # 5,116 left: one page
+
+
+async def test_a_long_answer_pages_in_8000_character_steps(tmp_path) -> None:
+    report = "x" * 30_000
+    script = Script(
+        events=[AcpEvent(kind="text_delta", text=report)],
+        result=AcpTurnResult(stop_reason="end_turn"),
+    )
+    async with acp_rig(tmp_path, FakeRuntime([script])) as rig:
+        out = await _spawn(task="long", acp_agent="claude")
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        child = out["session_key"]
+        first = json.loads(await sessions_tool.sessions_history(child, answer_offset=12_000))
+        assert len(first["answer"]) == 8_000 and first["next_offset"] == 20_000
+        assert "answer_offset=20000" in first["note"]
+        # The projector caps one turn's text at 24,000 characters.
+        last = json.loads(await sessions_tool.sessions_history(child, answer_offset=20_000))
+        assert last["next_offset"] is None and last["answer_total_chars"] > 24_000 - 1
+
+
+async def test_parent_can_continue_a_stopped_child_instead_of_respawning(tmp_path) -> None:
+    """After the user stopped Claude Code and said "go on", the parent tried a
+    spawn with a resume id, got resume_forbidden and started over."""
+    from agentos.tools.types import ToolError
+
+    runtime = FakeRuntime([_stoppable_script()])
+    async with acp_rig(tmp_path, runtime) as rig:
+        out = await _spawn(task="long job", acp_agent="claude")
+        child = out["session_key"]
+        await asyncio.wait_for(runtime.turn_started.wait(), timeout=5)
+        await asyncio.sleep(0.02)
+        rig.manager.note_stop(child, "user")
+        await rig.task_runtime.cancel(session_key=child, source="acp_rpc_cancel", reason="x")
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        await _completions(rig, 1)
+
+        # A session key (or its hex) is not a harness session id: the error
+        # says how to continue that child.
+        for wrong in (child, child.rsplit(":", 1)[-1]):
+            with pytest.raises(ToolError) as info:
+                await _spawn(task="go on", acp_agent="claude", resume_session_id=wrong)
+            message = str(info.value)
+            assert message.startswith("resume_forbidden:")
+            assert f'sessions_send(session_key="{child}", message=...)' in message
+        with pytest.raises(ToolError, match=r"sessions_send\(session_key=<the child key>"):
+            await _spawn(task="go on", acp_agent="claude", resume_session_id="nope")
+
+        # The child's real harness session id (or its record id) is accepted.
+        row = await rig.sessions.get_session(child)
+        for real in (row.origin["acp_session_id"], row.origin["record_id"]):
+            again = await _spawn(task="go on", acp_agent="claude", resume_session_id=real)
+            new_row = await rig.sessions.get_session(again["session_key"])
+            assert new_row.origin["resume_session_id"] == row.origin["acp_session_id"]
+
+        # The right path: sessions_send resumes the stopped child itself.
+        follow = json.loads(await sessions_tool.sessions_send(child, "go on"))
+        assert follow["session_key"] == child
