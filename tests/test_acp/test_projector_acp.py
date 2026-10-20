@@ -154,7 +154,7 @@ def test_text_is_capped_with_marker() -> None:
     assert "5 more characters" in p.text
     final = p.final_events(AcpTurnResult(stop_reason="end_turn"))
     assert isinstance(final[0], TextDeltaEvent) and "truncated" in final[0].text
-    assert MAX_ASSISTANT_TEXT_CHARS == 24_000
+    assert MAX_ASSISTANT_TEXT_CHARS == 100_000
 
 
 def test_usage_event_cost_is_remembered() -> None:

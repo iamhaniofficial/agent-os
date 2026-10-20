@@ -130,7 +130,10 @@ finished, failed, or needs an answer).
 - When a completion says the answer was cut ("The answer was cut at 12,000
   of 17,116 characters"), read the rest with
   `sessions_history(session_key=..., answer_offset=12000)` (repeat with the
-  `next_offset` it returns). Never redo the child's work yourself.
+  `next_offset` it returns). Never redo the child's work yourself. If you
+  still cannot read the rest, tell the user and point them to the child
+  session; never copy files out of a harness's own directories
+  (`~/.claude`, `~/.codex`) or into another agent's workspace.
 - The user may type into a child session directly. Those turns are theirs:
   they are not announced back to you.
 - List children: `subagents(action="list")` (ACP children carry

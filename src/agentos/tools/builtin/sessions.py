@@ -12,6 +12,7 @@ import structlog
 
 from agentos.agents.limits import MAX_SPAWN_DEPTH
 from agentos.gateway.routing import build_subagent_route_envelope
+from agentos.result_budget import register_persisted_result_budget
 from agentos.session.keys import build_subagent_session_key, is_acp_key, parse_agent_id
 from agentos.session.naming import normalize_session_name
 from agentos.tools.registry import tool
@@ -729,28 +730,59 @@ async def sessions_history(
         raise _manager_unavailable(exc) from exc
 
 
-#: Characters of a child's final answer one ``answer_offset`` call returns.
-ANSWER_PAGE_CHARS = 8000
+#: Longest ``sessions_history`` result an ``answer_offset`` page may be, as
+#: encoded JSON. Every cap between the tool and the model sits at or above
+#: 4,000 characters: the transcript ceiling registered below, the in-turn
+#: provider cap (6,344 at a 4k-token window, 160,000 at 200k) and the
+#: later-turn history cap (4,000-12,000). An 8,000-character page passed the
+#: in-turn cap but was stored -- and replayed in later turns -- cut to 2,000
+#: characters with "…", so a page now always fits whole.
+ANSWER_PAGE_RESULT_CHARS = 3_900
+#: Transcript ceiling for ``sessions_history`` results (default for tools: 2,000).
+SESSIONS_HISTORY_PERSIST_CHARS = 4_000
+
+
+def _encoded(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False)
 
 
 async def _answer_page(mgr: Any, session_key: str, offset: int, *, acp: bool) -> str:
     """One page of the child's final answer -- the same text the completion's
-    ``result.text`` was cut from, so its offsets line up."""
+    ``result.text`` was cut from, so its offsets line up -- sized so the whole
+    JSON result stays within :data:`ANSWER_PAGE_RESULT_CHARS` (JSON escaping
+    of quotes and newlines counts too)."""
     from agentos.gateway.subagent_announce import read_child_answer
 
     answer = await read_child_answer(session_key, session_manager=mgr, final_answer=acp)
-    page = answer[offset : offset + ANSWER_PAGE_CHARS]
-    end = offset + len(page)
     payload: dict[str, Any] = {
         "session_key": session_key,
         "answer_offset": offset,
         "answer_total_chars": len(answer),
-        "answer": page,
-        "next_offset": end if end < len(answer) else None,
+        "answer": "",
+        "next_offset": None,
+        "note": "",
     }
-    if payload["next_offset"] is not None:
-        payload["note"] = f"More follows: call again with answer_offset={end}."
-    return json.dumps(payload, ensure_ascii=False)
+    take = min(len(answer) - offset, ANSWER_PAGE_RESULT_CHARS) if offset < len(answer) else 0
+    while True:
+        end = offset + take
+        payload["answer"] = answer[offset:end]
+        payload["next_offset"] = end if end < len(answer) else None
+        payload["note"] = (
+            f"More follows: call again with answer_offset={end}."
+            if payload["next_offset"] is not None
+            else "End of the answer."
+        )
+        overflow = len(_encoded(payload)) - ANSWER_PAGE_RESULT_CHARS
+        if overflow <= 0 or take == 0:
+            return _encoded(payload)
+        take = max(0, take - overflow)
+
+
+def _sessions_history_persist_budget() -> int:
+    return SESSIONS_HISTORY_PERSIST_CHARS
+
+
+register_persisted_result_budget("sessions_history", _sessions_history_persist_budget)
 
 
 # ---------------------------------------------------------------------------

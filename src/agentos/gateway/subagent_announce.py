@@ -1024,7 +1024,10 @@ def _format_parent_wake_message(
                 lines.append(
                     f"The answer was cut at {kept_chars:,} of {full_chars:,} characters; read "
                     f'the rest with sessions_history(session_key="{child_session_key}", '
-                    f"answer_offset={kept_chars}) - do not redo the work."
+                    f"answer_offset={kept_chars}) - do not redo the work. If you still cannot "
+                    "read the rest, tell the user and point them to the child session; never "
+                    "copy files out of a harness's own directories (~/.claude, ~/.codex) or "
+                    "into another agent's workspace."
                 )
         error_class, error_message = _sanitized_failure_fields(payload)
         if error_class:
