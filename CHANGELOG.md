@@ -23,30 +23,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   copy-address button onto a second line in the chat-side panel or the desk.
 - The agent's own emoji is now ⚙️ instead of 🧢, both in the system prompt's
   product identity and in the desktop Trading desk's managed `IDENTITY.md`.
-
-## [2026.10.19] - 2026-10-19
-
-### Added
-- Restart the gateway from chat. `/restart [force]` in the web console and
-  the desktop app and, when `[gateway_control] chat_restart = true`, from any
-  paired Telegram, Discord or Slack sender; the `gateway` tool's `restart`
-  action works for the agent under the same toggle. The gateway acknowledges,
-  drains the active turns (30s; `force` cancels them), re-executes itself in
-  place so launchd, systemd, the desktop app and `agentos gateway start` all
-  keep tracking the same process, and posts "Gateway restarted" back to the
-  chat that asked. `agentos gateway restart` (new `--force`) and
-  `agentos upgrade` use the same in-place restart for a healthy gateway they
-  do not manage, which they used to refuse (exit 3) or silently skip with the
-  old code still running. New RPC `gateway.restart`. Not available on Windows.
-- Desktop Trade tab: each token in the holdings table has a copy icon next to
-  its ticker that puts the token's contract address on the clipboard (native
-  ETH, which has no contract, gets none).
-
-### Changed
-- The Bankr mark now sits on Bankr's purple tile (the square app icon) wherever
-  it appears: the Skills page's Bankr tab and catalog cards, the desktop Skills
-  panel, and the Bankr LLM Gateway provider tile in desktop Settings and the
-  setup wizard, which now fills its plate edge to edge.
 - A finished `oneshot` ACP child is now idle, not closed: a follow-up
   (`sessions_send`, or the user typing into the child) resumes its harness
   session in a new process. If the harness cannot resume, a fresh session
@@ -80,8 +56,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   tools"); the ACP kind moves to `input.acp_kind`. `acp.status` activity
   uses the same labels.
 - An ACP completion's `result.text` is the harness's final answer (the text
-  after its last tool call); narration split by tool calls is kept as
-  separate paragraphs in the child transcript.
+  from its last substantial run, at least 40 characters and half the longest
+  run, to the end), so a closing remark after a last tool call no longer
+  replaces the report; narration split by tool calls is kept as separate
+  paragraphs in the child transcript.
 
 ### Fixed
 - A resumed ACP turn was charged the whole session's cost: Claude Code's
@@ -134,6 +112,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   forbid copying files out of a harness's own directories.
 - An ACP child's `activity` reads "Thinking…" once its tool calls have
   finished and no text has arrived, instead of the last command for minutes.
+
+## [2026.10.19] - 2026-10-19
+
+### Added
+- Restart the gateway from chat. `/restart [force]` in the web console and
+  the desktop app and, when `[gateway_control] chat_restart = true`, from any
+  paired Telegram, Discord or Slack sender; the `gateway` tool's `restart`
+  action works for the agent under the same toggle. The gateway acknowledges,
+  drains the active turns (30s; `force` cancels them), re-executes itself in
+  place so launchd, systemd, the desktop app and `agentos gateway start` all
+  keep tracking the same process, and posts "Gateway restarted" back to the
+  chat that asked. `agentos gateway restart` (new `--force`) and
+  `agentos upgrade` use the same in-place restart for a healthy gateway they
+  do not manage, which they used to refuse (exit 3) or silently skip with the
+  old code still running. New RPC `gateway.restart`. Not available on Windows.
+- Desktop Trade tab: each token in the holdings table has a copy icon next to
+  its ticker that puts the token's contract address on the clipboard (native
+  ETH, which has no contract, gets none).
+
+### Changed
+- The Bankr mark now sits on Bankr's purple tile (the square app icon) wherever
+  it appears: the Skills page's Bankr tab and catalog cards, the desktop Skills
+  panel, and the Bankr LLM Gateway provider tile in desktop Settings and the
+  setup wizard, which now fills its plate edge to edge.
 
 ## [2026.10.16] - 2026-10-16
 
