@@ -142,7 +142,7 @@ Open Settings with ⌘, or the toolbar gear. Escape or **Done** closes it.
 
 | Group | Sections |
 | --- | --- |
-| Agent | Providers, Pilot Router, Skills, Environment, Trading |
+| Agent | Providers, Pilot Router, Skills, Channels, Environment, Trading |
 | App | Gateway, Appearance, Notifications, Security, Behaviour, Shortcuts |
 | More | Advanced, About |
 
@@ -152,6 +152,18 @@ same guided setup the Web UI uses. Appearance holds the theme
 the optional pet mascot. Behaviour holds open at login, what to open at
 launch, stopping the gateway on quit, the Quick Ask shortcut, and Return vs
 ⌘Return to send.
+
+Channels is the Web UI's Channels screen inside the app: every messaging
+adapter the gateway is configured with (Telegram, Discord, Slack, Microsoft
+Teams, Email), its live status, when it connected and how often it has been
+restarted. **Add channel** opens a sheet built from the gateway's adapter
+catalog: pick the adapter, paste what it needs, save; **Configure** reopens
+it for an existing channel with the adapter and name locked, and a secret
+left blank keeps the one already stored. Each card has an Enabled switch,
+Restart and Remove, and a Telegram card lists who is waiting to pair and who
+is in, with Pair, Deny and Disconnect. Changes to the configuration restart
+a gateway the app manages so they apply at once; an external gateway is
+told to restart.
 
 Environment is the Web UI's Environment screen inside the app: every variable
 the gateway, its providers and your skills read, grouped by what uses it,

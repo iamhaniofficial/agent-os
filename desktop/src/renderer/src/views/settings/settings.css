@@ -1221,3 +1221,367 @@
 .env-dialog .stg-error {
   color: var(--danger);
 }
+
+/* ── Channels ────────────────────────────────────────────────────────────── */
+
+/* Telegram admission, inside a channel card: a quiet block of rows. */
+.chn-access {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 18px 14px;
+  border-top: 1px solid var(--hairline);
+}
+.chn-access[data-pending='true'] {
+  background: color-mix(in srgb, var(--warn) 5%, transparent);
+}
+.chn-access__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+}
+.chn-access__title {
+  font-size: 13px;
+  font-weight: 500;
+}
+.chn-access__groups {
+  font-size: 11.5px;
+  color: var(--muted-foreground);
+}
+.chn-access__group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.chn-access__label {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.chn-access__label > span {
+  margin-left: 4px;
+  font-family: var(--font-mono);
+  letter-spacing: 0;
+}
+.chn-access__empty {
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.chn-person {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--foreground) 4%, transparent);
+  box-shadow: inset 0 0 0 0.5px var(--hairline);
+}
+.chn-person__who {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+.chn-person__name {
+  font-size: 12.5px;
+  font-weight: 500;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.chn-person__meta {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.chn-person__actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 6px;
+}
+.chn-person__actions .mac-button {
+  white-space: nowrap;
+}
+
+/* The raw runtime row, folded under the card like the installer log. */
+.chn-details {
+  margin: 8px 18px 14px;
+}
+.chn-details > pre {
+  max-height: 220px;
+}
+
+/* ── Channels: the setup sheet ───────────────────────────────────────────── */
+
+.chn-sheet__overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 64px;
+  background: color-mix(in srgb, var(--background) 55%, transparent);
+  backdrop-filter: blur(2px);
+}
+.chn-sheet {
+  display: flex;
+  width: min(620px, calc(100vw - 48px));
+  max-height: calc(100vh - 112px);
+  flex-direction: column;
+  border-radius: var(--radius-dialog);
+  background: var(--popover);
+  box-shadow:
+    0 0 0 0.5px var(--border),
+    0 24px 60px rgba(0, 0, 0, 0.38),
+    0 2px 8px rgba(0, 0, 0, 0.18);
+  outline: none;
+  transform-origin: top center;
+}
+.chn-sheet__frame {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+.chn-sheet__head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 18px 20px 12px;
+}
+.chn-sheet__head h2 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.chn-sheet__head p {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.chn-sheet__body {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 18px;
+  overflow-y: auto;
+  padding: 4px 20px 16px;
+}
+.chn-sheet__state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 0;
+  font-size: 12.5px;
+  color: var(--muted-foreground);
+}
+.chn-sheet__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--hairline);
+}
+.chn-sheet__feedback {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  font-size: 12px;
+}
+.chn-sheet__note {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dim);
+}
+.chn-sheet__problem {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: var(--danger);
+}
+.chn-sheet__problem[data-tone='warn'] {
+  color: var(--warn);
+}
+.chn-sheet__buttons {
+  display: flex;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
+.chn-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.chn-section__title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.chn-section__title .mac-help,
+.chn-section__title .prov-keylink {
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.chn-section__blurb {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--muted-foreground);
+}
+
+/* Adapter picker: the provider grid, narrower. */
+.chn-types {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 8px;
+}
+.chn-type {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 9px 11px;
+  border-radius: var(--radius-surface);
+  text-align: left;
+  background: color-mix(in srgb, var(--card) 72%, transparent);
+  box-shadow: 0 0 0 0.5px var(--hairline);
+  transition:
+    background-color 100ms ease-out,
+    box-shadow 100ms ease-out;
+}
+.chn-type:hover:not(:disabled) {
+  background: var(--card);
+  box-shadow: 0 0 0 0.5px var(--border);
+}
+.chn-type[aria-checked='true'] {
+  background: color-mix(in srgb, var(--primary) 7%, var(--card));
+  box-shadow: 0 0 0 1.5px var(--primary);
+}
+.chn-type:disabled:not([aria-checked='true']) {
+  opacity: 0.45;
+}
+.chn-type:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.chn-type__text {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+.chn-type__name {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.chn-type__meta {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* What the adapter needs before it can be set up. */
+.chn-needs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--primary) 6%, transparent);
+  box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--primary) 25%, transparent);
+}
+.chn-needs__title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--primary);
+}
+.chn-needs ul {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding-left: 16px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--foreground);
+  list-style: disc;
+}
+
+/* The form: label above control, two columns, long fields across both. */
+.chn-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 14px;
+}
+.chn-field[data-wide='true'] {
+  grid-column: 1 / -1;
+}
+.chn-field .mac-input,
+.chn-field .mac-select {
+  width: 100%;
+}
+.chn-field__switch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 30px;
+}
+.chn-field__switch > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+.chn-advanced {
+  border-radius: var(--radius);
+  box-shadow: inset 0 0 0 0.5px var(--hairline);
+}
+.chn-advanced__summary {
+  min-height: 36px;
+  padding: 6px 12px;
+  border-top: 0;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.chn-advanced[open] > .chn-advanced__summary {
+  border-bottom: 1px solid var(--hairline);
+}
+.chn-advanced > .chn-fields {
+  padding: 12px;
+}
+@media (max-width: 560px) {
+  .chn-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

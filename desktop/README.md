@@ -68,8 +68,9 @@ desktop/
             │                 #   self-saving brief, the chats filed there
             ├── views/quick-ask/ # The Quick Ask panel (its own window, `#/quick-ask`)
             ├── views/settings/ # Settings sheet: SettingsPanel (rail + section), one pane
-            │                 #   per section (providers, router, gateway, appearance,
-            │                 #   security, behaviour, shortcuts, advanced, about), parts.tsx, logic.ts
+            │                 #   per section (providers, router, skills, channels, environment,
+            │                 #   trading, gateway, appearance, notifications, security, behaviour,
+            │                 #   shortcuts, advanced, about), parts.tsx, logic.ts, channels-logic.ts
             ├── components/   #   Sidebar (+ resizer, project folders, session list with
             │                 #   its row menu and view menu), Toolbar, menu/ (PopMenu,
             │                 #   Menu, items, submenus), pet/, composer/
@@ -122,7 +123,7 @@ rail of sections on the left, the chosen one on the right as soft cards,
 Escape or "Done" to leave, the section remembered between opens (the
 `settingsOpen` / `settingsSection` flags in `stores/ui.ts`). Reached from the
 toolbar gear, ⌘, or the app menu's "Settings…" (main pushes `settings:open`). App preferences persist to `settings.json` through
-`settings:update`; `shared/settings.ts` owns that schema. The two agent
+`settings:update`; `shared/settings.ts` owns that schema. The agent
 sections edit the **gateway's** configuration instead, through the same
 guided RPCs the web console's setup uses, with the `config.snapshot`
 revision on every write so a stale form cannot overwrite a newer file.
@@ -131,6 +132,7 @@ revision on every write so a stale form cannot overwrite a newer file.
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Models        | Provider (catalog from `onboarding.catalog`), API key / env key / base URL / proxy, default model from `models.list`; saved via `onboarding.provider.configure`. Thinking level via `config.set`.                                                                                                                                                                                                                                                                                                                                  |
 | Pilot Router  | Mode (Pilot / LLM judge / Off), default tier, safety net, judge model, translation cap, and the tier ladder c0–c3 + vision with a model and thinking level per rung; saved via `onboarding.router.configure` using the console's `buildRouterConfigureParams`.                                                                                                                                                                                                                                                                     |
+| Channels      | The console's Channels screen: every configured adapter from `channels.status` with status, connected time, restart count and the Telegram pairing list (`channels.pairing.*`); Add/Configure through a sheet built from the catalog's channel specs (`onboarding.channel.probe` + `upsert`), an Enabled switch (`onboarding.channel.enable`/`disable`), Restart (`channels.restart`) and Remove (`onboarding.channel.remove`), all with the snapshot revision; a managed gateway is restarted to apply, as Providers does. |
 | Gateway       | Live status with Start/Stop/Restart, endpoint copy + open console; an editable draft of mode/host/port/token/CLI path with validation, Save/Revert, and a "restart to apply" notice when the running endpoint differs.                                                                                                                                                                                                                                                                                                             |
 | Appearance    | Theme + palette (`ThemeRows`), text size (`data-text-size` on `<html>`), reduce transparency (`data-transparency` + `win.setVibrancy`).                                                                                                                                                                                                                                                                                                                                                                                            |
 | Notifications | Master switch; what happens while the window is in front (nothing / in-app banner / system notification); Do not disturb (30 min, 1 h, 3 h, until tomorrow 9:00); show details; per-event switches (reply finished with a minimum length, reply failed, approval needed, scheduled job runs off/failures/all, gateway stopped on its own); sound on/off and which (the app chime or a macOS alert sound); Dock badge and bounce; a test button and a door to System Settings › Notifications. See [Notifications](#notifications). |

@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- Desktop app: Settings › Channels, the Web UI's Channels screen inside the
+  app. Every configured messaging adapter with its live status, connected
+  time and restart count; a guided sheet to add a channel or configure one
+  from the gateway's adapter catalog (secrets write-only, a blank one keeps
+  what is stored); an Enabled switch, Restart and Remove per channel; and
+  Telegram pairing (pair, deny, disconnect) in the card. Same RPCs as the
+  console (`channels.status`, `channels.pairing.*`, `onboarding.channel.*`)
+  with the config snapshot's revision on every write.
+
 ### Changed
 - Desktop Trade tab: token rows name their network with its mark alone (the
   name is the tooltip), so a long ticker no longer pushes the chain or the
