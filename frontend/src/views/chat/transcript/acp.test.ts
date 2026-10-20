@@ -1,3 +1,4 @@
+import { within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   buildCompletionCard,
@@ -226,6 +227,55 @@ describe('completion card', () => {
     expect(toggle).toHaveAttribute('aria-expanded', 'true')
   })
 
+  // Round 5: a reply the gateway cut short expanded to text that just stopped
+  // mid-sentence. It now ends on a line that says how much this is.
+  it('ends a cut-short reply with how much it shows and the way to the rest', () => {
+    const shown = 'Token report. '.repeat(40) + 'And the next token is'
+    const openSession = vi.fn()
+    const card = buildCompletionCard(
+      fullPayload({ result: { text: shown, truncated: true, full_chars: 17_116 } }),
+      { markdown, openSession },
+    )
+    const region = card.querySelector<HTMLElement>('.acp-done__result')!
+    const more = region.querySelector<HTMLElement>('.acp-done__result-clip > .acp-done__more')!
+    // At the end of the result itself, after the text, where the text stops.
+    expect(more.previousElementSibling).toHaveClass('acp-done__result-text')
+    expect(more).toHaveTextContent(
+      `Showing ${shown.length.toLocaleString('en-US')} of 17,116 characters — Open session for the full report`,
+    )
+    // Out of reach while the reply is clamped; reachable once expanded.
+    expect(more).toHaveAttribute('inert')
+    card.querySelector<HTMLButtonElement>('[data-action="toggle-result"]')!.click()
+    expect(more).not.toHaveAttribute('inert')
+    // The link does what Open session does.
+    within(more).getByRole('button', { name: 'Open session for the full report' }).click()
+    expect(openSession).toHaveBeenCalledWith(CHILD)
+    card.querySelector<HTMLButtonElement>('[data-action="toggle-result"]')!.click()
+    expect(more).toHaveAttribute('inert')
+  })
+
+  it('falls back to "the first part" without full_chars, and to no link without a navigator', () => {
+    const shown = 'x'.repeat(400)
+    const part = buildCompletionCard(fullPayload({ result: { text: shown, truncated: true } }), {
+      markdown,
+      openSession: vi.fn(),
+    })
+    expect(part.querySelector('.acp-done__more')).toHaveTextContent(
+      'Showing the first part — Open session for the full report',
+    )
+    const noLink = buildCompletionCard(
+      fullPayload({ result: { text: shown, truncated: true, full_chars: 12_345 } }),
+      { markdown },
+    )
+    expect(noLink.querySelector('.acp-done__more')).toHaveTextContent(
+      'Showing 400 of 12,345 characters.',
+    )
+    expect(noLink.querySelector('.acp-done__more button')).toBeNull()
+    // Not cut short: no such line.
+    const whole = buildCompletionCard(fullPayload(), { markdown })
+    expect(whole.querySelector('.acp-done__more')).toBeNull()
+  })
+
   it('draws a legacy payload from its stats line alone', () => {
     const legacy = {
       type: 'subagent_completion',
@@ -239,7 +289,9 @@ describe('completion card', () => {
     expect(card).toHaveAttribute('data-runtime', 'acp')
     expect(card.querySelector('.acp-done__title')).toHaveTextContent('Coding agent finished')
     expect(chipTexts(card)).toEqual(['50s', '211k tokens', '$0.40'])
-    expect(card.querySelector('.acp-done__note')).toHaveTextContent('cut short')
+    // Cut short, no full length known, no navigator: it just says so.
+    expect(card.querySelector('.acp-done__more')).toHaveTextContent('Showing the first part.')
+    expect(card.querySelector('.acp-done__more button')).toBeNull()
     // No navigator handed over: no "Open session".
     expect(card.querySelector('[data-action="open-session"]')).toBeNull()
 
