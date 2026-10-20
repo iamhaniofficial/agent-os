@@ -761,7 +761,7 @@ const IDENTITY_MD = `# IDENTITY.md
 ${MANAGED_MARK}
 
 Name: Trading desk
-Emoji: 🧢
+Emoji: ⚙️
 Creature: desk
 Vibe: calm execution
 Theme:
