@@ -1183,6 +1183,15 @@
   color: var(--dim);
   background: color-mix(in srgb, var(--foreground) 7%, transparent);
 }
+/* In a token row the network is its mark alone; the name is the tooltip. */
+.trd-asset__chainmark {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.trd-asset__chainmark .trd-chainmark {
+  width: 12px;
+  height: 12px;
+}
 /* In the chain filter the mark stands alone next to the segment's own label. */
 .trd-chainpick .trd-chainmark {
   margin-right: 5px;
