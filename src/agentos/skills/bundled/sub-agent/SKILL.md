@@ -101,8 +101,10 @@ the error and ask; do not silently switch harness or do the work yourself.
   run in a managed git worktree instead of the checkout. Use it for parallel
   workers on one repo and for anything you want isolated from the user's
   working tree.
-- `resume_session_id`: continue an earlier harness session you or your
-  children started.
+- `resume_session_id`: the harness session id (`acp_session_id`) of a
+  child that was closed, to carry its conversation into a new child. A child
+  that is only finished or stopped is continued with `sessions_send`
+  instead (below); never pass a session key here.
 
 ## Wait
 
@@ -121,6 +123,14 @@ finished, failed, or needs an answer).
   harness conversation; if the reply starts with "Started a new ...
   session; the previous context could not be resumed", the harness lost
   the earlier context, so include what it needs in the message.
+- To continue a stopped or finished child ("let Claude Code carry on"),
+  `sessions_send(session_key="agent:<you>:acp:<id>", message=...)`: it
+  resumes the same harness conversation with everything it already did. Do
+  not spawn a new one for it.
+- When a completion says the answer was cut ("The answer was cut at 12,000
+  of 17,116 characters"), read the rest with
+  `sessions_history(session_key=..., answer_offset=12000)` (repeat with the
+  `next_offset` it returns). Never redo the child's work yourself.
 - The user may type into a child session directly. Those turns are theirs:
   they are not announced back to you.
 - List children: `subagents(action="list")` (ACP children carry

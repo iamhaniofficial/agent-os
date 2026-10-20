@@ -458,11 +458,14 @@ def _stop_fields(row: Any, *, status: Any, cancel_source: str | None) -> dict[st
             ),
             "user_message": f"Stopped by the agent{when}.",
         }
+    key = _session_key(row)
     return {
         "stopped_by": "user",
         "terminal_message": (
             f"The user stopped this {name} run{when}. Do not restart it; tell the user what "
-            "was done so far and ask how to continue."
+            "was done so far and ask how to continue. If they want it to go on, "
+            f'sessions_send(session_key="{key}", message=...) resumes this run; do not '
+            "spawn a new one."
         ),
         "user_message": f"You stopped this {name} run{when}.",
     }
@@ -490,14 +493,27 @@ async def _read_child_result(
     session_manager: Any,
     final_answer: bool = False,
 ) -> dict[str, Any]:
-    """The child's latest assistant answer.
+    """The child's latest assistant answer, capped for the completion payload.
 
     ``final_answer`` (ACP harness children): only the latest turn counts --
     a turn that produced no text yields ``""`` rather than an older answer --
-    and the result is the harness's final answer, the text after its last
-    tool call, not the narration in between (the child transcript keeps all
-    of it).
+    and the result is the harness's final answer, not the narration in
+    between (the child transcript keeps all of it).
     """
+    text = await read_child_answer(
+        child_session_key, session_manager=session_manager, final_answer=final_answer
+    )
+    return _result_payload(text, source_role="assistant" if text else None)
+
+
+async def read_child_answer(
+    child_session_key: str,
+    *,
+    session_manager: Any,
+    final_answer: bool = False,
+) -> str:
+    """The full text :func:`_read_child_result` caps; ``sessions_history``
+    pages through it with ``answer_offset`` when a completion was cut."""
     # read_recent_transcript windows from the newest end; read_transcript
     # windows from the oldest end and is kept here only as a fallback for a
     # session_manager stand-in that predates read_recent_transcript -- a
@@ -511,9 +527,9 @@ async def _read_child_result(
         elif callable(read_transcript):
             rows = await read_transcript(child_session_key, limit=50)
         else:
-            return _result_payload("")
+            return ""
     except Exception:
-        return _result_payload("")
+        return ""
     for row in reversed(list(rows or [])):
         role = _row_value(row, "role")
         if final_answer and role == "user":
@@ -524,8 +540,8 @@ async def _read_child_result(
         if text and final_answer:
             text = _final_answer_text(row, text)
         if text:
-            return _result_payload(text, source_role="assistant")
-    return _result_payload("")
+            return text
+    return ""
 
 
 #: A text run shorter than this ("Done.") is never the answer on its own.
@@ -582,6 +598,10 @@ def _result_payload(text: str, *, source_role: str | None = None) -> dict[str, A
     return {
         "text": text[:_RESULT_MAX_CHARS],
         "truncated": truncated,
+        # The whole answer's length, so a parent shown the first 12,000
+        # characters knows how much is left to read (sessions_history
+        # ``answer_offset``) instead of redoing the work.
+        "full_chars": len(text),
         "source_role": source_role,
     }
 
@@ -591,22 +611,23 @@ def _bounded_parent_wake_result_text(
     *,
     child_session_key: str,
     budget_chars: int,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, int]:
+    """``(wake text, cut for the wake, answer characters kept)``."""
     if budget_chars <= 0:
         notice = (
             "[subagent result omitted from parent wake because the group output "
             f"budget was exhausted; full output remains in child session transcript: "
             f"{child_session_key}]"
         )
-        return notice[:_PARENT_WAKE_TRUNCATION_NOTICE_MAX_CHARS], True
+        return notice[:_PARENT_WAKE_TRUNCATION_NOTICE_MAX_CHARS], True, 0
     if len(text) <= budget_chars:
-        return text, False
+        return text, False, len(text)
     notice = (
         "\n[subagent result truncated for parent wake; full output remains in "
         f"child session transcript: {child_session_key}]"
     )
     slice_budget = max(0, budget_chars - len(notice))
-    return text[:slice_budget] + notice, True
+    return text[:slice_budget] + notice, True, slice_budget
 
 
 async def _build_parent_wake_payloads(
@@ -971,13 +992,13 @@ def _format_parent_wake_message(
     result_budget_remaining = _PARENT_WAKE_RESULTS_MAX_CHARS
     for index, payload in enumerate(payloads):
         result = payload.get("result")
-        text = result.get("text") if isinstance(result, dict) else ""
-        if not isinstance(text, str) or not text:
-            text = "[no assistant output]"
+        raw_text = result.get("text") if isinstance(result, dict) else ""
+        has_answer = isinstance(raw_text, str) and bool(raw_text)
+        text: str = raw_text if isinstance(raw_text, str) and raw_text else "[no assistant output]"
         child_session_key = str(payload.get("child_session_key", ""))
         remaining_payloads = max(1, len(payloads) - index)
         child_budget = result_budget_remaining // remaining_payloads
-        text, truncated_for_wake = _bounded_parent_wake_result_text(
+        text, truncated_for_wake, kept_chars = _bounded_parent_wake_result_text(
             text,
             child_session_key=child_session_key,
             budget_chars=child_budget,
@@ -996,6 +1017,15 @@ def _format_parent_wake_message(
         result_truncated = result.get("truncated") if isinstance(result, dict) else False
         if result_truncated or truncated_for_wake:
             lines.append("result_truncated=true")
+            full_chars = result.get("full_chars") if isinstance(result, dict) else None
+            if has_answer and isinstance(full_chars, int) and full_chars > kept_chars:
+                # The parent read "the result was cut" and redid the child's
+                # work; tell it exactly where the rest is.
+                lines.append(
+                    f"The answer was cut at {kept_chars:,} of {full_chars:,} characters; read "
+                    f'the rest with sessions_history(session_key="{child_session_key}", '
+                    f"answer_offset={kept_chars}) - do not redo the work."
+                )
         error_class, error_message = _sanitized_failure_fields(payload)
         if error_class:
             lines.append(f"error_class={error_class}")
@@ -1009,6 +1039,11 @@ def _format_parent_wake_message(
         if stopped_by in ("user", "agent") and isinstance(stop_message, str) and stop_message:
             lines.append(f"stopped_by={stopped_by}")
             lines.append(stop_message)
+        if payload.get("runtime") == "acp" and stopped_by != "agent":
+            lines.append(
+                f'continue_with=sessions_send(session_key="{child_session_key}", message=...) '
+                "(resumes this harness conversation; do not spawn a new one)"
+            )
         lines.extend(
             [
                 "<untrusted_subagent_result>",

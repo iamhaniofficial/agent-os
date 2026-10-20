@@ -89,6 +89,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   recorded but is no longer woken by it, so it does not answer twice.
 - An ACP turn whose prompt is with the harness but has no event yet shows
   "Waiting for Claude Code…" instead of "Starting Claude Code…".
+- A long ACP answer cut to 12,000 characters made the parent redo the
+  child's work. The completion's `result` now has `full_chars`, the parent's
+  wake names the cut and the exact `sessions_history(session_key=...,
+  answer_offset=N)` call, and `sessions_history` pages the rest of that
+  answer (8,000 characters per call).
+- A parent asked to continue a stopped child spawned a new one after
+  `resume_forbidden`. That error (and every ACP completion) now points to
+  `sessions_send(session_key=<child>)`, which resumes the same harness
+  conversation; a session key passed as `resume_session_id` is called out as
+  such, and the child's record id is accepted next to its `acp_session_id`.
 
 ## [2026.10.16] - 2026-10-16
 
