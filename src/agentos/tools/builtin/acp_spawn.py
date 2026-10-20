@@ -149,11 +149,19 @@ def resolve_spawn_cwd(
 
 
 def _home_relative(path: Path) -> str:
-    text = str(path)
-    home = os.path.expanduser("~")
-    if home and home not in ("/", "~") and text.startswith(home.rstrip("/") + "/"):
-        return "~" + text[len(home.rstrip("/")) :]
-    return text
+    """``path`` as ``~/…`` with forward slashes when it is under the home
+    directory (so the suggested config value reads the same on every OS),
+    otherwise unchanged."""
+    raw_home = os.path.expanduser("~")
+    if not raw_home or raw_home in ("/", "~"):
+        return str(path)
+    for home in (Path(raw_home), _real(Path(raw_home))):
+        try:
+            rel = path.relative_to(home)
+        except ValueError:
+            continue
+        return "~/" + rel.as_posix() if rel.parts else "~"
+    return str(path)
 
 
 def cwd_refusal_message(

@@ -12,6 +12,7 @@ from agentos.acp.types import AcpEvent
 @pytest.fixture(autouse=True)
 def _home(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", "/Users/x")
+    monkeypatch.setenv("USERPROFILE", "/Users/x")  # what expanduser reads on Windows
 
 
 @pytest.mark.parametrize(

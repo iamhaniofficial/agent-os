@@ -831,7 +831,13 @@ async def test_parent_kill_is_recorded_but_does_not_wake_the_parent(tmp_path) ->
             "Stopped by the agent after 2 tool calls (0:00)."
         )
         assert completions[-1]["terminal_message"].startswith("You stopped this Claude Code run")
-        live = [p for _, n, p in rig.events if n == "session.event.subagent_completion"]
+        # The parent transcript row is written before the live event goes out.
+        live: list[dict] = []
+        for _ in range(100):
+            live = [p for _, n, p in rig.events if n == "session.event.subagent_completion"]
+            if live:
+                break
+            await asyncio.sleep(0.02)
         assert live and live[-1]["stopped_by"] == "agent"
         await asyncio.sleep(0.05)
         assert sent == []  # recorded, not woken

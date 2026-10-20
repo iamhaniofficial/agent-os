@@ -235,6 +235,7 @@ def test_activity_label_is_short_single_line_and_home_relative(monkeypatch) -> N
     from agentos.acp.manager import ACTIVITY_MAX_CHARS
 
     monkeypatch.setenv("HOME", "/Users/x")
+    monkeypatch.setenv("USERPROFILE", "/Users/x")  # what expanduser reads on Windows
     assert tool_label("Read /Users/x/app/a.py", "read") == "Read ~/app/a.py"
     assert tool_label("`ls\n  -la`", "execute") == "Run ls"  # first line only
     assert tool_label(None, "search") == "Searching"

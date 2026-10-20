@@ -279,6 +279,7 @@ async def test_acp_tool_refuses_other_agents_sessions(tmp_path) -> None:
 
 async def test_cwd_refusal_names_the_exact_config_command(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # what expanduser reads on Windows
     outside = tmp_path / "Code" / "my-app"
     outside.mkdir(parents=True)
     async with acp_rig(tmp_path, allowed_cwds=["~/Code/other"]):
