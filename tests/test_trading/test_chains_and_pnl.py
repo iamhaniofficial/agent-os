@@ -8,6 +8,7 @@ from agentos.trading import chains, guardrails
 from agentos.trading.pnl import (
     Lot,
     format_amount,
+    format_ratio,
     holding_from_lots,
     per_raw,
     per_token,
@@ -86,6 +87,28 @@ class TestAmounts:
         assert format_amount(10**18, 18) == "1"
         assert format_amount(123456789012345678, 18) == "0.12345678"
         assert format_amount(0, 18) == "0"
+
+    def test_amounts_wider_than_28_digits_are_exact(self) -> None:
+        """The default Decimal context keeps 28 significant digits.
+
+        Ten billion tokens at 18 decimals is already 29 digits of base units;
+        a 100B-supply token (Bankr and Clanker launches) is 30. Rounding there
+        must not move a base unit, and must never round up.
+        """
+        supply = 10**29  # 100,000,000,000 tokens at 18 decimals
+        assert to_human(supply - 1, 18) == Decimal("99999999999.999999999999999999")
+        assert to_raw("99999999999.999999999999999999", 18) == supply - 1
+        assert to_raw("12345678901.123456789012345678", 18) == 12345678901123456789012345678
+        assert format_amount(supply - 1, 18) == "99999999999.99999999"
+        assert format_amount(supply - 1, 18, max_places=18) == "99999999999.999999999999999999"
+        assert format_amount(2**256 - 1, 18).startswith(
+            "115792089237316195423570985008687907853269"
+        )
+        assert format_amount(-(supply - 1), 18) == "-99999999999.99999999"
+
+    def test_ratio_wider_than_28_digits(self) -> None:
+        assert format_ratio(Decimal(10**17), Decimal(1)) == str(10**17)
+        assert format_ratio(Decimal("2"), Decimal("3")) == "0.666666666666"
 
     def test_negative_rejected(self) -> None:
         with pytest.raises(ValueError):
