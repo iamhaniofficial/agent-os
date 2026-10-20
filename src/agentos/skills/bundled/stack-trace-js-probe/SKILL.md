@@ -1,6 +1,6 @@
 ---
 name: stack-trace-js-probe
-description: "Internal helper for meta-stack-trace-investigator. Use when a JavaScript or TypeScript stack trace needs npm/node/tsc-specific checks, reproduction guidance, and patch targets."
+description: "Fixed-shape step helper for stack-trace meta-skill DAGs; not offered to the model. Use when a JavaScript or TypeScript stack trace needs npm/node/tsc-specific checks, reproduction guidance, and patch targets."
 user-invocable: false
 disable-model-invocation: true
 provenance:
