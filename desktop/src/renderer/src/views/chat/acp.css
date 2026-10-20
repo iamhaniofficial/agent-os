@@ -447,6 +447,8 @@
 /* ── Run card: the live status row ────────────────────────────────────── */
 
 .acp-run__status {
+  /* Its own size container: a narrow card drops the running step whole. */
+  container: acp-run-status / inline-size;
   position: relative;
   display: flex;
   align-items: center;
@@ -458,6 +460,19 @@
   border-radius: var(--radius);
   background: color-mix(in srgb, var(--foreground) 4%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hairline) 70%, transparent);
+}
+/* A running step keeps a readable floor and shortens with an ellipsis; when
+   the row has no room for that floor beside the dot and the figures (the
+   indicator 16, the gaps, "120 tool calls" and the clock: ~254 px), the
+   step leaves whole — the row's tooltip carries it — rather than show a
+   sliver ("R 12 tool calls 1:07" at 640 px). */
+.acp-run[data-state='running'] .acp-run__activity {
+  min-width: 6rem;
+}
+@container acp-run-status (width < 260px) {
+  .acp-run[data-state='running'] .acp-run__activity {
+    display: none;
+  }
 }
 /* Settled, the outcome ("Cancelled", "Finished in 48s") is never cut: it
    keeps its width and the figures move onto a second line when the card is

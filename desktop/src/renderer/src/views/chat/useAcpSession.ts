@@ -144,9 +144,13 @@ export function useAcpSession(sessionKey: string, turnRunning: boolean): AcpSess
   const refresh = useCallback(async (): Promise<void> => {
     const key = sessionKey
     try {
-      // On an app reload the bar mounts before the socket is up.
-      await rpc.waitForConnection()
-      if (liveKeyRef.current !== key) return
+      // On an app reload the bar mounts before the socket is up. Connected,
+      // the read goes out in this very tick: after a turn it must not queue
+      // behind the composer's `chat.suggestNext` (a model call).
+      if (rpc.state !== 'connected') {
+        await rpc.waitForConnection()
+        if (liveKeyRef.current !== key) return
+      }
       const row = (await rpc.call('acp.status', { session_key: key })) as AcpLiveRow | null
       attemptsRef.current = 0
       if (row && typeof row === 'object') apply(key, row)
@@ -200,6 +204,17 @@ export function useAcpSession(sessionKey: string, turnRunning: boolean): AcpSess
   const starting = !closed && !active && turnRunning && !runSeenActive
   const working = active || starting
   const polling = turnRunning || active
+
+  // The chat's run just ended while the last answer still said the harness
+  // was active (so the polling below goes on and does not read at once):
+  // read now, before anything else the turn's end sets off. Otherwise the
+  // poll's own edge read below covers it.
+  const prevRunningRef = useRef(turnRunning)
+  useEffect(() => {
+    const was = prevRunningRef.current
+    prevRunningRef.current = turnRunning
+    if (hint && was && !turnRunning && active) void refresh()
+  }, [hint, turnRunning, active, refresh])
 
   // Read on entry and on every edge; poll while the chat or the harness runs.
   useEffect(() => {

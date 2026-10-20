@@ -64,6 +64,13 @@ const SPEC: AcpSpawnSpec = {
   task: 'Look through the workspace and summarize it',
 }
 
+/** What the card says outside its raw-payload "Details" panel. */
+function shownText(card: Element): string {
+  const clone = card.cloneNode(true) as Element
+  clone.querySelectorAll('.acp-details').forEach((node) => node.remove())
+  return clone.textContent || ''
+}
+
 function chipTexts(root: Element): string[] {
   return Array.from(root.querySelectorAll('.acp-chips .acp-chip')).map((c) => c.textContent || '')
 }
@@ -276,7 +283,9 @@ describe('completion card', () => {
     expect(card).toHaveAttribute('data-outcome', 'failed')
     expect(card.querySelector('.acp-done__title')).toHaveTextContent('Claude Code failed')
     expect(card.querySelector('.acp-pill')).toHaveTextContent('Failed')
-    expect(card.querySelector('.acp-done__error')).toHaveTextContent('the harness exited')
+    // The harness's own error, never the parent-facing terminal_message.
+    expect(card.querySelector('.acp-done__error')).toHaveTextContent('exit 1')
+    expect(shownText(card)).not.toContain('the harness exited')
     expect(card.querySelector('.acp-done__result')).toBeNull()
     // Unknown figures are omitted, not drawn as zero.
     expect(chipTexts(card)).toEqual(['3s'])
@@ -286,12 +295,74 @@ describe('completion card', () => {
       { markdown },
     )
     expect(timedOut.querySelector('.acp-pill')).toHaveTextContent('Timed out')
-    expect(timedOut.querySelector('.acp-done__error')).toHaveTextContent('Timed out after 30m')
+    expect(timedOut.querySelector('.acp-done__error')).toHaveTextContent(
+      'Claude Code timed out after 6 tool calls (0:48).',
+    )
 
     const cancelled = buildCompletionCard(fullPayload({ status: 'cancelled' }), { markdown })
     expect(cancelled.querySelector('.acp-done__title')).toHaveTextContent(
       'Claude Code was cancelled',
     )
+  })
+
+  // Round 4: terminal_message is now written for the parent model ("…Do not
+  // restart it; tell the user what was done so far…"): the user never sees it.
+  it("shows the gateway's user_message for a stop, never the parent-facing text", () => {
+    const parentText =
+      'The user stopped this Claude Code run after 21 tool calls (1:00). Do not restart it; ' +
+      'tell the user what was done so far and ask how to continue.'
+    const stopped = fullPayload({
+      status: 'cancelled',
+      terminal_reason: 'cancelled',
+      stopped_by: 'user',
+      terminal_message: parentText,
+      user_message: 'You stopped this Claude Code run after 21 tool calls (1:00).',
+      result: { text: 'Read 12 of 20 files so far.' },
+    })
+    const card = buildCompletionCard(stopped, { markdown })
+    expect(card.querySelector('.acp-done__notice')).toHaveTextContent(
+      'You stopped this Claude Code run after 21 tool calls (1:00).',
+    )
+    expect(card.querySelector('.acp-done__error')).toBeNull()
+    expect(shownText(card)).not.toContain('Do not restart it')
+    // What it did before the stop stays readable under the notice.
+    expect(card.querySelector('.acp-done__result-text')).toHaveTextContent('Read 12 of 20 files')
+  })
+
+  it('derives the user line from who stopped it and the numbers when user_message is missing', () => {
+    const base = {
+      status: 'cancelled',
+      terminal_message: 'The user stopped this run. Do not restart it; tell the user …',
+      usage: { duration_ms: 60_000, tool_calls: 21 },
+      stats: '',
+      result: { text: '' },
+    }
+    const byYou = buildCompletionCard(fullPayload({ ...base, stopped_by: 'user' }), { markdown })
+    expect(byYou.querySelector('.acp-done__notice')).toHaveTextContent(
+      'You stopped this Claude Code run after 21 tool calls (1:00).',
+    )
+    const byAgent = buildCompletionCard(fullPayload({ ...base, stopped_by: 'agent' }), {
+      markdown,
+    })
+    expect(byAgent.querySelector('.acp-done__notice')).toHaveTextContent(
+      'Stopped by the agent after 21 tool calls (1:00).',
+    )
+    const early = buildCompletionCard(
+      fullPayload({ ...base, stopped_by: 'user', usage: { duration_ms: 4_000, tool_calls: 0 } }),
+      { markdown },
+    )
+    expect(early.querySelector('.acp-done__notice')).toHaveTextContent(
+      'You stopped this Claude Code run before any tool call (0:04).',
+    )
+    const bare = buildCompletionCard(fullPayload({ ...base, stopped_by: 'user', usage: null }), {
+      markdown,
+    })
+    expect(bare.querySelector('.acp-done__notice')).toHaveTextContent(
+      'You stopped this Claude Code run.',
+    )
+    for (const card of [byYou, byAgent, early, bare]) {
+      expect(shownText(card)).not.toContain('Do not restart it')
+    }
   })
 })
 
@@ -435,6 +506,33 @@ describe('harness run card + poller', () => {
     expect(card).toHaveAttribute('data-state', 'done')
     expect(card.querySelector('.acp-run__activity')).toHaveTextContent('Finished in 9s')
     expect(m.isPolling()).toBe(false)
+  })
+
+  it('reads a stopped last turn as cancelled, never as failed', async () => {
+    statusAnswer = {
+      session_key: CHILD,
+      last_turn: {
+        stopped_by: 'user',
+        error: 'Harness turn was cancelled by an operator or the parent agent; do not retry it',
+        tool_calls: 3,
+        duration_ms: 20_000,
+      },
+    }
+    const m = mounter()
+    const card = m.harnessCard(SPEC, { live: false })
+    document.body.appendChild(card)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(card).toHaveAttribute('data-state', 'cancelled')
+    expect(card.querySelector('.acp-run__activity')).toHaveTextContent('Cancelled')
+  })
+
+  it('drops a running step whole on a narrow card and keeps it in the row tooltip', async () => {
+    const m = mounter()
+    const card = m.harnessCard(SPEC, { live: true })
+    document.body.appendChild(card)
+    rows = [{ session_key: CHILD, active_turn: true, activity: 'Read src/app.py' }]
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(card.querySelector('.acp-run__status')).toHaveAttribute('title', 'Read src/app.py')
   })
 
   it('on history with the child still running, starts polling from acp.status', async () => {
@@ -621,8 +719,9 @@ describe('harness run card + poller', () => {
     // The completion card shows them too, and the stop as a notice, not an error.
     expect(chipTexts(completion)).toEqual(['1m 40s', '4 tool calls'])
     expect(completion.querySelector('.acp-done__notice')).toHaveTextContent(
-      'Stopped by the operator.',
+      'Claude Code was stopped after 4 tool calls (1:40).',
     )
+    expect(shownText(completion)).not.toContain('Stopped by the operator.')
     expect(completion.querySelector('.acp-done__error')).toBeNull()
   })
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { formatElapsedClock } from '@/views/chat/transcript/acp'
+import { formatElapsedClock, stoppedBy } from '@/views/chat/transcript/acp'
 import { t } from '~/i18n'
 import { ProviderLogo } from '~/views/settings/ProviderLogo'
 import type { AcpSessionView } from './useAcpSession'
@@ -21,6 +21,31 @@ function str(value: unknown): string {
 }
 
 /** The status line's second half: what the harness is doing, or what comes next. */
+/**
+ * How the last turn ended, for the idle line, when that is news. A stop is
+ * never a failure: "Stopped by you" (or the gateway's own summary), whoever
+ * made it and whatever error text the engine wrote for the parent ("…do not
+ * retry it"). Only a real failure reads as one, and in the error tone.
+ */
+export function lastTurnLine(lastTurn: unknown): { text: string; tone: '' | 'error' } | null {
+  if (!lastTurn || typeof lastTurn !== 'object') return null
+  const turn = lastTurn as Record<string, unknown>
+  const summary = str(turn.summary)
+  const who = stoppedBy(turn.stopped_by)
+  const code = str(turn.error_code).toLowerCase()
+  const stop = str(turn.stop_reason).toLowerCase()
+  if (who === 'user') return { text: summary || t('acp.bar.stoppedByYou'), tone: '' }
+  if (who === 'agent') return { text: summary || t('acp.bar.stoppedByAgent'), tone: '' }
+  if (code.includes('cancel') || stop === 'cancelled' || stop === 'canceled') {
+    return { text: summary || t('acp.bar.stopped'), tone: '' }
+  }
+  const error = str(turn.error)
+  if (error) {
+    return { text: t('acp.bar.lastFailed').replace('{message}', summary || error), tone: 'error' }
+  }
+  return null
+}
+
 interface Detail {
   text: string
   tone: '' | 'error'
@@ -36,15 +61,8 @@ function detailFor(view: AcpSessionView): Detail {
     if (view.activity) return { text: view.activity, tone: '', kind: 'activity' }
     return { text: t('acp.bar.starting').replace('{name}', name), tone: '', kind: 'activity' }
   }
-  const lastTurn = info?.last_turn
-  const error = lastTurn && typeof lastTurn === 'object' ? str(lastTurn.error) : ''
-  if (error) {
-    return {
-      text: t('acp.bar.lastFailed').replace('{message}', error),
-      tone: 'error',
-      kind: 'hint',
-    }
-  }
+  const last = lastTurnLine(info?.last_turn)
+  if (last) return { ...last, kind: 'hint' }
   return { text: t('acp.bar.idleHint').replace('{name}', name), tone: '', kind: 'hint' }
 }
 
