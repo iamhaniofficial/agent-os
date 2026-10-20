@@ -1,5 +1,8 @@
 import './chat.css'
 import './chat-unified.css'
+// Coding-harness card styles load as their own chunk, in parallel with the
+// page, so the chat route's CSS stays inside its bundle budget.
+void import('./acp-cards.css')
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { toast } from 'sonner'
