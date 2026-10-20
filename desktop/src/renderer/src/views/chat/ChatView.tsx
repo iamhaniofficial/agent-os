@@ -1,4 +1,5 @@
 import './chat.css'
+import './acp.css'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
@@ -49,7 +50,9 @@ import { useSettings } from '~/stores/settings'
 import { useUi } from '~/stores/ui'
 import { configuredProvider } from '@/views/setup/logic'
 import { useConfigSnapshot } from '~/views/settings/use-snapshot'
+import { AcpSessionBar } from './AcpSessionBar'
 import { ProjectChip } from './ProjectChip'
+import { useAcpSession } from './useAcpSession'
 import { useDeskInstruments, type DeskProps } from '~/views/trading/desk/useDeskInstruments'
 import { useTradeLedger } from '~/views/trading/desk/useTradeLedger'
 import type { Token } from '~/views/trading/types'
@@ -347,6 +350,17 @@ function ConnectedChat({
     [atDesk, rpc, requestSwap],
   )
 
+  // "Open session" on a coding harness's cards: a real navigation (pushed,
+  // so Back returns to the parent chat), unlike the replace of a key change.
+  const openSession = useCallback(
+    (rawKey: string) => {
+      const key = canonicalSessionKey(rawKey)
+      if (!key || key === sessionKey) return
+      void navigate(sessionPath(key))
+    },
+    [navigate, sessionKey],
+  )
+
   const {
     containerRef,
     routerFxDockRef,
@@ -376,8 +390,19 @@ function ConnectedChat({
     dcaActions: lpActions,
     triggerActions: lpActions,
     onMarketsSwap,
+    onOpenSession: openSession,
   })
   const attachments = useAttachments()
+  // A coding harness's own chat (`agent:<agent>:acp:<id>`): its bar, and a
+  // composer that says so once the session was ended.
+  const acp = useAcpSession(
+    sessionKey,
+    busy || ['queued', 'running', 'approval_pending'].includes(runState.status),
+  )
+  const acpClosedReason =
+    acp.confirmed && acp.state === 'closed'
+      ? t('acp.composer.closed').replace('{name}', acp.name)
+      : null
   // Ghost-text next prompt in the composer, asked for when a turn ends.
   const nextSuggestion = useNextSuggestion(rpc, sessionKey, busy)
   useEffect(() => {
@@ -524,6 +549,7 @@ function ConnectedChat({
 
   const onComposerSend = useCallback(
     async (rawText: string) => {
+      if (acpClosedReason) return
       let text = rawText
       let isLiteralSlash = false
       if (text.startsWith('//')) {
@@ -581,6 +607,7 @@ function ConnectedChat({
       }
     },
     [
+      acpClosedReason,
       attachments,
       send,
       executeSlash,
@@ -621,6 +648,10 @@ function ConnectedChat({
   // attachment, and while a reply streams it queues behind it.
   const sendQuickAsk = useCallback(
     async (rawText: string) => {
+      if (acpClosedReason) {
+        toast.warning(acpClosedReason)
+        return
+      }
       let text = rawText
       let isLiteralSlash = false
       if (text.startsWith('//')) {
@@ -657,6 +688,7 @@ function ConnectedChat({
       useUi.getState().requestComposerFocus()
     },
     [
+      acpClosedReason,
       attachments,
       busy,
       docked,
@@ -753,15 +785,18 @@ function ConnectedChat({
   const onDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault()
+      // An ended harness session takes nothing, a dropped file included.
+      if (acpClosedReason) return
       if (e.dataTransfer?.files?.length) attachments.addFiles(e.dataTransfer.files)
     },
-    [attachments],
+    [acpClosedReason, attachments],
   )
   const onDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
   }, [])
   const onPaste = useCallback(
     (e: React.ClipboardEvent) => {
+      if (acpClosedReason) return
       const items = e.clipboardData?.items
       if (!items) return
       const files: File[] = []
@@ -777,7 +812,7 @@ function ConnectedChat({
         e.preventDefault()
       }
     },
-    [attachments],
+    [acpClosedReason, attachments],
   )
 
   const onEnqueueCurrent = useCallback(() => {
@@ -904,6 +939,7 @@ function ConnectedChat({
 
       <div className="chat-stage" onDrop={onDrop} onDragOver={onDragOver} onPaste={onPaste}>
         <h1 className="sr-only">{tw('chat.srTitle')}</h1>
+        {docked && acp.confirmed ? <AcpSessionBar key={sessionKey} view={acp} /> : null}
         {/* The transcript's own box: the loading line and the desk's empty
             hint are positioned in it, so neither can spill over the desk's
             approvals region or the composer below it. */}
@@ -1001,6 +1037,7 @@ function ConnectedChat({
               seats={instruments.seats}
               placeholder={instruments.placeholder}
               onFocusChange={instruments.onFocusChange}
+              disabledReason={acpClosedReason}
             />
           </motion.div>
         </motion.div>

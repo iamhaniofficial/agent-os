@@ -130,6 +130,21 @@ export interface RunRow {
   live: boolean
   /** The gateway's run status word: running, queued, succeeded, failed, timeout, cancelled… */
   status: string
+  /**
+   * The row's last task as the gateway timed it (`last_task.started_at` /
+   * `finished_at`, epoch ms). When both are there the reply's duration is
+   * theirs: the same clock the harness cards read, not when this list
+   * happened to see the row go live and settle.
+   */
+  taskStartedAt?: number | null
+  taskFinishedAt?: number | null
+}
+
+/** A gateway timestamp (epoch s or ms, number or numeric string) → epoch ms, else null. */
+export function taskEpochMs(value: unknown): number | null {
+  const n = typeof value === 'string' && value.trim() ? Number(value) : value
+  if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return null
+  return n < 1e12 ? n * 1000 : n
 }
 
 export interface RunTrack {
@@ -165,11 +180,16 @@ export function diffSessionRuns(
     if (row.live) {
       next.set(row.key, track ?? { startedAt: now, title: row.title })
     } else if (track && !QUIET_TERMINALS.has(row.status)) {
+      const started = row.taskStartedAt ?? null
+      const ended = row.taskFinishedAt ?? null
       finished.push({
         key: row.key,
         title: row.title || track.title,
         status: row.status,
-        durationMs: Math.max(0, now - track.startedAt),
+        durationMs:
+          started !== null && ended !== null && ended >= started
+            ? ended - started
+            : Math.max(0, now - track.startedAt),
       })
     }
   }

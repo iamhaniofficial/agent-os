@@ -787,7 +787,7 @@ cron_default_mode = "bypass"            # off | bypass | full
 # state_dir = "~/.agentos/state/acp"     # records, leases, logs, Codex home, worktrees
 # isolate_codex_home = true              # Codex gets its own CODEX_HOME (login copied, cwd trusted)
 # install_missing_adapters = true        # allow the npx -y / uvx adapter download on first use
-# stream_delivery = "final_only"         # final_only | live
+# stream_delivery = "live"               # live (text streams as it arrives) | final_only
 # [acp.agents.cursor]                    # per-harness launch override
 # command = "agent"                      # replaces the built-in command (with args)
 # args = ["acp"]

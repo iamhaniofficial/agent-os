@@ -324,6 +324,21 @@ export function createHistoryRenderer(deps: HistoryRenderDeps) {
     return messages[messages.length - 1]?.role !== 'assistant'
   }
 
+  /**
+   * The live error row a rebuild must keep: the newest `.msg.error` the live
+   * path stamped `data-live-error`, while the history still ends on the
+   * user's message. A turn that fails before anything is written (an older
+   * gateway, an ACP session refusing the turn) leaves no row behind, and the
+   * resync that very error triggers would otherwise erase the only sign the
+   * turn failed. Once the gateway persists a reply or an error row after that
+   * message, the persisted row takes over and the live one goes.
+   */
+  function liveErrorToKeep(th: HTMLElement, messages: ChatMessage[]): HTMLElement | null {
+    if (messages[messages.length - 1]?.role !== 'user') return null
+    const errors = th.querySelectorAll<HTMLElement>('.msg.error[data-live-error]')
+    return errors.length ? (errors[errors.length - 1] ?? null) : null
+  }
+
   function historyLiveTailAnchor(): HTMLElement | null {
     if (!deps.isStreaming()) return null
     const bubble = deps.getStreamBubble()
@@ -673,11 +688,15 @@ export function createHistoryRenderer(deps: HistoryRenderDeps) {
     deps.markHistoryRendered()
     deps.finishHistoryRouterFx()
 
+    const keptError = liveErrorToKeep(th, messages)
+    if (keptError) appendHistoryElementInOrder(keptError)
+
     const streamBubble = deps.getStreamBubble()
     const thinking = deps.getThinkingIndicator()
     const liveUserAnchor = deps.getCurrentSessionLiveUserAnchor()
     const liveThinkingBlock = deps.getLiveThinkingBlock?.() || null
     th.querySelectorAll<HTMLElement>('.msg').forEach((el) => {
+      if (el === keptError) return
       if (deps.isStreaming() && el === streamBubble) return
       if (deps.isStreaming() && el === thinking) return
       if (deps.isStreaming() && el === liveThinkingBlock) return

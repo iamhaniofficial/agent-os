@@ -387,6 +387,17 @@
   white-space: pre-wrap;
 }
 
+/* A failed turn persisted as a `system` row ("Error: …"); a stopped one
+   ("Cancelled …", or the live "Task cancelled") is a notice, not an error. */
+.msg.system .msg-body[data-tone='error'] {
+  color: var(--danger);
+}
+.msg.system .msg-body[data-tone='notice'],
+.msg.error[data-tone='notice'] {
+  color: var(--foreground);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+}
+
 /* ── Assistant Markdown (legacy markdown.js:40-115 / chat.js:7906-7914) ─────
    Assistant text is sanitized before it enters innerHTML. These rules keep the
    generated semantic markup in the terminal system instead of inheriting a

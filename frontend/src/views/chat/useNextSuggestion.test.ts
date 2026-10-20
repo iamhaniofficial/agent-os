@@ -22,6 +22,9 @@ function fakeRpc() {
   return { rpc: rpc as unknown as WsRpcClient, pending }
 }
 
+/** The question goes out a beat after the turn ends (see the hook). */
+const beat = () => act(async () => new Promise<void>((resolve) => setTimeout(resolve, 0)))
+
 function setup(sessionKey = 'agent:main:webchat:a', busy = false) {
   const { rpc, pending } = fakeRpc()
   const hook = renderHook(
@@ -37,6 +40,9 @@ describe('useNextSuggestion', () => {
     expect(pending).toHaveLength(0)
 
     rerender({ key: 'agent:main:webchat:a', isBusy: false })
+    // Not in the same tick: the post-turn status reads go out first.
+    expect(pending).toHaveLength(0)
+    await beat()
     expect(pending).toHaveLength(1)
     expect(pending[0]!.method).toBe('chat.suggestNext')
     expect(pending[0]!.params).toEqual({ sessionKey: 'agent:main:webchat:a' })
@@ -53,6 +59,7 @@ describe('useNextSuggestion', () => {
   it('clears when the next turn starts', async () => {
     const { result, rerender, pending } = setup('agent:main:webchat:a', true)
     rerender({ key: 'agent:main:webchat:a', isBusy: false })
+    await beat()
     await act(async () => pending[0]!.resolve({ text: 'Ship it' }))
     expect(result.current.suggestion).toBe('Ship it')
 
@@ -63,6 +70,7 @@ describe('useNextSuggestion', () => {
   it('drops an answer that lands after the session switched', async () => {
     const { result, rerender, pending } = setup('agent:main:webchat:a', true)
     rerender({ key: 'agent:main:webchat:a', isBusy: false })
+    await beat()
     rerender({ key: 'agent:main:webchat:b', isBusy: false })
 
     await act(async () => pending[0]!.resolve({ text: 'stale' }))
@@ -72,6 +80,7 @@ describe('useNextSuggestion', () => {
   it('drops an answer that lands after the next turn started', async () => {
     const { result, rerender, pending } = setup('agent:main:webchat:a', true)
     rerender({ key: 'agent:main:webchat:a', isBusy: false })
+    await beat()
     rerender({ key: 'agent:main:webchat:a', isBusy: true })
 
     await act(async () => pending[0]!.resolve({ text: 'stale' }))
@@ -81,6 +90,7 @@ describe('useNextSuggestion', () => {
   it('swallows an rpc error (an older gateway without the method)', async () => {
     const { result, rerender, pending } = setup('agent:main:webchat:a', true)
     rerender({ key: 'agent:main:webchat:a', isBusy: false })
+    await beat()
 
     await act(async () => pending[0]!.reject(new Error('Unknown method')))
     await waitFor(() => expect(result.current.suggestion).toBeNull())
@@ -89,6 +99,7 @@ describe('useNextSuggestion', () => {
   it('treats a null or blank text as no suggestion', async () => {
     const { result, rerender, pending } = setup('agent:main:webchat:a', true)
     rerender({ key: 'agent:main:webchat:a', isBusy: false })
+    await beat()
     await act(async () => pending[0]!.resolve({ text: '   ' }))
     expect(result.current.suggestion).toBeNull()
   })
@@ -96,9 +107,18 @@ describe('useNextSuggestion', () => {
   it('clear() hides the current suggestion', async () => {
     const { result, rerender, pending } = setup('agent:main:webchat:a', true)
     rerender({ key: 'agent:main:webchat:a', isBusy: false })
+    await beat()
     await act(async () => pending[0]!.resolve({ text: 'Ship it' }))
 
     act(() => result.current.clear())
     expect(result.current.suggestion).toBeNull()
+  })
+
+  it('never asks when the next turn starts within that beat', async () => {
+    const { rerender, pending } = setup('agent:main:webchat:a', true)
+    rerender({ key: 'agent:main:webchat:a', isBusy: false })
+    rerender({ key: 'agent:main:webchat:a', isBusy: true })
+    await beat()
+    expect(pending).toHaveLength(0)
   })
 })

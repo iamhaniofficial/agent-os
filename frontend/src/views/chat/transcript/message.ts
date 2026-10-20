@@ -1,6 +1,7 @@
 import { t } from '@/i18n'
 import '@/i18n/en/chat'
 
+import { buildCompletionCard } from './acp'
 import type { MarkdownDep, TranscriptHeaderStateRef } from './stream'
 import { renderedPlainText } from './plainText'
 import { modelDisplayName } from './routerFx'
@@ -63,6 +64,12 @@ export interface MessageRendererDeps {
   toast: (message: string, kind?: 'info' | 'warn' | 'error', durationMs?: number) => void
   onEdit?: (text: string) => void
   onRegenerate?: (text: string) => void
+  /**
+   * Build the card for a `subagent_completion` row (transcript/acp.ts). The
+   * transcript passes its ACP mounter's, which adds "Open session" and settles
+   * the spawn's harness card; absent, a plain completion card is built.
+   */
+  subagentCard?: (payload: Record<string, unknown>, raw: string) => HTMLElement | null
 }
 
 const TURN_META_LS = 'agentos.turnmeta.'
@@ -135,24 +142,30 @@ function isSubagentCompletion(role: string, text: string, options: MessageOption
   }
 }
 
+/** A `subagent_completion` row whose text is not a JSON object: show it raw. */
 function appendSubagentDisclosure(body: HTMLElement, text: string): void {
   const details = document.createElement('details')
   details.className = 'chat-subagent-disclosure'
   const summary = document.createElement('summary')
   summary.className = 'chat-subagent-disclosure-summary'
+  summary.textContent = t('chat.msgSubagentCompletion')
   const pre = document.createElement('pre')
-  pre.className = 'chat-subagent-disclosure-body'
-  try {
-    const payload = JSON.parse(text) as { child_session_key?: string; session_key?: string }
-    summary.textContent = `Subagent: ${payload.child_session_key || payload.session_key || 'completion'}`
-    pre.textContent = JSON.stringify(payload, null, 2)
-  } catch {
-    summary.textContent = t('chat.msgSubagentCompletion')
-    pre.classList.add('chat-subagent-disclosure-body--raw')
-    pre.textContent = text
-  }
+  pre.className = 'chat-subagent-disclosure-body chat-subagent-disclosure-body--raw'
+  pre.textContent = text
   details.append(summary, pre)
   body.appendChild(details)
+}
+
+/**
+ * How a persisted `system` row reads. A failed turn persists "Error: …"
+ * (engine runtime, ACP dispatch): an error. A turn someone stopped persists
+ * "Cancelled …" (ACP dispatch): a notice, never the error style.
+ */
+export function systemRowTone(text: string): 'error' | 'notice' | '' {
+  const head = text.trim()
+  if (/^error:/i.test(head)) return 'error'
+  if (/^cancell?ed\b/i.test(head)) return 'notice'
+  return ''
 }
 
 function icon(pathData: string[]): SVGSVGElement {
@@ -322,6 +335,7 @@ export function createMessageRenderer(deps: MessageRendererDeps) {
   ): void {
     body.className = 'msg-body'
     body.textContent = ''
+    delete body.dataset.tone
     const subagent = isSubagentCompletion(role, text, options)
     const visibleText = role === 'assistant' ? stripGeneratedArtifactMarkers(text) : text
     if (role === 'assistant' && visibleText) {
@@ -329,10 +343,34 @@ export function createMessageRenderer(deps: MessageRendererDeps) {
       deps.markdown.bindCopy(body)
       deps.markdown.bindHighlight?.(body)
     } else if (subagent) {
-      appendSubagentDisclosure(body, visibleText)
+      appendSubagentCompletion(body, visibleText)
     } else if (visibleText) {
       body.textContent = role === 'user' ? stripTimePrefix(visibleText) : visibleText
+      if (role === 'system') {
+        const tone = systemRowTone(visibleText)
+        if (tone) body.dataset.tone = tone
+      }
     }
+  }
+
+  function appendSubagentCompletion(body: HTMLElement, text: string): void {
+    let payload: Record<string, unknown> | null = null
+    try {
+      const parsed = JSON.parse(text) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        payload = parsed as Record<string, unknown>
+      }
+    } catch {
+      payload = null
+    }
+    if (!payload) {
+      appendSubagentDisclosure(body, text)
+      return
+    }
+    const card =
+      deps.subagentCard?.(payload, text) ??
+      buildCompletionCard(payload, { markdown: deps.markdown, raw: text })
+    body.appendChild(card)
   }
 
   function messageTimestampTitle(timestamp?: string | number | null): string {

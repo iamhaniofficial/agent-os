@@ -83,11 +83,17 @@ the error and ask; do not silently switch harness or do the work yourself.
 - `task`: self-contained. The harness cannot see this conversation: include
   the goal, the files, the constraints, how to verify, and the exact output
   you need back.
-- `cwd`: the project directory. Never the AgentOS state directory
-  (`~/.agentos/state`) or the live AgentOS workspace.
-- `mode`: `oneshot` (default) for a single job; the harness exits when it
-  answers. `persistent` when you expect follow-ups in the same harness
-  context (iterating on a feature, a conversation the user keeps steering).
+- `cwd`: where the harness works. Omitted, it is your agent workspace,
+  which is fine for read-only work (a review, a summary, an investigation)
+  when `harness_mode` is read-only (`plan` for Claude Code, `read-only` for
+  Codex). A harness that writes files works in the user's project
+  directory, which must be listed in `[acp] allowed_cwds`, or in a
+  `worktree: true` checkout. Never the AgentOS state directory
+  (`~/.agentos/state`).
+- `mode`: `oneshot` (default) for a single job; the harness process exits
+  after each answer, and a `sessions_send` follow-up resumes the same
+  harness conversation. `persistent` keeps the process running between
+  turns (iterating on a feature, a conversation the user keeps steering).
 - `harness_mode`: optional session mode the harness offers, for example
   `read-only` (Codex) or `plan` / `acceptEdits` (Claude Code). Use a
   read-only mode for reviews and investigations.
@@ -95,8 +101,10 @@ the error and ask; do not silently switch harness or do the work yourself.
   run in a managed git worktree instead of the checkout. Use it for parallel
   workers on one repo and for anything you want isolated from the user's
   working tree.
-- `resume_session_id`: continue an earlier harness session you or your
-  children started.
+- `resume_session_id`: the harness session id (`acp_session_id`) of a
+  child that was closed, to carry its conversation into a new child. A child
+  that is only finished or stopped is continued with `sessions_send`
+  instead (below); never pass a session key here.
 
 ## Wait
 
@@ -108,11 +116,36 @@ finished, failed, or needs an answer).
 
 ## Steer, cancel, close
 
-- Follow-up for a `persistent` child: `sessions_send` to its session key
-  (`agent:<you>:acp:<id>`). `followup` queues the text after the current
-  turn; `steer` cancels the running turn and sends the new text instead.
-- List children: `subagents` (ACP children carry `runtime: "acp"`).
-- Stop one: `subagents` with `action="kill"` (cancel + close).
+- Follow-up for any child that was not closed, `oneshot` or `persistent`:
+  `sessions_send` to its session key (`agent:<you>:acp:<id>`). `followup`
+  queues the text after the current turn; `steer` cancels the running turn
+  and sends the new text instead. A finished `oneshot` child resumes its
+  harness conversation; if the reply starts with "Started a new ...
+  session; the previous context could not be resumed", the harness lost
+  the earlier context, so include what it needs in the message.
+- To continue a stopped or finished child ("let Claude Code carry on"),
+  `sessions_send(session_key="agent:<you>:acp:<id>", message=...)`: it
+  resumes the same harness conversation with everything it already did. Do
+  not spawn a new one for it.
+- When a completion says the answer was cut ("The answer was cut at 12,000
+  of 17,116 characters"), read the rest with
+  `sessions_history(session_key=..., answer_offset=12000)` (repeat with the
+  `next_offset` it returns). Never redo the child's work yourself. If you
+  still cannot read the rest, tell the user and point them to the child
+  session; never copy files out of a harness's own directories
+  (`~/.claude`, `~/.codex`) or into another agent's workspace.
+- The user may type into a child session directly. Those turns are theirs:
+  they are not announced back to you.
+- List children: `subagents(action="list")` (ACP children carry
+  `runtime: "acp"`).
+- To stop a harness when the user asks: `subagents(action="kill",
+  session_key="agent:<you>:acp:<id>")` with the full child key. Never run the
+  `agentos acp` CLI (or any shell command) to stop or close a harness. If
+  `subagents` is not in your tools, load it with `tool_search`.
+- When a completion says `stopped_by=user` ("The user stopped this ... run
+  ... Do not restart it"), the user stopped it on purpose: do not spawn the
+  same job again. Tell the user what it did before it stopped and ask how to
+  continue. A run you replaced with `steer` is not a stop.
 - Harness permission prompts reach the user through the normal approvals
   surface. If a child is waiting on one, say so; do not try to answer it.
 
@@ -123,9 +156,17 @@ finished, failed, or needs an answer).
    read: a pull request from a fork, a freshly cloned unknown repo, a branch
    someone else pushed. Hostile repo content can instruct the harness to run
    anything. Review those in a read-only `harness_mode`, in a worktree.
-2. Never start a harness inside the AgentOS state or workspace directories,
-   and never check out branches there; use the project checkout or a
-   worktree.
+2. Never start a harness in the AgentOS state directory. The agent
+   workspace is only for read-only work in a read-only `harness_mode`;
+   never let a harness edit files or check out branches there. Work that
+   writes goes to the user's project directory (listed in `[acp]
+   allowed_cwds`) or to a `worktree: true` checkout. If the spawn is refused
+   with `ACP_CWD_NOT_ALLOWED`, first check that you picked the right
+   directory: a relative path or a folder the task names (`agents/...`,
+   `notes/...`) usually lives in your agent workspace, so retry with that
+   path relative to the workspace. Only if the task really targets the
+   refused directory, tell the user the exact `agentos config set
+   acp.allowed_cwds ...` command from the error and ask them to run it.
 3. One writer per checkout. Parallel workers on the same repo each get
    `worktree: true`.
 4. Be patient. A quiet harness is working; only cancel on the user's word,
@@ -138,6 +179,8 @@ finished, failed, or needs an answer).
 | --- | --- |
 | `ACP_HARNESS_MISSING` | The harness CLI is not installed. Tell the user which one (`agentos acp doctor <id>` shows the fix). |
 | `ACP_AGENT_NOT_ALLOWED` | Not in `[acp] allowed_agents`, or ACP is disabled. Report it and ask which allowed harness to use. |
+| `ACP_CWD_NOT_ALLOWED` | The `cwd` is outside the workspace, the worktrees and `[acp] allowed_cwds`. Check your guess first: a folder the task names usually sits in your agent workspace, so retry with the workspace-relative path. If the task really needs that directory, give the user the exact `agentos config set acp.allowed_cwds '[...]'` command from the error and ask. |
+| `ACP_SESSION_CLOSED` | The child was closed (`acp close` / `subagents kill`). Spawn a new one; pass the `resume_session_id` from the error to keep the harness conversation. |
 | `ACP_SESSION_INIT_FAILED` | The harness started but would not open a session (often not logged in). Ask the user to run the harness CLI once and sign in. |
 | `ACP_PERMISSION_PROMPT_UNAVAILABLE` | It needed approval and nobody can answer here. Report it; suggest a read-only task or a different `[acp] permission_mode`. |
 | `ACP_TURN_TIMEOUT` | The turn hit `[acp] turn_timeout_s`. Report partial results; respawn with a smaller task if the user wants. |

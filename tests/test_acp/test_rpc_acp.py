@@ -70,7 +70,14 @@ def test_methods_are_registered_control_only() -> None:
     from agentos.gateway.access import ConnectionSurface
 
     d = get_dispatcher()
-    for name in ("acp.agents", "acp.doctor", "acp.sessions", "acp.cancel", "acp.close"):
+    for name in (
+        "acp.agents",
+        "acp.doctor",
+        "acp.sessions",
+        "acp.status",
+        "acp.cancel",
+        "acp.close",
+    ):
         entry = d.get_entry(name)
         assert entry is not None, name
         assert entry.audiences == frozenset({ConnectionSurface.CONTROL})
@@ -116,7 +123,7 @@ async def test_probe_delegates_to_manager() -> None:
     assert payload["agents"][0]["probe"] == {"probe": "ok", "agent_id": "codex"}
 
 
-@pytest.mark.parametrize("method", ["acp.sessions", "acp.cancel", "acp.close"])
+@pytest.mark.parametrize("method", ["acp.sessions", "acp.status", "acp.cancel", "acp.close"])
 async def test_manager_methods_report_unavailable_via_dispatch(method: str) -> None:
     res = await get_dispatcher().dispatch("1", method, {"session_key": "agent:main:acp:1"}, _ctx())
 
@@ -154,7 +161,7 @@ async def test_cancel_and_close_delegate() -> None:
     )
 
     assert cancelled == {"session_key": "agent:main:acp:1", "cancelled": True}
-    assert closed == {"session_key": "agent:main:acp:1", "closed": True}
+    assert closed == {"session_key": "agent:main:acp:1", "closed": True, "was_live": True}
     assert mgr.cancelled == [("agent:main:acp:1", "operator")]
     # close() here takes no ``discard`` keyword; it must not be passed.
     assert mgr.closed == [("agent:main:acp:1", False)]
@@ -178,3 +185,169 @@ async def test_acp_errors_keep_their_code() -> None:
 
     assert res.error is not None
     assert res.error.code == "ACP_TURN_FAILED"
+
+
+# --------------------------------------------------------------------------
+# acp.status / acp.sessions against a real manager and session store
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def real_sessions():
+    from agentos.session.manager import SessionManager
+    from agentos.session.storage import SessionStorage
+
+    store = SessionStorage(":memory:")
+    await store.connect()
+    yield SessionManager(store, inject_time_prefix=False)
+    await store.close()
+
+
+def _real_manager(sessions, runtime=None):
+    from acp_s_fakes import FakeRuntime
+
+    from agentos.acp.manager import AcpSessionManager
+
+    return AcpSessionManager(runtime or FakeRuntime(), config=AcpConfig(), session_manager=sessions)
+
+
+async def test_status_answers_for_an_idle_oneshot_session(real_sessions) -> None:
+    key = "agent:main:acp:0a0a0a0a"
+    await real_sessions.create(
+        key,
+        agent_id="main",
+        origin={
+            "kind": "acp",
+            "agent_id": "claude",
+            "cwd": "/tmp",
+            "mode": "oneshot",
+            "harness_mode": "plan",
+        },
+    )
+    manager = _real_manager(real_sessions)
+    rpc_acp.set_acp_manager(manager)
+    await manager.run_turn(key, "hello")
+
+    res = await get_dispatcher().dispatch("1", "acp.status", {"session_key": key}, _ctx())
+
+    assert res.ok, res.error
+    status = res.payload
+    assert status["session_key"] == key
+    assert status["agent_id"] == "claude" and status["agent_name"] == "Claude Code"
+    assert status["idle"] is True and status["closed"] is False and status["live"] is False
+    assert status["mode"] == "oneshot" and status["harness_mode"] == "plan"
+    assert status["cwd"] == "/tmp"
+    assert status["acp_session_id"] == "sess-1"
+    assert status["activity"] == "Writing the answer" and status["activity_kind"] == "text"
+    assert status["turn_tool_calls"] == 0
+    assert "last_turn" in status
+
+
+async def test_status_reports_closed_sessions(real_sessions) -> None:
+    key = "agent:main:acp:0b0b0b0b"
+    await real_sessions.create(
+        key,
+        agent_id="main",
+        origin={"kind": "acp", "agent_id": "codex", "cwd": "/tmp", "mode": "persistent"},
+    )
+    manager = _real_manager(real_sessions)
+    rpc_acp.set_acp_manager(manager)
+    await manager.run_turn(key, "hello")
+    sessions = await rpc_acp._handle_acp_sessions({}, _ctx())
+    row = sessions["sessions"][0]
+    assert row["agent_name"] == "Codex" and row["turn_tool_calls"] == 0
+    assert {"activity", "activity_kind"} <= set(row)
+
+    closed = await rpc_acp._handle_acp_close({"session_key": key}, _ctx())
+    assert closed == {"session_key": key, "closed": True, "was_live": True}
+    status = await rpc_acp._handle_acp_status({"session_key": key}, _ctx())
+    assert status["closed"] is True and status["idle"] is False and status["live"] is False
+    assert (await rpc_acp._handle_acp_sessions({}, _ctx()))["count"] == 0
+
+
+async def test_status_rejects_non_acp_sessions(real_sessions) -> None:
+    await real_sessions.create("agent:main:main", agent_id="main")
+    rpc_acp.set_acp_manager(_real_manager(real_sessions))
+
+    res = await get_dispatcher().dispatch(
+        "1", "acp.status", {"session_key": "agent:main:main"}, _ctx()
+    )
+
+    assert res.error is not None and res.error.code == "ACP_SESSION_INVALID"
+
+
+async def test_status_is_unavailable_when_acp_is_off(real_sessions) -> None:
+    rpc_acp.set_acp_manager(_real_manager(real_sessions))
+    ctx = RpcContext(conn_id="t", config=GatewayConfig(acp=AcpConfig(enabled=False)))
+
+    res = await get_dispatcher().dispatch(
+        "1", "acp.status", {"session_key": "agent:main:acp:1"}, ctx
+    )
+
+    assert res.error is not None and res.error.code == "ACP_UNAVAILABLE"
+
+
+async def test_cancel_and_close_also_cancel_queued_turns() -> None:
+    mgr = _manager()
+    rpc_acp.set_acp_manager(mgr)
+    calls: list[tuple[str, str]] = []
+
+    class Runtime:
+        async def cancel(self, *, session_key: str, source: str, reason: str) -> int:
+            calls.append((session_key, source))
+            return 1
+
+    await rpc_acp._handle_acp_cancel(
+        {"session_key": "agent:main:acp:1"}, _ctx(task_runtime=Runtime())
+    )
+    await rpc_acp._handle_acp_close(
+        {"session_key": "agent:main:acp:1"}, _ctx(task_runtime=Runtime())
+    )
+
+    assert calls == [
+        ("agent:main:acp:1", "acp_rpc_cancel"),
+        ("agent:main:acp:1", "acp_rpc_close"),
+    ]
+
+
+async def test_status_always_carries_session_key_and_agent_id(real_sessions) -> None:
+    key = "agent:main:acp:0c0c0c0c"
+    await real_sessions.create(
+        key, agent_id="main", origin={"kind": "acp", "agent_id": "gemini", "cwd": "/tmp"}
+    )
+    rpc_acp.set_acp_manager(_real_manager(real_sessions))
+
+    status = await rpc_acp._handle_acp_status({"session_key": key}, _ctx())
+
+    assert status["session_key"] == key and status["agent_id"] == "gemini"
+    assert status["agent_name"] == "Gemini CLI"
+    for field in (
+        "activity",
+        "activity_kind",
+        "turn_tool_calls",
+        "idle",
+        "closed",
+        "harness_mode",
+        "cwd",
+        "mode",
+        "last_turn",
+    ):
+        assert field in status, field
+
+
+@pytest.mark.parametrize("method", ["acp.close", "acp.cancel"])
+async def test_close_and_cancel_reject_keys_that_are_not_acp_sessions(
+    real_sessions, method: str
+) -> None:
+    """A parent closed the made-up key "894dd12b" and the RPC said it worked."""
+    await real_sessions.create("agent:main:main", agent_id="main")
+    manager = _real_manager(real_sessions)
+    rpc_acp.set_acp_manager(manager)
+    ctx = RpcContext(conn_id="t", config=GatewayConfig(), session_manager=real_sessions)
+
+    missing = await get_dispatcher().dispatch("1", method, {"session_key": "894dd12b"}, ctx)
+    other = await get_dispatcher().dispatch("2", method, {"session_key": "agent:main:main"}, ctx)
+
+    assert missing.error is not None and missing.error.code == "NOT_FOUND"
+    assert other.error is not None and other.error.code == "ACP_SESSION_INVALID"
+    assert manager.list_sessions() == []

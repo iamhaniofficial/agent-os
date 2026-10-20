@@ -79,8 +79,8 @@ LOADED_STATE_PROVIDER = "portable"
 #: and calling them directly once they were in the request.
 #:
 #: Deferred: tools a typical turn does not touch and whose absence the model
-#: can always repair with one ``tool_search`` call. 24 names, all visible on a
-#: stock gateway, whose request drops from 63 to 40 schemas.
+#: can always repair with one ``tool_search`` call. 25 names, all visible on a
+#: stock gateway, whose request drops from 64 to 40 schemas.
 #: ``test_deferred_tools`` pins these numbers.
 DEFERRED_BUILTIN_TOOLS: frozenset[str] = frozenset(
     {
@@ -106,6 +106,9 @@ DEFERRED_BUILTIN_TOOLS: frozenset[str] = frozenset(
         "skill_delete",
         "skill_edit",
         "skill_search_community",
+        # Child-session control (list / kill / steer). ``sessions_spawn`` of a
+        # coding harness loads it, so "stop it" is one call away afterwards.
+        "subagents",
         # Niche integrations and admin.
         "agents_list",
         "browser",

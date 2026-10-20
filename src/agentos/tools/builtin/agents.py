@@ -83,6 +83,70 @@ async def _list_children(mgr: Any, parent_key: str) -> list[dict[str, Any]]:
         page += 1
 
 
+#: Fields a ``subagents(list)`` row keeps; the raw session row (with the
+#: child's whole grounded task in ``origin``) ran to ~2 kB per child, and the
+#: transcript cap then emptied the list.
+_ACTIVE_STATUSES = frozenset({"running", "queued", "pending"})
+_TASK_PREVIEW_CHARS = 80
+_LABEL_CHARS = 60
+
+
+def _short(value: Any, limit: int) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = " ".join(value.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _by_relevance(rows: list[Any]) -> list[Any]:
+    """Running children first, then the most recently updated: when a long
+    list is cut, the entries that matter stay."""
+
+    def _key(row: Any) -> tuple[int, int]:
+        if not isinstance(row, dict):
+            return (1, 0)
+        active = 0 if str(row.get("status") or "") in _ACTIVE_STATUSES else 1
+        try:
+            updated = -int(row.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            updated = 0
+        return (active, updated)
+
+    return sorted(rows, key=_key)
+
+
+def _compact_child(row: Any) -> Any:
+    """One short row per child: key, runtime, who runs it, status, label,
+    times and a task preview (plus the ACP harness facts)."""
+    if not isinstance(row, dict):
+        return row
+    raw_origin = row.get("origin")
+    origin: dict[str, Any] = raw_origin if isinstance(raw_origin, dict) else {}
+    runtime = row.get("runtime") or origin.get("kind") or "subagent"
+    out: dict[str, Any] = {
+        "session_key": row.get("session_key"),
+        "runtime": runtime,
+        "status": row.get("status"),
+    }
+    if runtime == "acp":
+        out["acp_agent"] = row.get("acp_agent") or origin.get("agent_id")
+        out["acp_mode"] = row.get("acp_mode") or origin.get("mode")
+        out["acp_idle"] = bool(row.get("acp_idle"))
+        out["acp_closed"] = bool(row.get("acp_closed"))
+    else:
+        out["agent_id"] = row.get("agent_id")
+    label = row.get("display_name") or row.get("label")
+    if label:
+        out["label"] = _short(label, _LABEL_CHARS)
+    for key in ("started_at", "ended_at"):
+        if row.get(key) is not None:
+            out[key] = row.get(key)
+    task = origin.get("task")
+    if isinstance(task, str) and task.strip():
+        out["task"] = _short(task, _TASK_PREVIEW_CHARS)
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def _spawned_by(session_or_dict: object) -> object:
     if isinstance(session_or_dict, dict):
         return session_or_dict.get("spawned_by")
@@ -126,15 +190,21 @@ async def agents_list() -> str:
 
 @tool(
     name="subagents",
-    description="List, kill, or steer spawned subagent sessions.",
+    description=(
+        "List, stop (kill) or steer the sessions you spawned, including coding harnesses "
+        "(Claude Code, Codex, ...). When the user asks to stop a harness: "
+        'subagents(action="kill", session_key=<the child key>), never a shell command.'
+    ),
     params={
         "action": {
             "type": "string",
-            "description": "Action: list, kill, steer",
+            "enum": ["list", "kill", "steer"],
+            "description": "list your children; kill = stop and close one; steer = redirect it",
         },
         "session_key": {
             "type": "string",
-            "description": "Target subagent session key (required for kill and steer)",
+            "description": "Full child session key, e.g. agent:main:acp:1a2b3c4d "
+            "(required for kill and steer)",
         },
         "message": {
             "type": "string",
@@ -142,7 +212,10 @@ async def agents_list() -> str:
         },
     },
     required=["action"],
-    exposed_by_default=False,
+    # One tool_search away, and loaded by sessions_spawn(runtime="acp"):
+    # before this the tool was hidden altogether, and a parent asked to stop
+    # a harness ran `agentos acp close` through exec_command instead.
+    defer_loading=True,
 )
 async def subagents(
     action: str,
@@ -168,7 +241,10 @@ async def subagents(
             subs = await _list_children(mgr, current_key)
             from agentos.tools.builtin.acp_spawn import annotate_acp_rows
 
-            return json.dumps({"action": "list", "subagents": annotate_acp_rows(subs)})
+            rows = [_compact_child(row) for row in _by_relevance(annotate_acp_rows(subs))]
+            return json.dumps(
+                {"action": "list", "total": len(rows), "subagents": rows}, ensure_ascii=False
+            )
         except (ImportError, AttributeError, NotImplementedError) as exc:
             raise _manager_unavailable() from exc
 

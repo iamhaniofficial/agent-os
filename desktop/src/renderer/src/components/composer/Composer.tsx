@@ -3,6 +3,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import {
   useCallback,
   useEffect,
+  useId,
   useImperativeHandle,
   useRef,
   useState,
@@ -70,6 +71,11 @@ export interface ComposerProps {
    */
   suggestion?: string | null
   onFocusChange?: (focused: boolean) => void
+  /**
+   * The chat takes no messages (a coding harness's session that was ended):
+   * the composer stays in place, switched off, and says why in one line.
+   */
+  disabledReason?: string | null
 }
 
 const MIN_TEXTAREA_HEIGHT = 26
@@ -104,7 +110,10 @@ export function Composer({
   placeholder,
   suggestion = null,
   onFocusChange,
+  disabledReason = null,
 }: ComposerProps) {
+  const disabled = Boolean(disabledReason)
+  const disabledNoteId = useId()
   const [value, setValue] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -233,6 +242,7 @@ export function Composer({
   )
 
   const doSend = useCallback(() => {
+    if (disabled) return
     const text = value.trim()
     if (hasPendingWork) {
       toast.warning('Wait for file attachment processing to finish')
@@ -243,7 +253,7 @@ export function Composer({
     setProgrammatic('')
     historyIdxRef.current = null
     historyDraftRef.current = ''
-  }, [value, hasPendingAttachments, hasPendingWork, onSend, setProgrammatic])
+  }, [disabled, value, hasPendingAttachments, hasPendingWork, onSend, setProgrammatic])
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -352,7 +362,7 @@ export function Composer({
     [autoResize, onValueChange],
   )
 
-  const showSuggestion = Boolean(suggestion) && !value
+  const showSuggestion = Boolean(suggestion) && !value && !disabled
 
   const { disabled: sendDisabled, label: sendLabel } = sendButtonState(
     value,
@@ -367,137 +377,156 @@ export function Composer({
       {tray}
       {seats}
       {slashMenu}
+      {disabledReason ? (
+        <p id={disabledNoteId} className="composer-disabled-note" role="note">
+          {disabledReason}
+        </p>
+      ) : null}
       <form
         className="composer"
         data-busy={busy}
+        data-disabled={disabled || undefined}
         onSubmit={(e) => {
           e.preventDefault()
           doSend()
         }}
       >
-        {toolbar ? (
-          <div className="composer-run-modes" ref={runModesWrapRef}>
-            <button
-              ref={runModesTriggerRef}
-              type="button"
-              className="composer-chip"
-              aria-haspopup="dialog"
-              aria-expanded={runModesOpen}
-              aria-controls={runModesOpen ? 'composer-run-modes-popover' : undefined}
-              aria-label={t('composer.runModes')}
-              title={t('composer.runModesTitle')}
-              data-open={runModesOpen || undefined}
-              onClick={() => setRunModesOpen((v) => !v)}
+        {/* Off as a whole: one disabled fieldset switches off every control
+            in it, the ones passed in from outside (the route picker) too. */}
+        <fieldset className="composer-fieldset" disabled={disabled}>
+          {toolbar ? (
+            <div className="composer-run-modes" ref={runModesWrapRef}>
+              <button
+                ref={runModesTriggerRef}
+                type="button"
+                className="composer-chip"
+                aria-haspopup="dialog"
+                aria-expanded={runModesOpen}
+                aria-controls={runModesOpen ? 'composer-run-modes-popover' : undefined}
+                aria-label={t('composer.runModes')}
+                title={t('composer.runModesTitle')}
+                data-open={runModesOpen || undefined}
+                onClick={() => setRunModesOpen((v) => !v)}
+              >
+                <SlidersHorizontal className="size-4" strokeWidth={1.75} aria-hidden />
+              </button>
+              <AnimatePresence initial={false}>
+                {runModesOpen ? (
+                  <motion.div
+                    id="composer-run-modes-popover"
+                    className="composer-run-modes__popover"
+                    role="dialog"
+                    aria-labelledby="composer-run-modes-title"
+                    initial={reduceMotion ? false : { opacity: 0, scale: 0.98, y: 4 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    exit={reduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.98, y: 2 }}
+                    transition={reduceMotion ? { duration: 0 } : quick}
+                  >
+                    <header className="composer-run-modes__header">
+                      <h2 id="composer-run-modes-title" className="composer-run-modes__title">
+                        {t('composer.runModes')}
+                      </h2>
+                      <button
+                        ref={runModesCloseRef}
+                        type="button"
+                        className="composer-run-modes__close"
+                        aria-label={t('composer.runModesClose')}
+                        title={t('composer.runModesClose')}
+                        onClick={closeRunModes}
+                      >
+                        <X className="size-3.5" strokeWidth={2} aria-hidden />
+                      </button>
+                    </header>
+                    <div className="composer-run-modes__body">{toolbar}</div>
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
+            </div>
+          ) : null}
+          {onAttachFiles ? (
+            <>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                hidden
+                accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/html,text/csv,application/json,.png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.md,.markdown,.html,.htm,.csv,.json"
+                onChange={(e) => {
+                  if (e.target.files && e.target.files.length > 0) onAttachFiles(e.target.files)
+                  e.target.value = ''
+                }}
+                aria-label={t('composer.attach')}
+              />
+              <button
+                type="button"
+                className="composer-chip"
+                aria-label={t('composer.attach')}
+                title={t('composer.attach')}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <Paperclip className="size-4" strokeWidth={1.75} aria-hidden />
+              </button>
+            </>
+          ) : null}
+          <textarea
+            ref={textareaRef}
+            rows={1}
+            value={value}
+            onChange={onChange}
+            onKeyDown={onKeyDown}
+            onFocus={() => onFocusChange?.(true)}
+            onBlur={() => onFocusChange?.(false)}
+            disabled={disabled}
+            title={disabledReason ?? undefined}
+            // The reason is said once, on its own line above; the field
+            // points at it rather than repeat it as a placeholder.
+            aria-describedby={disabledReason ? disabledNoteId : undefined}
+            placeholder={
+              disabledReason
+                ? ''
+                : (showSuggestion && suggestion) || (placeholder ?? t('composer.placeholder'))
+            }
+            aria-label={t('composer.placeholder')}
+            aria-keyshortcuts={showSuggestion ? 'Tab' : undefined}
+            aria-autocomplete={slashListboxId ? 'list' : undefined}
+            aria-expanded={slashListboxId ? Boolean(slashActiveDescendant) : undefined}
+            aria-controls={slashActiveDescendant ? slashListboxId : undefined}
+            aria-activedescendant={slashActiveDescendant}
+          />
+          {showSuggestion ? (
+            <kbd
+              className="composer-suggestion-key"
+              data-testid="composer-suggestion-key"
+              title={t('composer.suggestionKeyTitle')}
+              aria-hidden="true"
             >
-              <SlidersHorizontal className="size-4" strokeWidth={1.75} aria-hidden />
-            </button>
-            <AnimatePresence initial={false}>
-              {runModesOpen ? (
-                <motion.div
-                  id="composer-run-modes-popover"
-                  className="composer-run-modes__popover"
-                  role="dialog"
-                  aria-labelledby="composer-run-modes-title"
-                  initial={reduceMotion ? false : { opacity: 0, scale: 0.98, y: 4 }}
-                  animate={{ opacity: 1, scale: 1, y: 0 }}
-                  exit={reduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.98, y: 2 }}
-                  transition={reduceMotion ? { duration: 0 } : quick}
-                >
-                  <header className="composer-run-modes__header">
-                    <h2 id="composer-run-modes-title" className="composer-run-modes__title">
-                      {t('composer.runModes')}
-                    </h2>
-                    <button
-                      ref={runModesCloseRef}
-                      type="button"
-                      className="composer-run-modes__close"
-                      aria-label={t('composer.runModesClose')}
-                      title={t('composer.runModesClose')}
-                      onClick={closeRunModes}
-                    >
-                      <X className="size-3.5" strokeWidth={2} aria-hidden />
-                    </button>
-                  </header>
-                  <div className="composer-run-modes__body">{toolbar}</div>
-                </motion.div>
-              ) : null}
-            </AnimatePresence>
-          </div>
-        ) : null}
-        {onAttachFiles ? (
-          <>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              hidden
-              accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,text/plain,text/markdown,text/html,text/csv,application/json,.png,.jpg,.jpeg,.gif,.webp,.pdf,.txt,.md,.markdown,.html,.htm,.csv,.json"
-              onChange={(e) => {
-                if (e.target.files && e.target.files.length > 0) onAttachFiles(e.target.files)
-                e.target.value = ''
-              }}
-              aria-label={t('composer.attach')}
-            />
+              {t('composer.suggestionKey')}
+            </kbd>
+          ) : null}
+          {routePicker}
+          {busy ? (
             <button
               type="button"
-              className="composer-chip"
-              aria-label={t('composer.attach')}
-              title={t('composer.attach')}
-              onClick={() => fileInputRef.current?.click()}
+              className="composer-send"
+              data-abort="true"
+              onClick={() => onAbort?.()}
+              aria-label={t('composer.stop')}
+              title={t('composer.stop')}
             >
-              <Paperclip className="size-4" strokeWidth={1.75} aria-hidden />
+              <Square className="size-3.5 fill-current" strokeWidth={2} aria-hidden />
             </button>
-          </>
-        ) : null}
-        <textarea
-          ref={textareaRef}
-          rows={1}
-          value={value}
-          onChange={onChange}
-          onKeyDown={onKeyDown}
-          onFocus={() => onFocusChange?.(true)}
-          onBlur={() => onFocusChange?.(false)}
-          placeholder={(showSuggestion && suggestion) || (placeholder ?? t('composer.placeholder'))}
-          aria-label={t('composer.placeholder')}
-          aria-keyshortcuts={showSuggestion ? 'Tab' : undefined}
-          aria-autocomplete={slashListboxId ? 'list' : undefined}
-          aria-expanded={slashListboxId ? Boolean(slashActiveDescendant) : undefined}
-          aria-controls={slashActiveDescendant ? slashListboxId : undefined}
-          aria-activedescendant={slashActiveDescendant}
-        />
-        {showSuggestion ? (
-          <kbd
-            className="composer-suggestion-key"
-            data-testid="composer-suggestion-key"
-            title={t('composer.suggestionKeyTitle')}
-            aria-hidden="true"
-          >
-            {t('composer.suggestionKey')}
-          </kbd>
-        ) : null}
-        {routePicker}
-        {busy ? (
-          <button
-            type="button"
-            className="composer-send"
-            data-abort="true"
-            onClick={() => onAbort?.()}
-            aria-label={t('composer.stop')}
-            title={t('composer.stop')}
-          >
-            <Square className="size-3.5 fill-current" strokeWidth={2} aria-hidden />
-          </button>
-        ) : (
-          <button
-            type="submit"
-            className="composer-send"
-            disabled={sendDisabled}
-            aria-label={t('composer.send')}
-            title={sendLabel}
-          >
-            <ArrowUp className="size-4" strokeWidth={2.5} aria-hidden />
-          </button>
-        )}
+          ) : (
+            <button
+              type="submit"
+              className="composer-send"
+              disabled={sendDisabled || disabled}
+              aria-label={t('composer.send')}
+              title={sendLabel}
+            >
+              <ArrowUp className="size-4" strokeWidth={2.5} aria-hidden />
+            </button>
+          )}
+        </fieldset>
       </form>
     </div>
   )

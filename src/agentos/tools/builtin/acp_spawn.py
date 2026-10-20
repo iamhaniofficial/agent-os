@@ -144,11 +144,55 @@ def resolve_spawn_cwd(
         workspace_dir=workspace_dir, acp_config=acp_config, state_dir=state_dir
     )
     if not any(_within(resolved, root) for root in roots):
-        raise ToolError(
-            f"cwd {resolved} is outside the agent workspace and [acp] allowed_cwds; "
-            "add the project directory to [acp] allowed_cwds to let harnesses work there"
-        )
+        raise ToolError(cwd_refusal_message(resolved, acp_config, workspace_dir=workspace_dir))
     return resolved
+
+
+def _home_relative(path: Path) -> str:
+    """``path`` as ``~/…`` with forward slashes when it is under the home
+    directory (so the suggested config value reads the same on every OS),
+    otherwise unchanged."""
+    raw_home = os.path.expanduser("~")
+    if not raw_home or raw_home in ("/", "~"):
+        return str(path)
+    for home in (Path(raw_home), _real(Path(raw_home))):
+        try:
+            rel = path.relative_to(home)
+        except ValueError:
+            continue
+        return "~/" + rel.as_posix() if rel.parts else "~"
+    return str(path)
+
+
+def cwd_refusal_message(
+    resolved: Path, acp_config: Any, *, workspace_dir: Path | None = None
+) -> str:
+    """Why ``cwd`` was refused, what to check first, and the exact command
+    that allows the directory if the task really needs it.
+
+    A refused cwd is often a wrong guess (a folder named in the task, such as
+    ``agents/trading``, usually lives in the agent workspace), so the agent
+    is told to check that before asking the user to widen access.
+    ``config set`` replaces the whole list, so the suggested value keeps the
+    directories already allowed.
+    """
+    existing = [
+        str(raw).strip()
+        for raw in getattr(acp_config, "allowed_cwds", None) or []
+        if raw and str(raw).strip()
+    ]
+    wanted = _home_relative(resolved)
+    value = json.dumps([*existing, wanted], ensure_ascii=False)
+    workspace = f" ({_home_relative(_real(workspace_dir))})" if workspace_dir is not None else ""
+    return (
+        f"ACP_CWD_NOT_ALLOWED: cwd {resolved} is outside the agent workspace, the managed "
+        "worktrees and [acp] allowed_cwds. First check that this is the right directory: a "
+        "relative path or a folder named in the task (for example agents/...) usually lives "
+        f"in the agent workspace{workspace}, so pass it relative to the workspace (or omit cwd) "
+        "and spawn again. Only if the task really targets this directory: tell the user and "
+        f"ask them to allow it with `agentos config set acp.allowed_cwds '{value}'` "
+        "(restart the gateway if it says a restart is required), then spawn again."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -196,7 +240,15 @@ async def authorize_resume(
     mgr: Any, *, requester_key: str, resume_session_id: str
 ) -> dict[str, Any]:
     """The ACP origin that recorded ``resume_session_id`` for the requester
-    or one of its children; raise when nobody it owns ever had it."""
+    or one of its children; raise when nobody it owns ever had it.
+
+    The id is the harness's ACP session id (also accepted: the record id, or
+    an id the child itself was resumed from). A parent that passes a child's
+    *session key* (or its short hex) is told to ``sessions_send`` to that
+    child instead: that resumes the same harness conversation, where a new
+    spawn with a guessed id failed with ``resume_forbidden`` and the parent
+    then started over from scratch.
+    """
     wanted = resume_session_id.strip()
     candidates: list[Any] = []
     try:
@@ -205,13 +257,36 @@ async def authorize_resume(
         own = None
     if own is not None:
         candidates.append(own)
-    candidates.extend(await _list_children(mgr, requester_key))
+    children = await _list_children(mgr, requester_key)
+    candidates.extend(children)
+    matches: list[dict[str, Any]] = []
     for row in candidates:
         origin = _origin(row)
-        if origin.get("kind") == "acp" and str(origin.get("acp_session_id") or "") == wanted:
-            return origin
+        if origin.get("kind") != "acp":
+            continue
+        recorded = {
+            str(origin.get(field) or "")
+            for field in ("acp_session_id", "record_id", "resume_session_id")
+        }
+        if wanted in recorded - {""}:
+            matches.append(origin)
+    if matches:
+        # Prefer a row that knows the harness session id the record resolves to.
+        return next((o for o in matches if o.get("acp_session_id")), matches[0])
+    for row in children:
+        key = str(_field(row, "session_key") or "")
+        if row_is_acp(row) and wanted and (wanted == key or key.endswith(":" + wanted)):
+            raise ToolError(
+                f'resume_forbidden: "{wanted}" is the session key of your harness child '
+                f"{key}, not a harness session id. To continue that child, call "
+                f'sessions_send(session_key="{key}", message=...): it resumes the same '
+                "harness conversation. Do not spawn a new one."
+            )
     raise ToolError(
-        "resume_forbidden: resume_session_id was not recorded for this session or its children"
+        "resume_forbidden: resume_session_id was not recorded for this session or its "
+        "children. To continue one of your harness children (finished or stopped), "
+        "call sessions_send(session_key=<the child key>, message=...) - "
+        'subagents(action="list") shows the keys. Do not spawn a new one.'
     )
 
 
@@ -243,7 +318,7 @@ async def spawn_acp_session(
     worktree_base_ref: str | None = None,
     model: str | None = None,
 ) -> str:
-    from agentos.acp.manager import get_acp_manager
+    from agentos.acp.manager import agent_display_name, get_acp_manager
     from agentos.gateway.routing import build_subagent_route_envelope
     from agentos.tools.builtin import sessions as sessions_tool
 
@@ -347,7 +422,8 @@ async def spawn_acp_session(
     if model:
         origin["model"] = model
     if resume_origin is not None:
-        origin["resume_session_id"] = resume_session_id
+        # The harness session id itself, even when the caller named the record.
+        origin["resume_session_id"] = resume_origin.get("acp_session_id") or resume_session_id
         if resume_origin.get("record_id"):
             origin["record_id"] = resume_origin.get("record_id")
     if worktree_info is not None:
@@ -410,8 +486,10 @@ async def spawn_acp_session(
         "session_key": session_key,
         "runtime": "acp",
         "acp_agent": harness,
+        "acp_agent_name": agent_display_name(harness),
         "cwd": str(resolved_cwd),
         "mode": session_mode,
+        "harness_mode": harness_mode or None,
         "task_id": handle.task_id,
         "status": "queued",
         "spawn_depth": spawn_depth,
@@ -427,9 +505,22 @@ async def spawn_acp_session(
             "branch": worktree_info["branch"],
             "base_ref": worktree_info["base_ref"],
         }
-    if session_mode == "persistent":
-        payload["followup"] = "sessions_send(session_key, message, mode='followup'|'steer')"
+    payload["followup"] = "sessions_send(session_key, message, mode='followup'|'steer')"
+    payload["stop"] = f'subagents(action="kill", session_key="{session_key}")'
+    await _load_subagents_tool()
     return json.dumps(payload)
+
+
+async def _load_subagents_tool() -> None:
+    """Put the (deferred) ``subagents`` tool in the session that just spawned
+    a harness, so "stop it" maps to ``subagents(action="kill")``: without it a
+    parent stopped a harness by running ``agentos acp close`` in a shell."""
+    try:
+        from agentos.tools.deferred import load_for_current_session
+
+        await load_for_current_session(["subagents"])
+    except Exception:  # noqa: BLE001 - the spawn already succeeded
+        log.debug("acp.spawn.subagents_load_failed", exc_info=True)
 
 
 # --------------------------------------------------------------------------
@@ -447,10 +538,12 @@ async def send_to_acp_session(
     """Queue ``message`` as the next turn of an ACP session.
 
     ``steer`` cancels the running turn first (its completion is not
-    announced: the replacement turn's is). A finished ``persistent`` session
-    is reopened; a ``oneshot`` or closed one is refused.
+    announced: the replacement turn's is). A finished session -- ``persistent``
+    or ``oneshot`` -- is reopened: a oneshot resumes its harness session in a
+    new process and closes it again after the turn. Only a session an
+    operator closed (``acp.close``, ``subagents kill``) is refused.
     """
-    from agentos.acp.manager import get_acp_manager
+    from agentos.acp.manager import get_acp_manager, origin_is_closed
     from agentos.gateway.routing import build_subagent_route_envelope
     from agentos.tools.builtin import sessions as sessions_tool
 
@@ -465,16 +558,12 @@ async def send_to_acp_session(
     if origin.get("kind") != "acp":
         raise SafeToolError(f"Session '{session_key}' is not an ACP session")
     status = str(_field(session, "status") or "running")
-    if origin.get("closed"):
+    # A stopped turn leaves the row "killed" (the task-status mapping) but the
+    # session open; only an operator close (origin.closed) ends it.
+    if origin_is_closed(origin, session_status=status):
         raise SafeToolError(
             f"ACP session '{session_key}' is closed; spawn a new one (resume_session_id"
             " can continue the harness conversation)"
-        )
-    if status == "killed":
-        raise SafeToolError(f"ACP session '{session_key}' was killed")
-    if origin.get("mode") == "oneshot" and status in ("done", "failed", "timeout"):
-        raise SafeToolError(
-            f"ACP session '{session_key}' was a oneshot and has finished; spawn a new one"
         )
     manager = get_acp_manager()
     if manager is None or not manager.available:
@@ -501,6 +590,8 @@ async def send_to_acp_session(
                 task_id = _field(row, "task_id")
                 if isinstance(task_id, str):
                     active_ids.append(task_id)
+        if active_ids or manager.is_turn_active(session_key):
+            manager.note_stop(session_key, "agent")
         if active_ids:
             superseded = list(origin.get("superseded_task_ids") or []) + active_ids
             origin["superseded_task_ids"] = superseded[-_SUPERSEDED_KEEP:]
@@ -512,7 +603,7 @@ async def send_to_acp_session(
             await manager.cancel(session_key, reason="acp_steer")
 
     changes["origin"] = origin
-    if status in ("done", "failed", "timeout"):
+    if status in ("done", "failed", "timeout", "killed"):
         changes.update({"status": "running", "ended_at": None})
     await mgr.update(session_key, **changes)
 
@@ -541,6 +632,56 @@ async def send_to_acp_session(
     )
 
 
+#: Longest tool input value / tool result kept per segment in ``sessions_history``.
+HISTORY_TOOL_BODY_CHARS = 500
+
+
+def _clip(text: str, limit: int = HISTORY_TOOL_BODY_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}[…{len(text) - limit} chars]"
+
+
+def _clip_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _clip(value)
+    if isinstance(value, dict):
+        return {k: _clip_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clip_value(v) for v in value]
+    return value
+
+
+def compact_acp_history(messages: list[Any]) -> list[Any]:
+    """``sessions_history`` rows of an ACP child with tool bodies clipped.
+
+    A harness turn carries dozens of tool calls with results up to 4k chars
+    each; a parent reading the child's history got an 83k-char result that
+    was cut before the assistant's report and concluded the history was
+    unavailable. Tool inputs and results keep their first
+    :data:`HISTORY_TOOL_BODY_CHARS` characters plus a ``[…N chars]`` marker;
+    message text is untouched.
+    """
+    out: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict) or not isinstance(message.get("tool_calls"), list):
+            out.append(message)
+            continue
+        segments: list[Any] = []
+        for segment in message["tool_calls"]:
+            if not isinstance(segment, dict):
+                segments.append(segment)
+                continue
+            segment = dict(segment)
+            if segment.get("type") == "tool_result" and isinstance(segment.get("result"), str):
+                segment["result"] = _clip(segment["result"])
+            elif segment.get("type") == "tool_use" and "input" in segment:
+                segment["input"] = _clip_value(segment["input"])
+            segments.append(segment)
+        out.append({**message, "tool_calls": segments})
+    return out
+
+
 def row_is_acp(row: Any) -> bool:
     if _origin(row).get("kind") == "acp":
         return True
@@ -549,17 +690,26 @@ def row_is_acp(row: Any) -> bool:
 
 
 def annotate_acp_rows(rows: list[Any]) -> list[Any]:
-    """Tag ACP children in a ``subagents(list)`` result with ``runtime: "acp"``."""
+    """Tag ACP children in a ``subagents(list)`` result with ``runtime: "acp"``.
+
+    ``acp_closed`` is an operator close (no more turns); a finished oneshot is
+    ``acp_idle`` and still takes ``sessions_send`` follow-ups.
+    """
+    from agentos.acp.manager import origin_is_closed
+
     out: list[Any] = []
     for row in rows:
         if isinstance(row, dict) and row_is_acp(row):
             origin = _origin(row)
+            closed = origin_is_closed(origin, session_status=row.get("status"))
             row = {
                 **row,
                 "runtime": "acp",
                 "acp_agent": origin.get("agent_id"),
                 "acp_mode": origin.get("mode"),
                 "cwd": origin.get("cwd"),
+                "acp_closed": closed,
+                "acp_idle": bool(origin.get("idle")) and not closed,
             }
         out.append(row)
     return out
@@ -586,15 +736,17 @@ async def acp_subagent_action(
         runtime = sessions_tool._get_task_runtime()
     except ToolError:
         runtime = None
+    manager = get_acp_manager()
+    if manager is not None:
+        manager.note_stop(session_key, "agent")
     if runtime is not None:
         await runtime.cancel(
             session_key=session_key, source="agent_tool_kill", reason="agent_tool_kill"
         )
-    manager = get_acp_manager()
     if manager is not None:
         await manager.close(session_key, reason="agent_tool_kill")
     else:
-        origin["closed"] = True
+        origin.update(closed=True, closed_reason="agent_tool_kill", idle=False)
         await mgr.update(session_key, origin=origin)
     if status != "killed":
         await mgr.kill_session(session_key)

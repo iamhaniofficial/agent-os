@@ -12,6 +12,7 @@ import structlog
 
 from agentos.agents.limits import MAX_SPAWN_DEPTH
 from agentos.gateway.routing import build_subagent_route_envelope
+from agentos.result_budget import register_persisted_result_budget
 from agentos.session.keys import build_subagent_session_key, is_acp_key, parse_agent_id
 from agentos.session.naming import normalize_session_name
 from agentos.tools.registry import tool
@@ -380,14 +381,16 @@ async def sessions_send(session_key: str, message: str, mode: str | None = None)
         },
         "cwd": {
             "type": "string",
-            "description": "runtime=acp: working directory (default: the agent workspace). "
-            "Must be inside the workspace or [acp] allowed_cwds.",
+            "description": "runtime=acp: working directory (default: the agent workspace, "
+            "fine for read-only work in a read-only harness_mode). Writes belong in a project "
+            "dir under [acp] allowed_cwds or a worktree=true checkout.",
         },
         "mode": {
             "type": "string",
             "enum": ["oneshot", "persistent"],
-            "description": "runtime=acp: 'oneshot' (default) closes the harness after the "
-            "first turn; 'persistent' keeps it for sessions_send follow-ups.",
+            "description": "runtime=acp: 'oneshot' (default) stops the harness process after "
+            "each turn (a sessions_send follow-up resumes it); 'persistent' keeps the process "
+            "running between turns.",
         },
         "harness_mode": {
             "type": "string",
@@ -670,7 +673,11 @@ async def sessions_list(
     name="sessions_history",
     concurrency="parallel",
     read_only=True,
-    description="Retrieve conversation history from a session's transcript.",
+    description=(
+        "Retrieve conversation history from a session's transcript. With answer_offset, "
+        "return only a child's final answer from that character on (the rest of a "
+        "completion that was cut), up to 8,000 characters per call."
+    ),
     params={
         "session_key": {
             "type": "string",
@@ -681,19 +688,35 @@ async def sessions_list(
             "description": "Max messages to return (1-100)",
             "default": 20,
         },
+        "answer_offset": {
+            "type": "integer",
+            "description": "Child sessions: page the final answer from this character "
+            "(the number a cut-off completion names) instead of listing messages",
+        },
     },
     required=["session_key"],
 )
-async def sessions_history(session_key: str, limit: int = 20) -> str:
+async def sessions_history(
+    session_key: str, limit: int = 20, answer_offset: int | None = None
+) -> str:
     if not (1 <= limit <= 100):
         raise ToolError("Limit must be between 1 and 100")
+    if answer_offset is not None and answer_offset < 0:
+        raise ToolError("answer_offset must be 0 or more")
 
     try:
         mgr = _get_session_manager()
         session = await mgr.get_session(session_key)
         if session is None:
             raise ToolError(f"Session not found: {session_key}")
+        from agentos.tools.builtin.acp_spawn import compact_acp_history, row_is_acp
+
+        if answer_offset is not None:
+            return await _answer_page(mgr, session_key, answer_offset, acp=row_is_acp(session))
         messages = await mgr.read_recent_transcript(session_key, limit)
+        if row_is_acp(session):
+            # Tool bodies clipped so the harness's own text survives truncation.
+            messages = compact_acp_history(list(messages or []))
         return json.dumps(
             {
                 "session_key": session_key,
@@ -705,6 +728,61 @@ async def sessions_history(session_key: str, limit: int = 20) -> str:
         raise
     except (ImportError, AttributeError, NotImplementedError) as exc:
         raise _manager_unavailable(exc) from exc
+
+
+#: Longest ``sessions_history`` result an ``answer_offset`` page may be, as
+#: encoded JSON. Every cap between the tool and the model sits at or above
+#: 4,000 characters: the transcript ceiling registered below, the in-turn
+#: provider cap (6,344 at a 4k-token window, 160,000 at 200k) and the
+#: later-turn history cap (4,000-12,000). An 8,000-character page passed the
+#: in-turn cap but was stored -- and replayed in later turns -- cut to 2,000
+#: characters with "…", so a page now always fits whole.
+ANSWER_PAGE_RESULT_CHARS = 3_900
+#: Transcript ceiling for ``sessions_history`` results (default for tools: 2,000).
+SESSIONS_HISTORY_PERSIST_CHARS = 4_000
+
+
+def _encoded(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def _answer_page(mgr: Any, session_key: str, offset: int, *, acp: bool) -> str:
+    """One page of the child's final answer -- the same text the completion's
+    ``result.text`` was cut from, so its offsets line up -- sized so the whole
+    JSON result stays within :data:`ANSWER_PAGE_RESULT_CHARS` (JSON escaping
+    of quotes and newlines counts too)."""
+    from agentos.gateway.subagent_announce import read_child_answer
+
+    answer = await read_child_answer(session_key, session_manager=mgr, final_answer=acp)
+    payload: dict[str, Any] = {
+        "session_key": session_key,
+        "answer_offset": offset,
+        "answer_total_chars": len(answer),
+        "answer": "",
+        "next_offset": None,
+        "note": "",
+    }
+    take = min(len(answer) - offset, ANSWER_PAGE_RESULT_CHARS) if offset < len(answer) else 0
+    while True:
+        end = offset + take
+        payload["answer"] = answer[offset:end]
+        payload["next_offset"] = end if end < len(answer) else None
+        payload["note"] = (
+            f"More follows: call again with answer_offset={end}."
+            if payload["next_offset"] is not None
+            else "End of the answer."
+        )
+        overflow = len(_encoded(payload)) - ANSWER_PAGE_RESULT_CHARS
+        if overflow <= 0 or take == 0:
+            return _encoded(payload)
+        take = max(0, take - overflow)
+
+
+def _sessions_history_persist_budget() -> int:
+    return SESSIONS_HISTORY_PERSIST_CHARS
+
+
+register_persisted_result_budget("sessions_history", _sessions_history_persist_budget)
 
 
 # ---------------------------------------------------------------------------

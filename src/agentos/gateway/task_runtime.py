@@ -163,6 +163,8 @@ class SubagentCompletionEvent:
     parent_task_id: str | None = None
     error_class: str | None = None
     error_message: str | None = None
+    #: Who cancelled a ``cancelled`` task (``TaskRuntime.cancel`` source).
+    cancel_source: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -181,6 +183,8 @@ class SubagentCompletionEvent:
             payload["error_class"] = self.error_class
         if self.error_message:
             payload["error_message"] = self.error_message
+        if self.cancel_source:
+            payload["cancel_source"] = self.cancel_source
         if self.status != AgentTaskStatus.SUCCEEDED:
             payload["terminal_message"] = build_terminal_reply(payload)
         return payload
@@ -1495,6 +1499,7 @@ class TaskRuntime:
             parent_task_id=task.envelope.metadata.get("parent_task_id"),
             error_class=error_class,
             error_message=error_message,
+            cancel_source=task.cancel_source if status == AgentTaskStatus.CANCELLED else None,
         )
         try:
             await self._terminal_listener(event)
