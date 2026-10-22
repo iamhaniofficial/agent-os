@@ -470,13 +470,13 @@ malformed or repetitive tool calls terminate predictably.
 ### Deferred tools
 
 By default a request carries only the tools a typical turn needs. The long tail
-— 24 builtins: audio generation, project and skill administration, `browser`,
-`x_search`, `http_request`, and a few more — is left out; the system prompt
+— 25 builtins: audio generation, project and skill administration, `browser`,
+`x_search`, `http_request`, `subagents`, and a few more — is left out; the system prompt
 lists each by name with a one-line summary under "Tools that must be loaded
 first", and so does the `tool_search` tool. The model calls `tool_search` to
 load the ones a task needs, and they stay loaded for the rest of the session (a
 reset starts lean again). On a stock gateway a request carries 40 tool schemas
-instead of 63. The spreadsheet/document builders and the git tools stay loaded:
+instead of 64. The spreadsheet/document builders and the git tools stay loaded:
 with them one load away the model reached for the shell instead. Reading a skill with `skill_view` also loads the tools that skill
 lists in `requires_tools`. Policy still applies: a tool the session may not use
 is neither listed nor loadable. A surface narrowed by an allowlist (an agent's
@@ -1121,7 +1121,7 @@ max_concurrent = 8
 # state_dir = "~/.agentos/state/acp"
 isolate_codex_home = true
 install_missing_adapters = true
-stream_delivery = "final_only"
+stream_delivery = "live"
 allowed_cwds = []
 
 [acp.agents.cursor]
@@ -1143,10 +1143,10 @@ env = {}
 | `state_dir` | unset | Overrides `<state>/acp` (session records, leases, logs, Codex home, worktrees). |
 | `isolate_codex_home` | `true` | Give Codex its own `CODEX_HOME` with your login copied in and the session directory trusted. |
 | `install_missing_adapters` | `true` | Allow the `npx -y` / `uvx` adapter download on first use. |
-| `stream_delivery` | `"final_only"` | `final_only` sends the harness's answer once at the end; `live` streams text as it arrives. |
+| `stream_delivery` | `"live"` | `live` streams the harness's text into the child session as it arrives; `final_only` sends the answer once at the end. |
 | `agents.<id>.command` / `args` | unset | Replace the built-in launch command for that harness, or add a new harness id. |
 | `agents.<id>.env` | `{}` | Extra environment for that harness only. |
-| `allowed_cwds` | `[]` | Extra directories a harness may use as `cwd`; otherwise `cwd` must be inside the agent workspace or a managed worktree. |
+| `allowed_cwds` | `[]` | Extra directories a harness may use as `cwd`; otherwise `cwd` must be inside the agent workspace or a managed worktree. The workspace suits read-only work in a read-only `harness_mode`; list a project here for a harness that writes (`agentos config set acp.allowed_cwds '["~/Code/my-app"]'`, which replaces the whole list). |
 
 ```sh
 agentos config set acp.permission_mode approve-reads

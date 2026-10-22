@@ -57,6 +57,9 @@ class FakeRuntime:
         self.turn_started = asyncio.Event()
         self.config_options: list[dict[str, Any]] = [{"id": "model"}]
         self.modes: list[dict[str, Any]] = [{"id": "default"}, {"id": "plan"}]
+        #: False: like a harness without ``session/load`` -- a resume request
+        #: comes back as a fresh ACP session.
+        self.resume_supported = True
 
     def _next_script(self, text: str) -> Script:
         if callable(self._scripts):
@@ -74,7 +77,8 @@ class FakeRuntime:
             cwd=spec.cwd,
             argv=["fake", spec.agent_id],
             argv_hash="hash",
-            acp_session_id=spec.resume_session_id or f"sess-{n}",
+            acp_session_id=(spec.resume_session_id if self.resume_supported else None)
+            or f"sess-{n}",
             pid=1000 + n,
             mode=spec.mode,
             config_options=[dict(o) for o in self.config_options],

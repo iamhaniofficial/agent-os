@@ -27,12 +27,18 @@ from typing import Any, ClassVar, Literal
 
 import structlog
 
+from agentos.acp.labels import harness_tool_name, tool_label
 from agentos.acp.types import AcpEvent, AcpTurnResult, AcpUsage
 
 log = structlog.get_logger("agentos.acp.projector")
 
 #: Cap on the assistant text kept for one harness turn (UI, transcript, announce).
-MAX_ASSISTANT_TEXT_CHARS = 24_000
+#: A long harness report is the work itself: at 24,000 a 25-34k-character
+#: report reached the parent with its ending dropped (``full_chars`` 24,064 =
+#: the cap plus the truncation marker) and the parent went to read the
+#: harness's own files instead. The parent reads past the completion's
+#: 12,000 characters with ``sessions_history(answer_offset=...)``.
+MAX_ASSISTANT_TEXT_CHARS = 100_000
 #: Cap on one tool result kept in the transcript.
 MAX_TOOL_RESULT_CHARS = 4_000
 
@@ -100,8 +106,20 @@ def _truncation_marker(dropped: int) -> str:
 
 
 def _tool_name(tool_kind: str | None) -> str:
+    """Fallback tool name when a step has no label at all."""
     kind = (tool_kind or "other").strip() or "other"
     return f"acp:{kind}"
+
+
+def _tool_display_name(state: _ToolState) -> str:
+    """The name a tool row carries: the human label ("Run git status").
+
+    The UIs title a tool card with its ``name``; ``input.acp_kind`` keeps the
+    ACP tool kind for anything that wants it.
+    """
+    return tool_label(
+        state.title, state.tool_kind, state.raw_input, tool_name=state.tool_name
+    ) or _tool_name(state.tool_kind)
 
 
 def _stringify(value: Any) -> str:
@@ -127,6 +145,7 @@ class _ToolState:
     tool_kind: str | None = None
     title: str | None = None
     raw_input: dict[str, Any] | None = None
+    tool_name: str | None = None
     finished: bool = False
 
 
@@ -148,6 +167,8 @@ class AcpProjector:
     _last_cost_usd: float | None = None
     _thoughts: list[str] = field(default_factory=list)
     _tool_calls: int = 0
+    #: A tool call came between the previous text run and the next one.
+    _tool_since_text: bool = False
 
     # ------------------------------------------------------------------ feed
 
@@ -176,15 +197,17 @@ class AcpProjector:
     def _on_text(self, text: str, *, message_id: str | None = None) -> list[EngineEvent]:
         if not text:
             return []
-        if (
-            message_id
-            and self._last_message_id
-            and message_id != self._last_message_id
-            and self._text_parts
-            and not "".join(self._text_parts[-2:]).endswith("\n")
-        ):
-            # A new harness message: keep it from gluing onto the previous one.
-            text = "\n\n" + text
+        if self._text_parts:
+            tail = "".join(self._text_parts[-2:])
+            new_message = bool(
+                message_id and self._last_message_id and message_id != self._last_message_id
+            )
+            if (new_message or self._tool_since_text) and not tail.endswith("\n\n"):
+                # A new harness message, or narration resumed after a tool
+                # call (Claude Code sends no message ids): a paragraph break
+                # keeps it from gluing onto the previous sentence.
+                text = ("\n" if tail.endswith("\n") else "\n\n") + text
+        self._tool_since_text = False
         if message_id:
             self._last_message_id = message_id
         room = self.max_text_chars - self._text_len
@@ -215,28 +238,29 @@ class AcpProjector:
             tool_kind=event.tool_kind,
             title=event.title,
             raw_input=dict(event.raw_input) if isinstance(event.raw_input, dict) else None,
+            tool_name=_harness_tool_name(event),
         )
         self._tools[tool_id] = state
         self._tool_order.append(tool_id)
         self._tool_calls += 1
+        self._tool_since_text = True
         self._flush_text_segment()
+        name = _tool_display_name(state)
         self._segments.append(
             {
                 "type": "tool_use",
                 "tool_use_id": tool_id,
-                "name": _tool_name(state.tool_kind),
+                "name": name,
                 "input": self._tool_arguments(state),
             }
         )
-        return state, [
-            ToolUseStartEvent(tool_use_id=tool_id, tool_name=_tool_name(state.tool_kind))
-        ]
+        return state, [ToolUseStartEvent(tool_use_id=tool_id, tool_name=name)]
 
     @staticmethod
     def _tool_arguments(state: _ToolState) -> dict[str, Any]:
         args: dict[str, Any] = dict(state.raw_input or {})
-        if state.title:
-            args.setdefault("title", state.title)
+        args.setdefault("title", _tool_display_name(state))
+        args.setdefault("acp_kind", (state.tool_kind or "other").strip() or "other")
         return args
 
     def _merge(self, state: _ToolState, event: AcpEvent) -> None:
@@ -246,6 +270,7 @@ class AcpProjector:
             state.tool_kind = event.tool_kind
         if isinstance(event.raw_input, dict) and event.raw_input:
             state.raw_input = dict(event.raw_input)
+        state.tool_name = state.tool_name or _harness_tool_name(event)
 
     def _finish_tool(self, state: _ToolState, event: AcpEvent) -> list[EngineEvent]:
         if state.finished:
@@ -258,7 +283,7 @@ class AcpProjector:
         if not result_text:
             result_text = "failed" if failed else "completed"
         capped = _cap(result_text, MAX_TOOL_RESULT_CHARS)
-        name = _tool_name(state.tool_kind)
+        name = _tool_display_name(state)
         arguments = self._tool_arguments(state)
         for segment in reversed(self._segments):
             if (
@@ -341,7 +366,7 @@ class AcpProjector:
                 {
                     "type": "tool_result",
                     "tool_use_id": tool_id,
-                    "name": _tool_name(state.tool_kind),
+                    "name": _tool_display_name(state),
                     "result": "[no result reported by the harness]",
                     "is_error": False,
                 }
@@ -388,6 +413,10 @@ class AcpProjector:
         )
 
 
+def _harness_tool_name(event: AcpEvent) -> str | None:
+    return harness_tool_name(event.raw if isinstance(event.raw, dict) else None) or None
+
+
 def _message_id(event: AcpEvent) -> str | None:
     raw = event.raw if isinstance(event.raw, dict) else {}
     value = raw.get("message_id") or raw.get("messageId")
@@ -408,25 +437,40 @@ def error_event(exc: BaseException) -> ErrorEvent:
 COST_READING_KEY = "acp_cost_reading"
 
 
+def _baseline_session(previous: Mapping[str, Any]) -> str | None:
+    session = previous.get("acp_session_id")
+    if isinstance(session, str) and session:
+        return session
+    # Older records keyed the baseline by process: ``record:pid:acp_session_id``.
+    process = previous.get("process")
+    if isinstance(process, str) and process:
+        tail = process.rsplit(":", 1)[-1]
+        return tail or None
+    return None
+
+
 def cost_delta(
     reading: float | None,
     previous: Mapping[str, Any] | None,
     *,
-    process_key: str,
+    session_id: str | None,
 ) -> float | None:
     """Turn a cumulative harness cost reading into this turn's increment.
 
-    ACP's ``usage_update.cost.amount`` is the *cumulative* session cost
-    (Claude's ``total_cost_usd``). The baseline is only valid for the same
-    harness process: a new process (resume, restart) starts its own running
-    total, and a reading below the baseline means the total restarted, so
-    the reading itself is the increment (same rule as claude-agent-acp's
-    ``modelUsageIncrement``).
+    ACP's ``usage_update.cost.amount`` is the *cumulative* cost of the ACP
+    session (Claude's ``total_cost_usd``), and a resumed session may carry
+    that total over into the new process. So the baseline is keyed by
+    ``acp_session_id``, not by process: a reading at or above the baseline of
+    the same session counts only the increase; a reading below it means the
+    total restarted (a resume that did not carry it over), so the reading
+    itself is the increment; a different session starts its own total.
     """
     if reading is None:
         return None
     reading = max(0.0, float(reading))
-    if not isinstance(previous, Mapping) or previous.get("process") != process_key:
+    if not isinstance(previous, Mapping) or not session_id:
+        return reading
+    if _baseline_session(previous) != session_id:
         return reading
     try:
         base = float(previous.get("amount") or 0.0)
@@ -487,25 +531,57 @@ def last_turn_record(
     turn_cost: float | None,
     error: str | None = None,
     error_code: str | None = None,
+    tool_calls: int | None = None,
+    stop_reason: str | None = None,
+    stopped_by: str | None = None,
 ) -> dict[str, Any]:
-    """The ``origin["last_turn"]`` entry the announce ``Stats:`` line reads."""
+    """The ``origin["last_turn"]`` entry the announce ``Stats:`` line reads.
+
+    ``tool_calls`` overrides the result's count (a failed or cancelled turn
+    has no result but the projector still saw its tool calls). Token counts
+    are left out when nobody reported them (no result, or a cancelled turn
+    whose response carried none) rather than recorded as zero.
+    """
     usage = result.usage if result is not None else AcpUsage()
+    if tool_calls is None:
+        tool_calls = result.tool_calls if result is not None else 0
+    if stop_reason is None:
+        stop_reason = result.stop_reason if result is not None else "error"
     record: dict[str, Any] = {
         "duration_ms": int(duration_ms),
-        "input_tokens": int(usage.input_tokens or 0),
-        "output_tokens": int(usage.output_tokens or 0),
-        "total_tokens": int(usage.total_tokens or 0)
-        or int(usage.input_tokens or 0) + int(usage.output_tokens or 0),
-        "stop_reason": result.stop_reason if result is not None else "error",
-        "tool_calls": result.tool_calls if result is not None else 0,
+        "stop_reason": stop_reason,
+        "tool_calls": int(tool_calls),
     }
+    reported = result is not None and (
+        result.stop_reason != "cancelled"
+        or bool(usage.input_tokens or usage.output_tokens or usage.total_tokens)
+    )
+    if reported:
+        record["input_tokens"] = int(usage.input_tokens or 0)
+        record["output_tokens"] = int(usage.output_tokens or 0)
+        record["total_tokens"] = int(usage.total_tokens or 0) or int(usage.input_tokens or 0) + int(
+            usage.output_tokens or 0
+        )
     if turn_cost is not None:
         record["cost_usd"] = round(float(turn_cost), 6)
-    if error:
+    if stopped_by:
+        # A stop is not a failure: no agent-facing error text, a summary the
+        # UIs can show as it is ("Stopped by you after 3 tool calls (0:18).").
+        record["stopped_by"] = stopped_by
+        record["summary"] = stop_summary(
+            stopped_by, record["tool_calls"], format_clock(record["duration_ms"])
+        )
+    elif error:
         record["error"] = error[:500]
     if error_code:
         record["error_code"] = error_code
     return record
+
+
+def stop_summary(stopped_by: str, tool_calls: int, clock: str) -> str:
+    """User-facing line for a stopped turn: "Stopped by you after 3 tool calls (0:18)."."""
+    who = "you" if stopped_by == "user" else "the agent"
+    return f"Stopped by {who} {tool_calls_phrase(tool_calls, clock)}."
 
 
 def _format_duration(ms: int) -> str:
@@ -517,6 +593,25 @@ def _format_duration(ms: int) -> str:
     if minutes:
         return f"{minutes}m{secs:02d}s"
     return f"{secs}s"
+
+
+def format_clock(ms: int | float) -> str:
+    """``m:ss`` (``h:mm:ss`` past an hour) for a duration in milliseconds."""
+    seconds = max(0, int(round(float(ms) / 1000)))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def tool_calls_phrase(tool_calls: int, clock: str) -> str:
+    """``after 3 tool calls (0:18)`` / ``after 1 tool call`` / ``before any tool call``."""
+    if tool_calls <= 0:
+        return f"before any tool call ({clock})"
+    if tool_calls == 1:
+        return f"after 1 tool call ({clock})"
+    return f"after {tool_calls} tool calls ({clock})"
 
 
 def format_stats(last_turn: Mapping[str, Any] | None) -> str | None:

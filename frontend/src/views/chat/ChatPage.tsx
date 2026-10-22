@@ -1,5 +1,8 @@
 import './chat.css'
 import './chat-unified.css'
+// Coding-harness card styles load as their own chunk, in parallel with the
+// page, so the chat route's CSS stays inside its bundle budget.
+void import('./acp-cards.css')
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { toast } from 'sonner'
@@ -265,6 +268,8 @@ export function ChatPage() {
     // Either kind of pin removes the router's choice, so both suppress the
     // router-fx strip — a model pin is no less decided than a tier pin.
     routePinned: route.isPinned,
+    // A coding harness's cards open its child session in this view.
+    onOpenSession: switchToSession,
   })
   const attachments = useAttachments()
   // Ghost-text next prompt in the composer, asked for when a turn ends.

@@ -94,15 +94,19 @@ def test_tool_call_lifecycle_maps_to_start_and_result() -> None:
         AcpEvent(kind="text_delta", text="Done."),
     )
     assert isinstance(out[0], ToolUseStartEvent)
-    assert (out[0].tool_use_id, out[0].tool_name) == ("t1", "acp:edit")
+    # The tool row is named with its human label (the UIs title cards by name).
+    assert (out[0].tool_use_id, out[0].tool_name) == ("t1", "Edit main.py")
     result = out[1]
     assert isinstance(result, ToolResultEvent)
-    assert result.tool_name == "acp:edit" and not result.is_error
-    assert result.arguments == {"path": "main.py", "title": "Edit main.py"}
+    assert result.tool_name == "Edit main.py" and not result.is_error
+    assert result.arguments == {"path": "main.py", "title": "Edit main.py", "acp_kind": "edit"}
     assert '"ok": true' in result.result
     segments = p.transcript_segments()
     assert [s["type"] for s in segments] == ["text", "tool_use", "tool_result", "text"]
-    assert segments[1]["input"] == {"path": "main.py", "title": "Edit main.py"}
+    assert segments[1]["name"] == "Edit main.py"
+    assert segments[1]["input"] == {"path": "main.py", "title": "Edit main.py", "acp_kind": "edit"}
+    # Narration resumed after the tool call is its own paragraph.
+    assert p.text == "Editing.\n\nDone."
 
 
 def test_failed_tool_and_unknown_update_synthesize_start() -> None:
@@ -150,7 +154,7 @@ def test_text_is_capped_with_marker() -> None:
     assert "5 more characters" in p.text
     final = p.final_events(AcpTurnResult(stop_reason="end_turn"))
     assert isinstance(final[0], TextDeltaEvent) and "truncated" in final[0].text
-    assert MAX_ASSISTANT_TEXT_CHARS == 24_000
+    assert MAX_ASSISTANT_TEXT_CHARS == 100_000
 
 
 def test_usage_event_cost_is_remembered() -> None:
@@ -161,15 +165,31 @@ def test_usage_event_cost_is_remembered() -> None:
 
 
 def test_cost_delta_rules() -> None:
-    assert cost_delta(None, None, process_key="p") is None
-    assert cost_delta(0.4, None, process_key="p") == 0.4
-    prev = {"process": "p", "amount": 0.4}
-    assert abs(cost_delta(0.65, prev, process_key="p") - 0.25) < 1e-9
-    # New harness process: its running total starts over.
-    assert cost_delta(0.1, prev, process_key="q") == 0.1
-    # Running total rewound within one process: the reading is the increment.
-    assert cost_delta(0.2, prev, process_key="p") == 0.2
+    assert cost_delta(None, None, session_id="s") is None
+    assert cost_delta(0.4, None, session_id="s") == 0.4
+    prev = {"acp_session_id": "s", "amount": 0.4}
+    assert abs(cost_delta(0.65, prev, session_id="s") - 0.25) < 1e-9
+    # A different ACP session starts its own running total.
+    assert cost_delta(0.1, prev, session_id="t") == 0.1
+    # Total restarted within the session (a resume that did not carry it over).
+    assert cost_delta(0.2, prev, session_id="s") == 0.2
+    # Records written before the session key: ``record:pid:acp_session_id``.
+    legacy = {"process": "rec-1:4242:s", "amount": 0.4}
+    assert abs(cost_delta(0.5, legacy, session_id="s") - 0.1) < 1e-9
     assert COST_READING_KEY == "acp_cost_reading"
+
+
+def test_resumed_session_cost_counts_only_the_increase() -> None:
+    """2026-10-19: agent:main:acp:108fc5c7 turn 1 read 1.0338; the resumed
+    turn 2 (new process, same ACP session) read 1.1732 and was booked whole."""
+    turn1 = {"acp_session_id": "sess-a", "amount": 1.0338}
+    delta = cost_delta(1.1732, turn1, session_id="sess-a")
+    assert delta is not None and abs(delta - 0.1394) < 1e-9
+    # cfb95897: the resumed reading restarted below the baseline.
+    assert (
+        cost_delta(0.299, {"acp_session_id": "sess-b", "amount": 0.3995}, session_id="sess-b")
+        == 0.299
+    )
 
 
 def test_usage_update_fields_adds_tokens_and_cost_only_when_known() -> None:
@@ -235,7 +255,7 @@ def test_projected_records_map_one_to_one_onto_engine_events() -> None:
         engine_types.ErrorEvent,
     ]
     assert [e.kind for e in engine] == [e.kind for e in projected]
-    assert engine[2].arguments == {"p": 1}
+    assert engine[2].arguments == {"p": 1, "title": "Reading a file", "acp_kind": "read"}
     assert engine[3].cost_source == "harness" and engine[4].code == "ACP_TURN_TIMEOUT"
 
 

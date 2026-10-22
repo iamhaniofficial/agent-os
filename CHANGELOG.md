@@ -16,12 +16,119 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   console (`channels.status`, `channels.pairing.*`, `onboarding.channel.*`)
   with the config snapshot's revision on every write.
 
+## [2026.10.20] - 2026-10-20
+
+### Added
+- `acp.status {session_key}` gateway RPC: one status object for any ACP
+  session (live, idle or closed) with `agent_name`, `activity`,
+  `activity_kind`, `turn_tool_calls`, `idle`, `closed`, `mode`,
+  `harness_mode`, `cwd` and `last_turn`. `acp.sessions` rows carry the same
+  live progress fields, and a harness that is still starting is listed.
+- ACP completions (`session.event.subagent_completion` and the parent's
+  system message) carry `runtime`, `acp_agent`, `acp_agent_name`, `cwd`,
+  `mode`, `harness_mode` and a structured `usage` object next to the
+  `Stats:` string; other subagents report `runtime: "subagent"`.
+
 ### Changed
 - Desktop Trade tab: token rows name their network with its mark alone (the
   name is the tooltip), so a long ticker no longer pushes the chain or the
   copy-address button onto a second line in the chat-side panel or the desk.
 - The agent's own emoji is now ⚙️ instead of 🧢, both in the system prompt's
   product identity and in the desktop Trading desk's managed `IDENTITY.md`.
+- A finished `oneshot` ACP child is now idle, not closed: a follow-up
+  (`sessions_send`, or the user typing into the child) resumes its harness
+  session in a new process. If the harness cannot resume, a fresh session
+  starts and the turn's text says so. Only `acp close` / `subagents kill`
+  end a session.
+- `[acp] stream_delivery` defaults to `live`: child sessions stream the
+  harness's text as it arrives.
+- `acp.cancel` / `acp.close` also cancel the session's queued and starting
+  turns; `acp.close` reports `closed: true` plus `was_live`.
+- The `sub-agent` skill and the spawn `cwd` refusal agree with the cwd
+  policy: the workspace is for read-only work, writes need an
+  `[acp] allowed_cwds` project or a worktree, and a refusal
+  (`ACP_CWD_NOT_ALLOWED`) first asks the agent to check its guess (folders
+  named in a task usually live in the workspace), then names the exact
+  `agentos config set` command.
+- Deferred tool loading. `subagents` (list, stop or steer your children) is
+  no longer hidden from the main agent: it joins the deferred set, which now
+  holds 25 rarely used builtins; deferral still cuts a stock request from 64
+  to 40 tool schemas. `sessions_spawn(runtime="acp")` loads it into the session, so a
+  parent asked to stop a harness has it at hand; it had fallen back to
+  `agentos acp close` through `exec_command`.
+- `acp.cancel` / `acp.close` reject a key that is not an existing ACP
+  session (`NOT_FOUND` / `ACP_SESSION_INVALID`; `agentos acp close` exits
+  non-zero) instead of reporting success for a made-up key.
+- A completion for an ACP run the user stopped says so to the parent
+  (`stopped_by: "user"`, and the wake text): "The user stopped this Claude
+  Code run after N tool calls (m:ss). Do not restart it; ...". A parent's
+  steer is not reported as a stop.
+- Tool rows in an ACP child transcript are named with a short label built
+  from the tool call ("Run git status", "Read ~/app/x.py", "Looking up
+  tools"); the ACP kind moves to `input.acp_kind`. `acp.status` activity
+  uses the same labels.
+- An ACP completion's `result.text` is the harness's final answer (the text
+  from its last substantial run, at least 40 characters and half the longest
+  run, to the end), so a closing remark after a last tool call no longer
+  replaces the report; narration split by tool calls is kept as separate
+  paragraphs in the child transcript.
+
+### Fixed
+- A resumed ACP turn was charged the whole session's cost: Claude Code's
+  reading is cumulative per ACP session and can carry over a resume, so the
+  cost baseline is now keyed by ACP session id instead of process.
+- A stopped ACP turn left nothing in the child transcript: its tool calls
+  and text are kept with a "Cancelled after N tool calls (m:ss)." row, and
+  its duration, tool calls and cost reach `last_turn` and the completion.
+  A stopped child still takes follow-ups.
+- A turn sent into a closed ACP session (or refused for any other reason
+  before the harness ran) was invisible in the desktop: the error event was
+  wiped by the history resync that follows it. Refusals and failed harness
+  turns now log `acp.dispatch.turn_refused` / `acp.dispatch.turn_failed`
+  and leave an `Error: ...` row in the child transcript.
+- One slow request no longer holds back the rest of its WebSocket: requests
+  on a connection are still answered in order, except `chat.suggestNext`
+  (an auxiliary model call at every turn end), `acp.doctor`,
+  `providers.probe`, `onboarding.channel.probe` and `trading.probe`, which
+  answer when ready. `chat.history`, `sessions.list` and `acp.status` sent
+  right after a turn ended waited ~4-5 s behind the suggestion.
+- `subagents(action="list")` returns one short row per child (key, runtime,
+  agent or harness, status, label, times, an 80-character task preview),
+  running children first, with a `total`; a list that used to fill 8 kB with
+  each child's full grounded task was emptied by the transcript cap.
+- A stopped ACP run carries a user-facing `user_message` in its completion
+  ("You stopped this Claude Code run after 21 tool calls (1:00)." / "Stopped
+  by the agent after ..."), and its `last_turn` a `stopped_by` and `summary`
+  instead of the agent-facing "cancelled by an operator" error text.
+- A parent that stops its own ACP child (`subagents kill`) gets the completion
+  recorded but is no longer woken by it, so it does not answer twice.
+- An ACP turn whose prompt is with the harness but has no event yet shows
+  "Waiting for Claude Code…" instead of "Starting Claude Code…".
+- A long ACP answer cut to 12,000 characters made the parent redo the
+  child's work. The completion's `result` now has `full_chars`, the parent's
+  wake names the cut and the exact `sessions_history(session_key=...,
+  answer_offset=N)` call, and `sessions_history` pages the rest of that
+  answer in pages that reach the model whole.
+- A parent asked to continue a stopped child spawned a new one after
+  `resume_forbidden`. That error (and every ACP completion) now points to
+  `sessions_send(session_key=<child>)`, which resumes the same harness
+  conversation; a session key passed as `resume_session_id` is called out as
+  such, and the child's record id is accepted next to its `acp_session_id`.
+- `sessions_history(answer_offset=...)` pages arrived cut: 8,000-character
+  pages were stored (and replayed in later turns) at the 2,000-character
+  tool-result ceiling with "…". Pages are now at most 3,900 characters of
+  encoded JSON and `sessions_history` keeps results up to 4,000, so every
+  page reaches the model whole. One harness turn now keeps up to 100,000
+  characters of text instead of 24,000, which had cut long reports before
+  any paging. The truncated-answer wake line and the `sub-agent` skill also
+  forbid copying files out of a harness's own directories.
+- An ACP child's `activity` reads "Thinking…" once its tool calls have
+  finished and no text has arrived, instead of the last command for minutes.
+- Trading: base-unit conversions (`to_human` / `to_raw` in the PnL ledger) no
+  longer round amounts past 28 significant digits, so large raw balances of
+  18-decimal tokens convert exactly.
+- Skills: the five `stack-trace-*-probe` skills no longer describe themselves
+  as helpers of a `meta-stack-trace-investigator` skill that never shipped.
 
 ## [2026.10.19] - 2026-10-19
 

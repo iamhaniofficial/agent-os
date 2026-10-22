@@ -21,6 +21,7 @@ import { t } from '@/i18n'
 import '@/i18n/en/chat'
 
 import type { StreamEventPayload } from '../types'
+import { parseAcpSpawn, type AcpSpawnSpec } from './acp'
 import { buildAskCardDOM, parseAskQuestions } from './ask'
 import { buildPlanCardDOM, parsePlanFromToolResult } from './plan'
 
@@ -54,7 +55,20 @@ const TOOL_ICONS: Record<string, ToolIconName> = {
   memory_store: 'brain-circuit',
 }
 
+/** A coding harness reports its tools by ACP kind (`acp:read`, `acp:execute`, …). */
+const ACP_KIND_ICONS: Record<string, ToolIconName> = {
+  read: 'file-text',
+  edit: 'pen-line',
+  delete: 'pen-line',
+  move: 'folder-open',
+  search: 'search',
+  execute: 'terminal',
+  think: 'brain-circuit',
+  fetch: 'globe',
+}
+
 export function toolIconName(name: string): ToolIconName {
+  if (name.startsWith('acp:')) return ACP_KIND_ICONS[name.slice(4)] || 'zap'
   return TOOL_ICONS[name] || 'zap'
 }
 
@@ -66,11 +80,19 @@ function createToolIcon(name: string): HTMLSpanElement {
   return icon
 }
 
-function createToolName(name: string, input: unknown): HTMLSpanElement {
+function createToolName(name: string, input: unknown, title = ''): HTMLSpanElement {
   const label = document.createElement('span')
   label.className = 'chat-tools-name'
-  label.textContent = toolDisplayName(name, input)
+  label.textContent = toolDisplayName(name, input, title)
+  // The raw name stays reachable when a human title stands in for it.
+  if (label.textContent !== (name || 'tool')) label.title = name
   return label
+}
+
+/** The human title a payload or segment carries (`title`, or its input's `title`). */
+function toolTitle(source: unknown): string {
+  const raw = (source as { title?: unknown } | null | undefined)?.title
+  return typeof raw === 'string' ? raw.trim() : ''
 }
 
 /* ── Pure helpers (unit-tested) ─────────────────────────────────────────── */
@@ -124,7 +146,15 @@ export function publishArtifactTargetName(input: unknown): string {
 }
 
 // chat.js:7049-7055 — display name; publish_artifact appends the target basename.
-export function toolDisplayName(name: string, input: unknown): string {
+// A coding harness's tool (`acp:<kind>`) reads as its human title ("Read
+// src/app.py", "Run pytest -q") when the segment carries one: an explicit
+// `title`, or the `title` its input was persisted with (acp/projector.py).
+export function toolDisplayName(name: string, input: unknown, title = ''): string {
+  if (title.trim()) return title.trim()
+  if (name.startsWith('acp:')) {
+    const fromInput = toolTitle(toolInputObject(input))
+    if (fromInput) return fromInput
+  }
   if (name === 'publish_artifact') {
     const target = publishArtifactTargetName(input)
     if (target) return `${name} - ${target}`
@@ -425,8 +455,23 @@ export interface ToolRendererDeps {
    * approval did not go out yet. Absent → the card renders read-only.
    */
   approvePlan?: () => boolean
+  /**
+   * sessions_spawn(runtime="acp") → the harness run card (transcript/acp.ts)
+   * that replaces the generic tool row. `live`: the result just arrived on
+   * the stream; otherwise it is a history reconstruction. Absent, or null
+   * returned → the generic row stays.
+   */
+  harnessCard?: (
+    spec: AcpSpawnSpec,
+    options: { live: boolean; toolId: string },
+  ) => HTMLElement | null
   /** chat.js `_chatDiag` — the diagnostics ring. Default: no-op. */
   diag?: (event: string, detail: Record<string, unknown>) => void
+}
+
+/** A harness run card stands where its tool row was, keyed by the same id. */
+function isHarnessCard(el: Element | null): boolean {
+  return Boolean(el && el.classList.contains('acp-run'))
 }
 
 /* ── Factory ────────────────────────────────────────────────────────────── */
@@ -443,10 +488,20 @@ export function createToolRenderer(deps: ToolRendererDeps) {
 
   /* ── retitle (chat.js:7143-7165) ──────────────────────────────────────── */
 
-  function retitleToolCallDOM(details: HTMLElement | null, name: string, input: unknown): void {
+  function retitleToolCallDOM(
+    details: HTMLElement | null,
+    name: string,
+    input: unknown,
+    title = '',
+  ): void {
     if (!details || !name) return
     const current = details.getAttribute('data-tool-name') || ''
-    if (current === name) return
+    const shown = details.querySelector('.chat-tools-name')?.textContent || ''
+    const next = toolDisplayName(name, input, title)
+    // Same tool, same label: nothing to redraw. A title that arrived with the
+    // result (an ACP harness's tool) still relabels the row; a payload without
+    // one never takes a title back off it.
+    if (current === name && (shown === next || next === name)) return
     details.setAttribute('data-tool-name', name)
     const summary = details.querySelector('.chat-tools-summary')
     if (!summary) return
@@ -456,7 +511,7 @@ export function createToolRenderer(deps: ToolRendererDeps) {
     const statusText = currentStatus?.dataset?.status || currentStatus?.textContent || ''
     summary.textContent = ''
     summary.appendChild(createToolIcon(name))
-    summary.appendChild(createToolName(name, input))
+    summary.appendChild(createToolName(name, input, title))
     if (providerBadge) summary.appendChild(providerBadge)
     const statusSpan = document.createElement('span')
     statusSpan.className = 'chat-tools-status'
@@ -471,6 +526,7 @@ export function createToolRenderer(deps: ToolRendererDeps) {
     toolId: string,
     input: unknown,
     isRunning: boolean,
+    title = '',
   ): HTMLElement {
     const preview = truncate(
       typeof input === 'string' ? input : JSON.stringify(input || '', null, 2),
@@ -492,7 +548,7 @@ export function createToolRenderer(deps: ToolRendererDeps) {
       if (details.classList.contains('chat-tools-collapse--running')) e.preventDefault()
     })
     summary.appendChild(createToolIcon(name))
-    summary.appendChild(createToolName(name, input))
+    summary.appendChild(createToolName(name, input, title))
     const statusSpan = document.createElement('span')
     statusSpan.className = 'chat-tools-status'
     applyToolSummaryStatus(statusSpan, isRunning ? 'running' : '')
@@ -570,6 +626,7 @@ export function createToolRenderer(deps: ToolRendererDeps) {
     const body = bubble && bubble.querySelector('.msg-body')
     const details = findToolDetailsById(body, toolId)
     if (!details) return null
+    if (isHarnessCard(details)) return details
     let toolName =
       (payload as { name?: string; tool_name?: string }).name ||
       (payload as { tool_name?: string }).tool_name ||
@@ -581,6 +638,7 @@ export function createToolRenderer(deps: ToolRendererDeps) {
         (payload as { arguments?: unknown; input?: unknown }).arguments ||
           (payload as { input?: unknown }).input ||
           '',
+        toolTitle(payload),
       )
     }
     toolName = toolName || details.getAttribute('data-tool-name') || ''
@@ -628,7 +686,7 @@ export function createToolRenderer(deps: ToolRendererDeps) {
       return
     }
 
-    const details = buildToolCallDOM(name, toolId, input, true)
+    const details = buildToolCallDOM(name, toolId, input, true, toolTitle(payload))
     const provider = deps.getSearchProvider()
     if (name === 'web_search' && provider) {
       injectProviderBadge(details.querySelector('.chat-tools-summary'), provider)
@@ -672,6 +730,34 @@ export function createToolRenderer(deps: ToolRendererDeps) {
     let resultTarget: Element | null = body // default: append to msg-body
     if (toolId) {
       const details = findToolDetailsById(body, toolId)
+      if (isHarnessCard(details)) {
+        // A replayed/duplicate result for a spawn already drawn as its card.
+        diag('tool_result.append.skip_harness_duplicate', { toolId })
+        if (deps.getAutoScroll()) deps.scrollToBottom()
+        return
+      }
+      const resolvedName = toolName || (details ? details.getAttribute('data-tool-name') || '' : '')
+      if (resolvedName === 'sessions_spawn' && !isError && deps.harnessCard) {
+        const spec = parseAcpSpawn(
+          (payload as { arguments?: unknown; input?: unknown }).arguments ||
+            (payload as { input?: unknown }).input ||
+            (details as unknown as { _agentosToolInput?: unknown } | null)?._agentosToolInput,
+          content,
+        )
+        const card = spec ? deps.harnessCard(spec, { live: true, toolId }) : null
+        if (card) {
+          if (details) {
+            details.replaceWith(card)
+          } else if (body) {
+            deps.flushPendingTextSegment()
+            body.appendChild(card)
+            deps.newTextSegment()
+          }
+          if (deps.getAutoScroll()) deps.scrollToBottom()
+          diag('tool_result.harness_card', { toolId, child: spec?.childKey || '' })
+          return
+        }
+      }
       if (details) {
         if (toolName) {
           retitleToolCallDOM(
@@ -680,6 +766,7 @@ export function createToolRenderer(deps: ToolRendererDeps) {
             (payload as { arguments?: unknown; input?: unknown }).arguments ||
               (payload as { input?: unknown }).input ||
               '',
+            toolTitle(payload),
           )
         }
         toolName = toolName || details.getAttribute('data-tool-name') || ''
@@ -799,6 +886,7 @@ export function createToolRenderer(deps: ToolRendererDeps) {
             (seg.tool_use_id as string) || '',
             seg.input || '',
             false,
+            toolTitle(seg),
           )
           ;(details as unknown as { _agentosToolInput?: unknown })._agentosToolInput =
             seg.input || null
@@ -812,8 +900,22 @@ export function createToolRenderer(deps: ToolRendererDeps) {
 
           if (toolId) {
             const details = findToolDetailsById(body, toolId)
+            if (isHarnessCard(details)) continue
+            if (details && resultToolName === 'sessions_spawn' && !isError && deps.harnessCard) {
+              const spec = parseAcpSpawn(seg.input || toolInputById[toolId], content)
+              const card = spec ? deps.harnessCard(spec, { live: false, toolId }) : null
+              if (card) {
+                details.replaceWith(card)
+                continue
+              }
+            }
             if (details) {
-              retitleToolCallDOM(details, resultToolName, seg.input || '')
+              retitleToolCallDOM(
+                details,
+                resultToolName,
+                seg.input || toolInputById[toolId] || '',
+                toolTitle(seg),
+              )
               const withInput = details as unknown as { _agentosToolInput?: unknown }
               withInput._agentosToolInput =
                 withInput._agentosToolInput || toolInputById[toolId] || null

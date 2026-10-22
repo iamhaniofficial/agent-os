@@ -11,6 +11,7 @@ import {
   muteUntilFor,
   runKind,
   sessionKeyFromHash,
+  taskEpochMs,
   triggerFiredEvent,
   type DeliveryContext,
   type NotifyEvent,
@@ -147,6 +148,34 @@ describe('diffSessionRuns', () => {
     const tracked = new Map<string, RunTrack>([['a', { startedAt: NOW - 5_000, title: 'Alpha' }]])
     const { next } = diffSessionRuns(tracked, rows(true), NOW)
     expect(next.get('a')?.startedAt).toBe(NOW - 5_000)
+  })
+
+  // Round 2: a harness's reply toast said "Took 1m 56s" while its card said
+  // "2m 08s". The list sees a row go live and settle when it happens to
+  // refetch; the gateway timed the task itself, and that is what the card's
+  // clock is close to.
+  it("takes the duration from the gateway's task times when the row carries them", () => {
+    const tracked = new Map<string, RunTrack>([['a', { startedAt: NOW - 116_000, title: 'Alpha' }]])
+    const row = {
+      key: 'a',
+      title: 'Alpha',
+      live: false,
+      status: 'succeeded',
+      taskStartedAt: NOW - 130_000,
+      taskFinishedAt: NOW - 2_000,
+    }
+    expect(diffSessionRuns(tracked, [row], NOW).finished[0]?.durationMs).toBe(128_000)
+    // A task not finished yet (or no times at all): what the list saw.
+    const open = { ...row, taskFinishedAt: null }
+    expect(diffSessionRuns(tracked, [open], NOW).finished[0]?.durationMs).toBe(116_000)
+  })
+
+  it('reads gateway timestamps in seconds or milliseconds', () => {
+    expect(taskEpochMs(1_800_000_000)).toBe(1_800_000_000_000)
+    expect(taskEpochMs(1_800_000_000_123)).toBe(1_800_000_000_123)
+    expect(taskEpochMs('1800000000123')).toBe(1_800_000_000_123)
+    expect(taskEpochMs(null)).toBeNull()
+    expect(taskEpochMs('soon')).toBeNull()
   })
 
   it('stays quiet for runs the user stopped', () => {

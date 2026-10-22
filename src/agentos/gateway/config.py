@@ -2134,7 +2134,9 @@ class AcpConfig(BaseModel):
     """Give the Codex harness its own ``CODEX_HOME`` with a generated trust entry."""
     install_missing_adapters: bool = True
     """Allow ``npx -y`` / ``uvx`` adapter downloads on first use."""
-    stream_delivery: Literal["final_only", "live"] = "final_only"
+    stream_delivery: Literal["final_only", "live"] = "live"
+    """``live`` streams the harness's text into the child session as it
+    arrives; ``final_only`` sends it once when the turn ends."""
     allowed_cwds: list[str] = Field(default_factory=list)
     """Directories (and their subtrees) a spawned harness may use as ``cwd``
     besides the agent workspace, e.g. your project checkouts."""

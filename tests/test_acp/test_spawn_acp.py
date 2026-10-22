@@ -3,6 +3,7 @@ subagents list/kill/steer for ACP children, and the ``acp`` tool."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -49,6 +50,9 @@ async def test_spawn_creates_row_and_enqueues_acp_run(tmp_path) -> None:
         key = out["session_key"]
         assert is_acp_key(key) and key.startswith("agent:main:acp:")
         assert out["runtime"] == "acp" and out["mode"] == "oneshot"
+        assert out["acp_agent"] == "codex" and out["acp_agent_name"] == "Codex"
+        assert out["stop"] == f'subagents(action="kill", session_key="{key}")'
+        assert out["harness_mode"] == "read-only"
         row = await rig.sessions.get_session(key)
         assert row.spawned_by == PARENT_KEY and row.spawn_depth == 1
         assert row.origin["kind"] == "acp"
@@ -271,3 +275,82 @@ async def test_acp_tool_refuses_other_agents_sessions(tmp_path) -> None:
         )
         with pytest.raises(ToolError, match="another agent"):
             await acp_tools.acp(action="close", session_key=other)
+
+
+async def test_cwd_refusal_names_the_exact_config_command(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # what expanduser reads on Windows
+    outside = tmp_path / "Code" / "my-app"
+    outside.mkdir(parents=True)
+    async with acp_rig(tmp_path, allowed_cwds=["~/Code/other"]):
+        with pytest.raises(ToolError) as info:
+            await _spawn(task="x", acp_agent="claude", cwd=str(outside))
+    message = str(info.value)
+    assert message.startswith("ACP_CWD_NOT_ALLOWED:")
+    # config set replaces the list, so the suggestion keeps what is allowed.
+    assert 'agentos config set acp.allowed_cwds \'["~/Code/other", "~/Code/my-app"]\'' in message
+    # Check the guess first: names in a task usually live in the workspace.
+    assert "First check that this is the right directory" in message
+    assert "agent workspace (" in message and "Only if the task really targets" in message
+
+
+async def test_finished_oneshot_child_lists_as_idle_and_can_be_killed(tmp_path) -> None:
+    async with acp_rig(tmp_path) as rig:
+        out = await _spawn(task="once", acp_agent="claude")
+        key = out["session_key"]
+        assert out["followup"].startswith("sessions_send(")
+        await rig.task_runtime.wait(out["task_id"], timeout=5)
+        for _ in range(100):
+            if (await rig.sessions.get_session(key)).status == "done":
+                break
+            await asyncio.sleep(0.01)
+        listed = json.loads(await agents_tool.subagents(action="list"))["subagents"]
+        assert listed[0]["status"] == "done"
+        assert listed[0]["acp_idle"] is True and listed[0]["acp_closed"] is False
+
+        sessions = json.loads(await acp_tools.acp(action="sessions"))
+        child = sessions["children"][0]
+        assert child["idle"] is True and child["closed"] is False and child["live"] is False
+
+        killed = json.loads(await agents_tool.subagents(action="kill", session_key=key))
+        assert killed["status"] == "killed"
+        row = await rig.sessions.get_session(key)
+        assert row.origin["closed"] is True and row.origin["closed_reason"] == "agent_tool_kill"
+        with pytest.raises(Exception, match="is closed"):
+            await sessions_tool.sessions_send(key, "more")
+
+
+async def test_acp_spawn_loads_the_subagents_tool(tmp_path) -> None:
+    """After a spawn, "stop it" maps to subagents(action="kill"): the deferred
+    tool is loaded into the session (a parent had run `agentos acp close` in a
+    shell because the tool was not there)."""
+    from agentos.tools import deferred
+
+    loaded: list[list[str]] = []
+
+    async def _load(names):
+        loaded.append(list(names))
+        return list(names)
+
+    original = deferred.load_for_current_session
+    deferred.load_for_current_session = _load  # type: ignore[assignment]
+    try:
+        async with acp_rig(tmp_path):
+            out = await _spawn(task="x", acp_agent="claude")
+    finally:
+        deferred.load_for_current_session = original  # type: ignore[assignment]
+    assert loaded == [["subagents"]]
+    assert out["stop"].startswith('subagents(action="kill"')
+
+
+def test_sub_agent_skill_says_how_to_stop_a_harness() -> None:
+    from pathlib import Path
+
+    from agentos.skills.loader import SkillLoader
+
+    bundled = Path(__file__).resolve().parents[2] / "src" / "agentos" / "skills" / "bundled"
+    specs = {spec.name: spec for spec in SkillLoader(bundled_dir=bundled).load_all()}
+    # No requires_tools: that would hide the skill where subagents is denied.
+    assert specs["sub-agent"].requires_tools == []
+    text = specs["sub-agent"].content
+    assert 'subagents(action="kill",' in text and "Never run the" in text

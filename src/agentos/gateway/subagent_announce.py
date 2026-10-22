@@ -122,13 +122,22 @@ async def announce_subagent_completion(
             )
             if parent_task_id:
                 payload["parent_task_id"] = parent_task_id
+        child_row = await _read_child_row(event.child_session_key, session_manager=session_manager)
         payload["result"] = await _read_child_result(
             event.child_session_key,
             session_manager=session_manager,
+            final_answer=_origin_from_session(child_row).get("kind") == "acp",
         )
-        stats = await _read_child_stats(event.child_session_key, session_manager=session_manager)
+        stats = _stats_for_row(child_row) if child_row is not None else None
         if stats:
             payload["stats"] = stats
+        if child_row is not None:
+            payload.update(_child_runtime_fields(child_row))
+            payload.update(
+                _stop_fields(
+                    child_row, status=payload.get("status"), cancel_source=event.cancel_source
+                )
+            )
         get_session = getattr(session_manager, "get_session", None)
         if callable(get_session):
             parent = await get_session(event.parent_session_key)
@@ -166,6 +175,10 @@ async def announce_subagent_completion(
         await _announce_to_parent_channel(payload, parent=parent, channel_manager=channel_manager)
 
     if task_runtime is not None and parent_wake_payloads:
+        if _only_agent_stops(parent_wake_payloads):
+            # The parent stopped this child itself and already answered in
+            # that turn; waking it again made it reply twice.
+            return
         await _send_parent_wake(
             event.parent_session_key,
             parent_task_id,
@@ -301,6 +314,8 @@ async def close_subagent_spawn_group(
             parent_task_id=parent_task_id,
             pending_count=0,
         )
+    if _only_agent_stops(payloads):
+        return False  # the parent stopped them itself: nothing to wake it for
     await _send_parent_wake(
         parent_session_key,
         parent_task_id,
@@ -328,20 +343,138 @@ async def _read_parent_task_id(
     return value if isinstance(value, str) and value else None
 
 
-async def _read_child_stats(
+async def _read_child_row(
     child_session_key: str,
     *,
     session_manager: Any,
-) -> str | None:
-    """``Stats:`` text for ACP children (runtime, tokens, cost); else ``None``."""
+) -> Any | None:
     get_session = getattr(session_manager, "get_session", None)
     if not callable(get_session):
         return None
     try:
-        child = await get_session(child_session_key)
+        return await get_session(child_session_key)
     except Exception:
         return None
-    return _stats_for_row(child)
+
+
+_USAGE_KEYS = ("duration_ms", "input_tokens", "output_tokens", "total_tokens", "cost_usd")
+
+
+def _child_runtime_fields(row: Any) -> dict[str, Any]:
+    """Which runtime ran the child, and for an ACP harness its identity and the
+    last turn's structured usage (completion payload contract B).
+
+    Every ``usage`` key is present; a value is ``None`` when the harness did
+    not report it (Codex reports no cost).
+    """
+    origin = _origin_from_session(row)
+    if origin.get("kind") != "acp":
+        return {"runtime": "subagent"}
+    agent_id = str(origin.get("agent_id") or "")
+    try:
+        from agentos.acp.manager import agent_display_name
+
+        agent_name = agent_display_name(agent_id)
+    except Exception:  # pragma: no cover - acp package always ships with the engine
+        agent_name = agent_id
+    last_turn = origin.get("last_turn")
+    turn = last_turn if isinstance(last_turn, dict) else {}
+    usage: dict[str, Any] = {}
+    for key in _USAGE_KEYS:
+        value = turn.get(key)
+        usage[key] = (
+            value if isinstance(value, int | float) and not isinstance(value, bool) else None
+        )
+    tool_calls = turn.get("tool_calls")
+    usage["tool_calls"] = (
+        tool_calls if isinstance(tool_calls, int) and not isinstance(tool_calls, bool) else None
+    )
+    return {
+        "runtime": "acp",
+        "acp_agent": agent_id or None,
+        "acp_agent_name": agent_name or None,
+        "cwd": origin.get("cwd"),
+        "mode": origin.get("mode"),
+        "harness_mode": origin.get("harness_mode"),
+        "usage": usage,
+    }
+
+
+#: Cancel sources that mean the parent replaced the turn (a steer), not a stop.
+_PARENT_STEER_CANCEL_SOURCES = frozenset({"acp_steer"})
+#: Cancel sources that are the parent agent stopping its own child.
+_AGENT_STOP_CANCEL_SOURCES = frozenset({"agent_tool_kill", "acp_tool_cancel", "acp_tool_close"})
+
+
+def _task_cancel_source(task_row: Any) -> str | None:
+    details = _row_value(task_row, "details")
+    if not isinstance(details, dict):
+        return None
+    cancellation = details.get("cancellation")
+    if not isinstance(cancellation, dict):
+        return None
+    source = cancellation.get("source")
+    return source if isinstance(source, str) and source else None
+
+
+def _stop_fields(row: Any, *, status: Any, cancel_source: str | None) -> dict[str, Any]:
+    """For a stopped ACP run: who stopped it, what the parent must do, and a
+    line for the person reading the chat.
+
+    ``stopped_by`` is ``"user"`` for the card or bar Stop (``acp.cancel``),
+    ``acp close``, the child chat's Stop; ``"agent"`` when the parent stopped
+    its own child (``subagents kill``). ``terminal_message`` is for the parent
+    model (live testing showed a parent reading the generic "The task was
+    cancelled before it finished." and rerunning the same job after the user
+    stopped it); ``user_message`` is for the UI. A parent's steer replaces
+    the turn instead and is not announced at all.
+    """
+    if str(getattr(status, "value", status) or "") != "cancelled":
+        return {}
+    origin = _origin_from_session(row)
+    if origin.get("kind") != "acp" or cancel_source in _PARENT_STEER_CANCEL_SOURCES:
+        return {}
+    try:
+        from agentos.acp.manager import agent_display_name
+        from agentos.acp.projector import format_clock, tool_calls_phrase
+    except Exception:  # pragma: no cover - acp package always ships with the engine
+        return {}
+    name = agent_display_name(str(origin.get("agent_id") or "")) or "coding harness"
+    last_turn = origin.get("last_turn")
+    turn = last_turn if isinstance(last_turn, dict) else {}
+    if turn.get("stop_reason") == "cancelled":
+        tool_calls = _int_value(turn.get("tool_calls"))
+        when = " " + tool_calls_phrase(
+            tool_calls, format_clock(_int_value(turn.get("duration_ms")))
+        )
+    else:
+        when = ""  # stopped before the turn ran: no numbers of its own
+    if cancel_source in _AGENT_STOP_CANCEL_SOURCES:
+        return {
+            "stopped_by": "agent",
+            "terminal_message": (
+                f"You stopped this {name} run{when}. It will not report back; start it again "
+                "only if the user asks."
+            ),
+            "user_message": f"Stopped by the agent{when}.",
+        }
+    key = _session_key(row)
+    return {
+        "stopped_by": "user",
+        "terminal_message": (
+            f"The user stopped this {name} run{when}. Do not restart it; tell the user what "
+            "was done so far and ask how to continue. If they want it to go on, "
+            f'sessions_send(session_key="{key}", message=...) resumes this run; do not '
+            "spawn a new one."
+        ),
+        "user_message": f"You stopped this {name} run{when}.",
+    }
+
+
+def _only_agent_stops(payloads: list[dict[str, Any]] | None) -> bool:
+    """Nothing to wake the parent for: it stopped these children itself and
+    already answered in the turn that did it."""
+    return bool(payloads) and all(p.get("stopped_by") == "agent" for p in payloads or [])
 
 
 def _stats_for_row(row: Any) -> str | None:
@@ -358,7 +491,29 @@ async def _read_child_result(
     child_session_key: str,
     *,
     session_manager: Any,
+    final_answer: bool = False,
 ) -> dict[str, Any]:
+    """The child's latest assistant answer, capped for the completion payload.
+
+    ``final_answer`` (ACP harness children): only the latest turn counts --
+    a turn that produced no text yields ``""`` rather than an older answer --
+    and the result is the harness's final answer, not the narration in
+    between (the child transcript keeps all of it).
+    """
+    text = await read_child_answer(
+        child_session_key, session_manager=session_manager, final_answer=final_answer
+    )
+    return _result_payload(text, source_role="assistant" if text else None)
+
+
+async def read_child_answer(
+    child_session_key: str,
+    *,
+    session_manager: Any,
+    final_answer: bool = False,
+) -> str:
+    """The full text :func:`_read_child_result` caps; ``sessions_history``
+    pages through it with ``answer_offset`` when a completion was cut."""
     # read_recent_transcript windows from the newest end; read_transcript
     # windows from the oldest end and is kept here only as a fallback for a
     # session_manager stand-in that predates read_recent_transcript -- a
@@ -372,17 +527,70 @@ async def _read_child_result(
         elif callable(read_transcript):
             rows = await read_transcript(child_session_key, limit=50)
         else:
-            return _result_payload("")
+            return ""
     except Exception:
-        return _result_payload("")
+        return ""
     for row in reversed(list(rows or [])):
         role = _row_value(row, "role")
+        if final_answer and role == "user":
+            break
         if role != "assistant":
             continue
         text = _content_to_text(_row_value(row, "content"))
+        if text and final_answer:
+            text = _final_answer_text(row, text)
         if text:
-            return _result_payload(text, source_role="assistant")
-    return _result_payload("")
+            return text
+    return ""
+
+
+#: A text run shorter than this ("Done.") is never the answer on its own.
+_MIN_FINAL_ANSWER_CHARS = 40
+#: ... nor is one under this share of the turn's longest text run.
+_FINAL_ANSWER_SHARE = 0.5
+_RESUME_NOTICE_PREFIX = "Started a new "
+_RESUME_NOTICE_SUFFIX = "the previous context could not be resumed."
+
+
+def _final_answer_text(row: Any, full_text: str) -> str:
+    """The harness's answer, not its narration.
+
+    The text runs of the turn (split by tool calls) are scanned for the last
+    *substantial* one, at least ``max(40, half the longest run)`` characters;
+    the answer is that run through the end, joined with blank lines. So a
+    report followed by a tool call and a short closing remark keeps the
+    report, and interim "Now reading X." lines before the answer are dropped.
+    Without tool calls, or without a substantial run, it is the full text. A
+    resume notice at the top of the turn stays: the parent must know the
+    harness lost its earlier context.
+    """
+    segments = _row_value(row, "tool_calls")
+    if not isinstance(segments, list) or not any(
+        isinstance(seg, dict) and seg.get("type") in ("tool_use", "tool_result") for seg in segments
+    ):
+        return full_text
+    runs = [
+        text
+        for seg in segments
+        if isinstance(seg, dict) and seg.get("type") == "text"
+        for text in [str(seg.get("text") or "").strip()]
+        if text
+    ]
+    if not runs:
+        return full_text
+    threshold = max(_MIN_FINAL_ANSWER_CHARS, _FINAL_ANSWER_SHARE * max(len(r) for r in runs))
+    start = next((i for i in range(len(runs) - 1, -1, -1) if len(runs[i]) >= threshold), None)
+    if start is None:
+        return full_text
+    answer = "\n\n".join(runs[start:])
+    first = full_text.lstrip().split("\n\n", 1)[0].strip()
+    if (
+        first.startswith(_RESUME_NOTICE_PREFIX)
+        and first.endswith(_RESUME_NOTICE_SUFFIX)
+        and not answer.startswith(first)
+    ):
+        return f"{first}\n\n{answer}"
+    return answer
 
 
 def _result_payload(text: str, *, source_role: str | None = None) -> dict[str, Any]:
@@ -390,6 +598,10 @@ def _result_payload(text: str, *, source_role: str | None = None) -> dict[str, A
     return {
         "text": text[:_RESULT_MAX_CHARS],
         "truncated": truncated,
+        # The whole answer's length, so a parent shown the first 12,000
+        # characters knows how much is left to read (sessions_history
+        # ``answer_offset``) instead of redoing the work.
+        "full_chars": len(text),
         "source_role": source_role,
     }
 
@@ -399,22 +611,23 @@ def _bounded_parent_wake_result_text(
     *,
     child_session_key: str,
     budget_chars: int,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, int]:
+    """``(wake text, cut for the wake, answer characters kept)``."""
     if budget_chars <= 0:
         notice = (
             "[subagent result omitted from parent wake because the group output "
             f"budget was exhausted; full output remains in child session transcript: "
             f"{child_session_key}]"
         )
-        return notice[:_PARENT_WAKE_TRUNCATION_NOTICE_MAX_CHARS], True
+        return notice[:_PARENT_WAKE_TRUNCATION_NOTICE_MAX_CHARS], True, 0
     if len(text) <= budget_chars:
-        return text, False
+        return text, False, len(text)
     notice = (
         "\n[subagent result truncated for parent wake; full output remains in "
         f"child session transcript: {child_session_key}]"
     )
     slice_budget = max(0, budget_chars - len(notice))
-    return text[:slice_budget] + notice, True
+    return text[:slice_budget] + notice, True, slice_budget
 
 
 async def _build_parent_wake_payloads(
@@ -487,6 +700,11 @@ async def _build_terminal_group_payloads(
         stats = _stats_for_row(row)
         if stats:
             payload["stats"] = stats
+        payload.update(
+            _stop_fields(
+                row, status=payload.get("status"), cancel_source=_task_cancel_source(task_row)
+            )
+        )
         agent_id = _row_value(row, "agent_id")
         if "agent_id" not in payload and isinstance(agent_id, str) and agent_id:
             payload["agent_id"] = agent_id
@@ -774,13 +992,13 @@ def _format_parent_wake_message(
     result_budget_remaining = _PARENT_WAKE_RESULTS_MAX_CHARS
     for index, payload in enumerate(payloads):
         result = payload.get("result")
-        text = result.get("text") if isinstance(result, dict) else ""
-        if not isinstance(text, str) or not text:
-            text = "[no assistant output]"
+        raw_text = result.get("text") if isinstance(result, dict) else ""
+        has_answer = isinstance(raw_text, str) and bool(raw_text)
+        text: str = raw_text if isinstance(raw_text, str) and raw_text else "[no assistant output]"
         child_session_key = str(payload.get("child_session_key", ""))
         remaining_payloads = max(1, len(payloads) - index)
         child_budget = result_budget_remaining // remaining_payloads
-        text, truncated_for_wake = _bounded_parent_wake_result_text(
+        text, truncated_for_wake, kept_chars = _bounded_parent_wake_result_text(
             text,
             child_session_key=child_session_key,
             budget_chars=child_budget,
@@ -799,6 +1017,18 @@ def _format_parent_wake_message(
         result_truncated = result.get("truncated") if isinstance(result, dict) else False
         if result_truncated or truncated_for_wake:
             lines.append("result_truncated=true")
+            full_chars = result.get("full_chars") if isinstance(result, dict) else None
+            if has_answer and isinstance(full_chars, int) and full_chars > kept_chars:
+                # The parent read "the result was cut" and redid the child's
+                # work; tell it exactly where the rest is.
+                lines.append(
+                    f"The answer was cut at {kept_chars:,} of {full_chars:,} characters; read "
+                    f'the rest with sessions_history(session_key="{child_session_key}", '
+                    f"answer_offset={kept_chars}) - do not redo the work. If you still cannot "
+                    "read the rest, tell the user and point them to the child session; never "
+                    "copy files out of a harness's own directories (~/.claude, ~/.codex) or "
+                    "into another agent's workspace."
+                )
         error_class, error_message = _sanitized_failure_fields(payload)
         if error_class:
             lines.append(f"error_class={error_class}")
@@ -807,6 +1037,16 @@ def _format_parent_wake_message(
         stats = payload.get("stats")
         if isinstance(stats, str) and stats:
             lines.append(f"Stats: {stats}")
+        stop_message = payload.get("terminal_message")
+        stopped_by = payload.get("stopped_by")
+        if stopped_by in ("user", "agent") and isinstance(stop_message, str) and stop_message:
+            lines.append(f"stopped_by={stopped_by}")
+            lines.append(stop_message)
+        if payload.get("runtime") == "acp" and stopped_by != "agent":
+            lines.append(
+                f'continue_with=sessions_send(session_key="{child_session_key}", message=...) '
+                "(resumes this harness conversation; do not spawn a new one)"
+            )
         lines.extend(
             [
                 "<untrusted_subagent_result>",
@@ -814,13 +1054,16 @@ def _format_parent_wake_message(
                 "</untrusted_subagent_result>",
             ]
         )
-    lines.extend(
-        [
-            "",
-            "Synthesize these completed subagent results for the user. "
-            "Mention failed or timed-out children explicitly.",
-        ]
+    closing = (
+        "Synthesize these completed subagent results for the user. "
+        "Mention failed or timed-out children explicitly."
     )
+    if any(payload.get("stopped_by") == "user" for payload in payloads):
+        closing += (
+            " The user stopped a run marked stopped_by=user: do not start it again; say what "
+            "it did before it stopped and ask the user how to continue."
+        )
+    lines.extend(["", closing])
     return "\n".join(lines)
 
 

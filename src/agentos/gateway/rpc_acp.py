@@ -1,9 +1,16 @@
 """RPC handlers for the ACP coding-harness consumer (``acp.*``).
 
 ``acp.agents`` and a probe-less ``acp.doctor`` only read the registry and
-config, so they answer on every gateway. ``acp.sessions``, ``acp.cancel``,
-``acp.close`` and ``acp.doctor`` with ``probe`` need the gateway's
-``AcpSessionManager``; without one they fail with ``ACP_UNAVAILABLE``.
+config, so they answer on every gateway. ``acp.sessions``, ``acp.status``,
+``acp.cancel``, ``acp.close`` and ``acp.doctor`` with ``probe`` need the
+gateway's ``AcpSessionManager``; without one they fail with
+``ACP_UNAVAILABLE``.
+
+``acp.sessions`` lists sessions with a live harness process (each row carries
+``agent_name``, ``activity``, ``activity_kind``, ``turn_tool_calls`` and,
+while a turn runs, ``turn_elapsed_s``). ``acp.status {session_key}`` answers
+for any ACP session -- live, idle oneshot or closed -- and fails with
+``ACP_SESSION_INVALID`` for a key that is not an ACP session.
 
 The manager is found through :func:`set_acp_manager` (boot wiring calls it)
 or, failing that, an ``acp_manager`` attribute on the services the RPC
@@ -165,20 +172,90 @@ async def _handle_acp_sessions(params: dict | None, ctx: RpcContext) -> dict[str
     return {"sessions": sessions, "count": len(sessions)}
 
 
+@_d.method("acp.status")
+async def _handle_acp_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    p = _params(params)
+    key = _session_key(p)
+    acp_cfg = getattr(ctx.config, "acp", None)
+    if acp_cfg is not None and getattr(acp_cfg, "enabled", True) is False:
+        raise RpcHandlerError(ACP_UNAVAILABLE, "ACP is disabled ([acp] enabled = false)")
+    manager = _require_manager(ctx)
+    status = getattr(manager, "status", None)
+    if not callable(status):
+        raise RpcHandlerError(ACP_UNAVAILABLE, "ACP session manager cannot report status")
+    try:
+        result = await _call_with_optional_kw(status, key, require_acp=True)
+    except Exception as exc:
+        raise _map_acp_error(exc) from exc
+    plain = to_plain(result)
+    if not isinstance(plain, dict):
+        raise RpcHandlerError("ACP_SESSION_INVALID", f"Session {key} is not an ACP session")
+    return plain
+
+
+async def _require_acp_session(ctx: RpcContext, manager: Any, key: str) -> None:
+    """Refuse a key that is not an existing ACP session.
+
+    ``acp.close`` on a made-up key used to "succeed" silently (an agent
+    closed ``894dd12b`` and believed it had stopped the harness). A missing
+    row is ``NOT_FOUND``; any other session is ``ACP_SESSION_INVALID``.
+    """
+    sessions = ctx.session_manager or getattr(manager, "session_manager", None)
+    get_session = getattr(sessions, "get_session", None)
+    if not callable(get_session):
+        return  # nothing to check against (bare test doubles)
+    try:
+        row = await _maybe_await(get_session(key))
+    except Exception as exc:  # noqa: BLE001 - a lookup failure is not a pass
+        raise RpcHandlerError(ACP_UNAVAILABLE, f"cannot look up session {key}: {exc}") from exc
+    if row is None:
+        raise KeyError(f"ACP session not found: {key} (use the full agent:<id>:acp:<hex> key)")
+    origin = row.get("origin") if isinstance(row, dict) else getattr(row, "origin", None)
+    if not isinstance(origin, dict) or origin.get("kind") != "acp":
+        raise RpcHandlerError("ACP_SESSION_INVALID", f"Session {key} is not an ACP session")
+
+
+def _note_user_stop(manager: Any, key: str) -> None:
+    """The desktop / web Stop and Close come from the person at the screen."""
+    note = getattr(manager, "note_stop", None)
+    if callable(note):
+        note(key, "user")
+
+
+async def _cancel_session_tasks(ctx: RpcContext, key: str, *, source: str) -> int:
+    """Cancel the session's queued/running task-runtime turns (a harness that
+    is still starting has no ACP turn to cancel yet)."""
+    cancel = getattr(ctx.task_runtime, "cancel", None) if ctx.task_runtime is not None else None
+    if not callable(cancel):
+        return 0
+    try:
+        count = await _maybe_await(cancel(session_key=key, source=source, reason=source))
+    except Exception:  # noqa: BLE001 - the harness cancel below still runs
+        log.warning("acp.rpc.task_cancel_failed", session_key=key, exc_info=True)
+        return 0
+    return count if isinstance(count, int) else 0
+
+
 @_d.method("acp.cancel")
 async def _handle_acp_cancel(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     p = _params(params)
     key = _session_key(p)
     manager = _require_manager(ctx)
+    await _require_acp_session(ctx, manager, key)
     reason = str(p.get("reason") or "operator")
+    _note_user_stop(manager, key)
+    cancelled_tasks = await _cancel_session_tasks(ctx, key, source="acp_rpc_cancel")
     try:
         result = await _call_with_optional_kw(manager.cancel, key, reason=reason)
     except KeyError:
         raise
     except Exception as exc:
         raise _map_acp_error(exc) from exc
-    log.info("acp.rpc.cancelled", session_key=key)
-    return {"session_key": key, "cancelled": True if result is None else bool(result)}
+    log.info("acp.rpc.cancelled", session_key=key, tasks=cancelled_tasks)
+    return {
+        "session_key": key,
+        "cancelled": True if result is None else bool(result or cancelled_tasks),
+    }
 
 
 @_d.method("acp.close")
@@ -187,6 +264,9 @@ async def _handle_acp_close(params: dict | None, ctx: RpcContext) -> dict[str, A
     key = _session_key(p)
     manager = _require_manager(ctx)
     discard = bool(p.get("discard", False))
+    await _require_acp_session(ctx, manager, key)
+    _note_user_stop(manager, key)
+    await _cancel_session_tasks(ctx, key, source="acp_rpc_close")
     try:
         result = await _call_with_optional_kw(manager.close, key, discard=discard)
     except KeyError:
@@ -194,7 +274,9 @@ async def _handle_acp_close(params: dict | None, ctx: RpcContext) -> dict[str, A
     except Exception as exc:
         raise _map_acp_error(exc) from exc
     log.info("acp.rpc.closed", session_key=key, discard=discard)
-    return {"session_key": key, "closed": True if result is None else bool(result)}
+    # ``close`` reports whether a harness process was running; the session is
+    # closed either way (an idle oneshot has no process).
+    return {"session_key": key, "closed": True, "was_live": result is None or bool(result)}
 
 
 async def _call_with_optional_kw(fn: Any, key: str, **kwargs: Any) -> Any:

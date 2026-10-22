@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { render } from '../markdown'
-import { createMessageRenderer, historyTurnMeta } from './message'
+import { createMessageRenderer, historyTurnMeta, systemRowTone } from './message'
 import { createThinkingBlock } from './thinking'
 
 const chatCss = readFileSync('src/views/chat/chat.css', 'utf8')
@@ -84,11 +84,12 @@ describe('message renderer', () => {
     expect(row.querySelector('[aria-label="Regenerate response"]')).not.toBeNull()
   })
 
-  it('renders subagent JSON through textContent inside a disclosure', () => {
+  it('renders a subagent completion as a card, its payload only ever as text', () => {
     const { renderer } = makeRenderer()
     const payload = JSON.stringify({
       type: 'subagent_completion',
-      child_session_key: 'agent:child',
+      child_session_key: 'agent:child:webchat:x',
+      status: 'succeeded',
       value: '<img src=x onerror=alert(1)>',
     })
     const row = renderer.addMessage('system', payload, Date.now(), {
@@ -96,9 +97,58 @@ describe('message renderer', () => {
     })!
 
     expect(row).toHaveClass('subagent')
-    expect(row.querySelector('summary')).toHaveTextContent('Subagent: agent:child')
+    expect(row.querySelector('.acp-done__title')).toHaveTextContent('Subagent child finished')
     expect(row.querySelector('img')).toBeNull()
-    expect(row.querySelector('pre')).toHaveTextContent('<img src=x onerror=alert(1)>')
+    // The raw payload stays reachable for debugging, behind "Details", as text.
+    expect(row.querySelector('.acp-details__json')).toHaveTextContent(
+      '<img src=x onerror=alert(1)>',
+    )
+    expect(row.querySelector('details')).toBeNull()
+  })
+
+  it('keeps a raw disclosure for a completion row that is not a JSON object', () => {
+    const { renderer } = makeRenderer()
+    const row = renderer.addMessage('system', 'not json <b>x</b>', Date.now(), {
+      provenanceSourceTool: 'subagent_completion',
+    })!
+    expect(row.querySelector('summary')).toHaveTextContent('Subagent completion')
+    expect(row.querySelector('pre')).toHaveTextContent('not json <b>x</b>')
+    expect(row.querySelector('b')).toBeNull()
+  })
+
+  it('hands the completion payload to the injected card builder', () => {
+    const subagentCard = vi.fn(() => {
+      const el = document.createElement('div')
+      el.className = 'injected-card'
+      return el
+    })
+    const { renderer } = makeRenderer({ subagentCard })
+    const text = JSON.stringify({ type: 'subagent_completion', child_session_key: 'k' })
+    const row = renderer.addMessage('system', text, Date.now(), {
+      provenanceSourceTool: 'subagent_completion',
+    })!
+    expect(subagentCard).toHaveBeenCalledWith(
+      { type: 'subagent_completion', child_session_key: 'k' },
+      text,
+    )
+    expect(row.querySelector('.injected-card')).not.toBeNull()
+  })
+
+  it('marks a persisted "Error: …" system row so the skins draw it as an error', () => {
+    const { renderer } = makeRenderer()
+    const failed = renderer.addMessage('system', 'Error: ACP session was closed')!
+    expect(failed.querySelector('.msg-body')).toHaveAttribute('data-tone', 'error')
+    const note = renderer.addMessage('system', 'Context compacted')!
+    expect(note.querySelector('.msg-body')).not.toHaveAttribute('data-tone')
+  })
+
+  it('draws a stopped turn ("Cancelled after …") as a notice, never as an error', () => {
+    const { renderer } = makeRenderer()
+    const row = renderer.addMessage('system', 'Cancelled after 6 tool calls (1:42).')!
+    expect(row.querySelector('.msg-body')).toHaveAttribute('data-tone', 'notice')
+    expect(systemRowTone('Error: boom')).toBe('error')
+    expect(systemRowTone('Canceled by the user')).toBe('notice')
+    expect(systemRowTone('Cancellation policy changed')).toBe('')
   })
 
   it('attaches model, token, cost, cache, and reasoning metadata', () => {
