@@ -194,6 +194,31 @@ describe('stream history-reconciliation state', () => {
     expect(user.nextElementSibling).toBe(bubble)
     controller.clearViewLocalStreamState('test_cleanup')
   })
+
+  it('discards a parked live view whose turn ended off-screen, so a return starts from history', () => {
+    const thread = document.createElement('div')
+    document.body.appendChild(thread)
+    const controller = createStreamController(
+      { current: thread },
+      {
+        getSessionKey: () => 'agent:main:webchat:test',
+      },
+    )
+
+    controller.startStreaming()
+    const bubble = controller.ensureStreamBubble()
+    expect(controller.parkCurrentSessionStreamState('session_switch')).toBe(true)
+
+    // The turn was stopped while the session was off-screen (`task.cancelled`
+    // only: no stream frame ever closes it).
+    expect(controller.discardParkedStreamState('agent:main:webchat:test')).toBe(true)
+    expect(controller.discardParkedStreamState('agent:main:webchat:test')).toBe(false)
+
+    expect(controller.restoreLiveStreamStateForSession('agent:main:webchat:test')).toBe(false)
+    expect(controller.isStreaming()).toBe(false)
+    expect(bubble.isConnected).toBe(false)
+    controller.clearViewLocalStreamState('test_cleanup')
+  })
 })
 
 describe('tail following', () => {
