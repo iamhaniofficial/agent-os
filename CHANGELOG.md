@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Web and desktop chat: a session whose turn ended while it was off-screen
+  through a task-only terminal (Stop, a kill, a steer, a gateway restart) no
+  longer reopens as "Running" with a Stop button and a cursor for good; a
+  coding-harness child in that state read "Working · Starting Claude Code…"
+  after its parent had long finished. The subscribe answer's run state now
+  wins over a parked live view and over replayed frames that no `done` frame
+  closes: the stale bubble is dropped and the thread re-read from history,
+  and a task terminal for a backgrounded session discards its parked view.
+
 ## [2026.10.20] - 2026-10-20
 
 ### Added
