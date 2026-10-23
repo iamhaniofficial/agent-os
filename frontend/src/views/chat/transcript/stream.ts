@@ -1406,6 +1406,24 @@ export function createStreamController(
     return true
   }
 
+  /**
+   * Forget the live view parked for `key` (its turn ended while the session
+   * was off-screen), so a later visit starts from history instead of a bubble
+   * that is still marked streaming. Nothing parked is a no-op.
+   */
+  function discardParkedStreamState(key: string): boolean {
+    const state = liveStreamStateBySession.get(key)
+    if (!state) return false
+    liveStreamStateBySession.delete(key)
+    state.routerStrips.forEach((el) => routerFxPauseScanTimers(el))
+    diag('stream.parked_state_discarded', {
+      sessionKey: key,
+      hadStreamBubble: !!state.streamBubble,
+      streamRawLen: state.streamRaw.length,
+    })
+    return true
+  }
+
   function clearViewLocalStreamState(reason: string): void {
     // chat.js:6965-7000
     const hadStreamBubble = !!_streamBubble
@@ -1627,6 +1645,7 @@ export function createStreamController(
     // park/restore/clear
     parkCurrentSessionStreamState,
     restoreLiveStreamStateForSession,
+    discardParkedStreamState,
     clearViewLocalStreamState,
     hasViewLocalStreamState,
     // scroll

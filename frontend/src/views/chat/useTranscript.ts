@@ -1651,8 +1651,31 @@ export function useTranscript(opts: {
     const resyncHistory = () =>
       void queryClient.invalidateQueries({ queryKey: ['chat', 'history', sessionKeyRef.current] })
 
+    // The subscribe answer names the session's real run state; it wins over
+    // whatever the view reconstructed on the way in. A parked live view
+    // restored on return, and frames replayed ahead of the answer (a turn's
+    // deltas, heartbeats and state changes), both leave the thread streaming.
+    // A turn that ended through a task-only terminal — Stop, a kill, a steer,
+    // a gateway restart — has no `done` / `error` frame to close it, so the
+    // view stayed "Running" with a Stop button and a cursor for good (a
+    // harness child then read "Working · Starting Claude Code…"). Once the
+    // gateway says no turn is active, drop the stale live view and re-render
+    // from history, which already holds the partial answer and its stop row.
+    const reconcileStreamWithGateway = (state: Record<string, unknown> | null) => {
+      if (!state || typeof state.run_status !== 'string') return
+      if (!controller.isStreaming()) return
+      const status = sessionRunStatus(state).status
+      if (['queued', 'running', 'approval_pending'].includes(status)) return
+      diag('session.subscribe.stream_reconciled', { status })
+      controller.clearViewLocalStreamState('subscribe_reconcile')
+      applySessionRunState(state)
+      seams().applySessionRunState?.(state)
+      resyncHistory()
+    }
+
     // ── Subscribe (chat.js:2857 `_subscribeSession`) ──────────────────────
     const subscribe = async () => {
+      let gatewayState: Record<string, unknown> | null = null
       try {
         await rpc.waitForConnection()
         if (cancelled || sessionKey !== sessionKeyRef.current) return
@@ -1671,6 +1694,7 @@ export function useTranscript(opts: {
         if (cancelled || sessionKey !== sessionKeyRef.current) return
         if (res && res.subscribed === false) throw new Error(t('chat.noSubscriptionManager'))
         const subscribedState = (res as Record<string, unknown>) ?? {}
+        gatewayState = subscribedState
         applySessionRunState(subscribedState)
         seams().applySessionRunState?.(subscribedState)
         const currentSeq = Number(res?.current_stream_seq)
@@ -1709,6 +1733,7 @@ export function useTranscript(opts: {
         // async config work, so include them in the same entry barrier.
         await Promise.allSettled(Array.from(pendingReplayTasks))
         if (!cancelled && sessionKey === sessionKeyRef.current) {
+          reconcileStreamWithGateway(gatewayState)
           subscriptionSettledSessionRef.current = sessionKey
           setSubscriptionSettleRevision((revision) => revision + 1)
         }
@@ -2061,7 +2086,24 @@ export function useTranscript(opts: {
         seams().handleGenericEvent?.(rawEvent, rawPayload, rawMeta)
         // The observer never replaces the production finalizer (chat.js:5033
         // `.done` / 5142 `.error`); it only receives the same raw frame.
-        if (!isCurrentSessionPayload(rawPayload, sessionKeyRef.current)) return
+        if (!isCurrentSessionPayload(rawPayload, sessionKeyRef.current)) {
+          // A task terminal for a session parked off-screen: its turn is over,
+          // so the parked live view must not come back streaming on the next
+          // visit (a Stop or a kill leaves no stream frame that would end it).
+          if (rawEvent.startsWith('task.')) {
+            const p = rawPayload as { key?: string; session_key?: string; sessionKey?: string }
+            const key = p.key || p.session_key || p.sessionKey || ''
+            if (
+              key &&
+              ['succeeded', 'failed', 'timeout', 'abandoned', 'cancelled'].includes(
+                rawEvent.slice('task.'.length),
+              )
+            ) {
+              controller.discardParkedStreamState(key)
+            }
+          }
+          return
+        }
 
         if (rawEvent.startsWith('session.event.')) {
           if (isStaleEpoch(rawPayload)) {

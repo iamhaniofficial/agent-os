@@ -513,6 +513,138 @@ describe('ChatPage', () => {
     expect(thread.querySelector('.msg.assistant')).toHaveTextContent('final answer')
   })
 
+  it('ends a replayed stream the gateway says is over once the subscribe answers', async () => {
+    mockRpc = makeRpc()
+    let resolveSubscribe!: (value: Record<string, unknown>) => void
+    const subscribeResult = new Promise<Record<string, unknown>>((resolve) => {
+      resolveSubscribe = resolve
+    })
+    let historyReads = 0
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'commands.list_for_surface') {
+        return Promise.resolve({ surface: 'web_chat', commands: SLASH_CATALOG })
+      }
+      if (args[0] === 'chat.history') {
+        historyReads += 1
+        return Promise.resolve({
+          messages: [
+            { role: 'user', text: 'question', timestamp: 100 },
+            { role: 'assistant', text: 'I will locate the entry first', timestamp: 200 },
+            { role: 'system', text: 'Cancelled after 1 tool call (0:12).', timestamp: 300 },
+          ],
+          history_scope: 'complete',
+        })
+      }
+      if (args[0] === 'sessions.messages.subscribe') return subscribeResult
+      return Promise.resolve({})
+    })
+    renderPage()
+    await waitFor(() => expect(document.querySelector('.msg.user')).toHaveTextContent('question'))
+
+    // The gateway replays the frames this client never saw: a turn stopped
+    // while the session was off-screen streams again, and nothing closes it
+    // (a Stop leaves `task.cancelled` only, never a `done` frame).
+    const key = 'agent:main:webchat:default'
+    act(() => {
+      mockRpc.emit(
+        'session.event.state_change',
+        { key, stream_seq: 1, to_state: 'thinking' },
+        { replayed: true },
+      )
+      mockRpc.emit(
+        'session.event.text_delta',
+        { key, stream_seq: 2, text: 'I will locate the entry first' },
+        { replayed: true },
+      )
+      mockRpc.emit(
+        'session.event.run_heartbeat',
+        { key, stream_seq: 3, message: 'Agent run is still active' },
+        { replayed: true },
+      )
+    })
+    expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument()
+
+    await act(async () => {
+      resolveSubscribe({
+        subscribed: true,
+        replay_complete: true,
+        replayed_count: 3,
+        current_stream_seq: 3,
+        run_status: 'cancelled',
+        active_task: null,
+        last_task: { task_id: 't1', status: 'cancelled', terminal_reason: 'cancelled' },
+      })
+      await subscribeResult
+    })
+
+    // The gateway's answer wins: no Stop, no live bubble, the state it named,
+    // and the thread re-read from history (which holds the stop row).
+    await waitFor(() => expect(screen.queryByRole('button', { name: /stop/i })).toBeNull())
+    expect(screen.getByRole('button', { name: /send/i })).toBeInTheDocument()
+    expect(document.querySelector('.msg.assistant.streaming')).toBeNull()
+    expect(document.querySelector('.chat-session-run-status')).toHaveAttribute(
+      'data-status',
+      'cancelled',
+    )
+    await waitFor(() => expect(historyReads).toBeGreaterThan(1))
+    await waitFor(() =>
+      expect(document.querySelector('.chat-thread')).toHaveTextContent(
+        'Cancelled after 1 tool call',
+      ),
+    )
+  })
+
+  it('keeps a replayed stream alive when the gateway says the turn is still running', async () => {
+    mockRpc = makeRpc()
+    let resolveSubscribe!: (value: Record<string, unknown>) => void
+    const subscribeResult = new Promise<Record<string, unknown>>((resolve) => {
+      resolveSubscribe = resolve
+    })
+    mockRpc.call.mockImplementation((...args: unknown[]) => {
+      if (args[0] === 'commands.list_for_surface') {
+        return Promise.resolve({ surface: 'web_chat', commands: SLASH_CATALOG })
+      }
+      if (args[0] === 'chat.history') {
+        return Promise.resolve({
+          messages: [{ role: 'user', text: 'question', timestamp: 100 }],
+          history_scope: 'complete',
+        })
+      }
+      if (args[0] === 'sessions.messages.subscribe') return subscribeResult
+      return Promise.resolve({})
+    })
+    renderPage()
+    await waitFor(() => expect(document.querySelector('.msg.user')).toHaveTextContent('question'))
+
+    const key = 'agent:main:webchat:default'
+    act(() => {
+      mockRpc.emit(
+        'session.event.text_delta',
+        { key, stream_seq: 1, text: 'half an answer' },
+        { replayed: true },
+      )
+    })
+    await act(async () => {
+      resolveSubscribe({
+        subscribed: true,
+        replay_complete: true,
+        replayed_count: 1,
+        current_stream_seq: 1,
+        run_status: 'running',
+        active_task: { task_id: 't2', status: 'running' },
+        last_task: { task_id: 't2', status: 'running' },
+      })
+      await subscribeResult
+    })
+
+    expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument()
+    expect(document.querySelector('.chat-thread')).toHaveTextContent('half an answer')
+    expect(document.querySelector('.chat-session-run-status')).toHaveAttribute(
+      'data-status',
+      'running',
+    )
+  })
+
   it('downloads a non-anchor artifact target through the authenticated delegate', async () => {
     mockRpc = makeRpc()
     renderPage()
